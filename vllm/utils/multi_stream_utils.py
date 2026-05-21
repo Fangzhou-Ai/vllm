@@ -56,6 +56,28 @@ def maybe_execute_in_parallel(
     """
     if aux_stream is not None:
         event0.record()
+        result0 = fn0()
+        with torch.cuda.stream(aux_stream):
+            event0.wait()
+            result1 = fn1()
+            event1.record()
+        event1.wait()
+    else:
+        result0 = fn0()
+        result1 = fn1()
+    return (result0, result1)
+
+
+def maybe_execute_in_parallel_rocm(
+    fn0: Callable[[], Any],
+    fn1: Callable[[], Any],
+    event0: torch.cuda.Event,
+    event1: torch.cuda.Event,
+    aux_stream: torch.cuda.Stream | None = None,
+) -> tuple[Any, Any]:
+    """ROCm variant that launches aux work before default for better overlap."""
+    if aux_stream is not None:
+        event0.record()
         with torch.cuda.stream(aux_stream):
             event0.wait()
             result1 = fn1()

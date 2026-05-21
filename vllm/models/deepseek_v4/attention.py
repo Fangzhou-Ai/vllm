@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import DeepseekV2Config, DeepseekV3Config
 
+import vllm.envs as envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.model_executor.layers.linear import (
     ReplicatedLinear,
@@ -54,14 +55,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
 )
 from vllm.models.deepseek_v4.compressor import DeepseekCompressor
-from vllm.models.deepseek_v4.multi_stream import (
-    should_overlap_dsv4_indexer,
-    should_overlap_dsv4_input_gemms,
-)
 from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
+    maybe_execute_in_parallel_rocm,
     record_tensors_on_stream,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
@@ -402,20 +400,27 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
-        forward_context = get_forward_context()
-        attn_metadata = forward_context.attn_metadata
-        overlap_input_gemms = should_overlap_dsv4_input_gemms(
-            hidden_states.shape[0],
-            self.aux_stream_list,
-            attn_metadata,
-            self.swa_cache_layer.prefix,
+        overlap_input_gemms = (
+            hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
         )
-        if overlap_input_gemms and aux_streams is not None:
-            record_tensors_on_stream((hidden_states,), aux_streams[0])
-            if aux_fns[1] is not None:
-                record_tensors_on_stream((hidden_states,), aux_streams[1])
-            if aux_fns[2] is not None:
-                record_tensors_on_stream((hidden_states,), aux_streams[2])
+        if current_platform.is_rocm():
+            from vllm.models.deepseek_v4.amd.multi_stream import (
+                should_overlap_dsv4_rocm_input_gemms,
+            )
+
+            forward_context = get_forward_context()
+            overlap_input_gemms = should_overlap_dsv4_rocm_input_gemms(
+                hidden_states.shape[0],
+                self.aux_stream_list,
+                forward_context.attn_metadata,
+                self.swa_cache_layer.prefix,
+            )
+            if overlap_input_gemms and aux_streams is not None:
+                record_tensors_on_stream((hidden_states,), aux_streams[0])
+                if aux_fns[1] is not None:
+                    record_tensors_on_stream((hidden_states,), aux_streams[1])
+                if aux_fns[2] is not None:
+                    record_tensors_on_stream((hidden_states,), aux_streams[2])
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
@@ -454,17 +459,26 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # on the default stream so q stays on its consumer stream (mla_attn
         # downstream reads q on default). Indexer/compressor go on aux for
         # overlap with default's GEMM + cache write.
-        overlap_indexer = should_overlap_dsv4_indexer(
-            self.aux_stream_list,
-            attn_metadata,
-            self.swa_cache_layer.prefix,
-        )
         if self.indexer is not None:
             aux_stream = (
-                self.aux_stream_list[0]
-                if overlap_indexer and self.aux_stream_list is not None
-                else None
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
+            if current_platform.is_rocm():
+                from vllm.models.deepseek_v4.amd.multi_stream import (
+                    should_overlap_dsv4_rocm_indexer,
+                )
+
+                if not should_overlap_dsv4_rocm_indexer(
+                    self.aux_stream_list,
+                    attn_metadata,
+                    self.swa_cache_layer.prefix,
+                ):
+                    aux_stream = None
+                elif aux_stream is not None:
+                    record_tensors_on_stream(
+                        (hidden_states, qr, indexer_kv_score, indexer_weights),
+                        aux_stream,
+                    )
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -476,13 +490,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            if aux_stream is not None:
-                record_tensors_on_stream(
-                    (hidden_states, qr, indexer_kv_score, indexer_weights),
-                    aux_stream,
-                )
-
-            q, _ = maybe_execute_in_parallel(
+            execute_parallel = (
+                maybe_execute_in_parallel_rocm
+                if current_platform.is_rocm()
+                else maybe_execute_in_parallel
+            )
+            q, _ = execute_parallel(
                 wq_b_kv_insert_and_compress,
                 lambda: indexer(
                     hidden_states,
@@ -496,15 +509,28 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self.ln_events[1],
                 aux_stream,
             )
-            if aux_stream is not None and self.topk_indices_buffer is not None:
+            if (
+                current_platform.is_rocm()
+                and aux_stream is not None
+                and self.topk_indices_buffer is not None
+            ):
                 self.topk_indices_buffer.record_stream(torch.cuda.current_stream())
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
-                self.aux_stream_list[0]
-                if overlap_indexer and self.aux_stream_list is not None
-                else None
+                self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
+            if current_platform.is_rocm():
+                from vllm.models.deepseek_v4.amd.multi_stream import (
+                    should_overlap_dsv4_rocm_indexer,
+                )
+
+                if not should_overlap_dsv4_rocm_indexer(
+                    self.aux_stream_list,
+                    attn_metadata,
+                    self.swa_cache_layer.prefix,
+                ):
+                    aux_stream = None
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -512,7 +538,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            q, _ = maybe_execute_in_parallel(
+            execute_parallel = (
+                maybe_execute_in_parallel_rocm
+                if current_platform.is_rocm()
+                else maybe_execute_in_parallel
+            )
+            q, _ = execute_parallel(
                 wq_b_kv_insert,
                 lambda: compressor(kv_score, positions, self.rotary_emb),
                 self.ln_events[0],

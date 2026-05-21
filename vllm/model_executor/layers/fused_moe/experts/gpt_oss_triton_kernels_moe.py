@@ -93,7 +93,18 @@ def _patch_make_bitmatrix_metadata() -> None:
             sum_bitmatrix_rows,
         )
     except ImportError:
-        return
+        try:
+            from triton_kernels.tensor_details import bitmatrix as _bm
+            from triton_kernels.tensor_details.bitmatrix import (
+                BitmatrixMetadata,
+                _keyed_add,
+                cdiv,
+            )
+            from triton_kernels.tensor_details.bitmatrix_details.sum_bitmatrix_rows import (  # noqa: E501
+                sum_bitmatrix_rows,
+            )
+        except ImportError:
+            return
 
     @triton.jit
     def _stage2_pow2(
@@ -201,10 +212,12 @@ def _patch_make_bitmatrix_metadata() -> None:
     # sys.modules maps "triton_kernels.tensor" vs
     # "vllm.third_party.triton_kernels.tensor".
     from triton_kernels.tensor import SparseMatrix as _SparseMatrix
+    import triton_kernels.tensor as _tensor_mod
 
     _SparseMatrix.__post_init__.__globals__["make_bitmatrix_metadata"] = (
         _make_bitmatrix_metadata_pow2_safe
     )
+    _tensor_mod.make_bitmatrix_metadata = _make_bitmatrix_metadata_pow2_safe
     # Also patch the bitmatrix module itself in case it is imported directly.
     _bm.make_bitmatrix_metadata = _make_bitmatrix_metadata_pow2_safe
 
