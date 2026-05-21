@@ -19,10 +19,13 @@ def create_dsv4_rocm_aux_stream_list() -> list[torch.cuda.Stream] | None:
 
     Opt-in via ``VLLM_DSV4_ROCM_MULTI_STREAM`` because multi-stream was
     previously disabled due to hang issues (#41820).
+
+    ROCm currently exposes a single indexer stream. Input-GEMM multi-stream
+    overlap remains disabled until validated separately.
     """
     if not envs.VLLM_DSV4_ROCM_MULTI_STREAM:
         return None
-    return [torch.cuda.Stream() for _ in range(3)]
+    return [torch.cuda.Stream()]
 
 
 def _has_decode_tokens(
@@ -44,14 +47,9 @@ def should_overlap_dsv4_rocm_input_gemms(
     swa_cache_prefix: str,
 ) -> bool:
     """Whether to overlap fused_wqa_wkv with auxiliary input GEMMs on ROCm."""
-    if aux_stream_list is None:
-        return False
-    threshold = envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
-    if threshold <= 0 or num_tokens > threshold:
-        return False
-    if envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY:
-        return _has_decode_tokens(attn_metadata, swa_cache_prefix)
-    return True
+    # Input-GEMM multi-stream overlap hangs on ROCm during decode today.
+    # Keep disabled until the indexer-only path is stable (#41820).
+    return False
 
 
 def should_overlap_dsv4_rocm_indexer(

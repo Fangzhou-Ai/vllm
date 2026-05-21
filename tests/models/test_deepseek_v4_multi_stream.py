@@ -34,7 +34,7 @@ def test_create_dsv4_rocm_aux_stream_list_enabled():
         envs.VLLM_DSV4_ROCM_MULTI_STREAM = True
         streams = create_dsv4_rocm_aux_stream_list()
     assert streams is not None
-    assert len(streams) == 3
+    assert len(streams) == 1
 
 
 def test_should_overlap_dsv4_rocm_indexer_decode_only():
@@ -55,13 +55,13 @@ def test_should_overlap_dsv4_rocm_indexer_decode_only():
         )
 
 
-def test_should_overlap_dsv4_rocm_input_gemms_respects_threshold():
+def test_should_overlap_dsv4_rocm_input_gemms_disabled():
     aux_streams = [torch.cuda.Stream()]
     attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=1)}
     with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
         envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD = 4
         envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = True
-        assert should_overlap_dsv4_rocm_input_gemms(
+        assert not should_overlap_dsv4_rocm_input_gemms(
             4, aux_streams, attn_metadata, "swa.prefix"
         )
         assert not should_overlap_dsv4_rocm_input_gemms(

@@ -59,7 +59,6 @@ from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
-    maybe_execute_in_parallel_rocm,
     record_tensors_on_stream,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
@@ -355,8 +354,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
         aux_streams = self.aux_stream_list
         if aux_streams is not None:
-            assert len(aux_streams) >= 3
-            aux_streams = aux_streams[:3]
+            if current_platform.is_rocm():
+                aux_streams = aux_streams[:1]
+            else:
+                assert len(aux_streams) >= 3
+                aux_streams = aux_streams[:3]
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
@@ -415,12 +417,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 forward_context.attn_metadata,
                 self.swa_cache_layer.prefix,
             )
-            if overlap_input_gemms and aux_streams is not None:
-                record_tensors_on_stream((hidden_states,), aux_streams[0])
-                if aux_fns[1] is not None:
-                    record_tensors_on_stream((hidden_states,), aux_streams[1])
-                if aux_fns[2] is not None:
-                    record_tensors_on_stream((hidden_states,), aux_streams[2])
+            # ROCm input-GEMM overlap is disabled; no cross-stream records needed.
 
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
@@ -490,11 +487,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            execute_parallel = (
-                maybe_execute_in_parallel_rocm
-                if current_platform.is_rocm()
-                else maybe_execute_in_parallel
-            )
+            execute_parallel = maybe_execute_in_parallel
+            indexer_start_event = self.ln_events[2]
+            indexer_done_event = self.ln_events[3]
             q, _ = execute_parallel(
                 wq_b_kv_insert_and_compress,
                 lambda: indexer(
@@ -505,15 +500,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     positions,
                     self.indexer_rotary_emb,
                 ),
-                self.ln_events[0],
-                self.ln_events[1],
+                indexer_start_event,
+                indexer_done_event,
                 aux_stream,
             )
-            if (
-                current_platform.is_rocm()
-                and aux_stream is not None
-                and self.topk_indices_buffer is not None
-            ):
+            if aux_stream is not None and self.topk_indices_buffer is not None:
                 self.topk_indices_buffer.record_stream(torch.cuda.current_stream())
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
@@ -538,16 +529,12 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            execute_parallel = (
-                maybe_execute_in_parallel_rocm
-                if current_platform.is_rocm()
-                else maybe_execute_in_parallel
-            )
+            execute_parallel = maybe_execute_in_parallel
             q, _ = execute_parallel(
                 wq_b_kv_insert,
                 lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[0],
-                self.ln_events[1],
+                self.ln_events[2],
+                self.ln_events[3],
                 aux_stream,
             )
         else:
