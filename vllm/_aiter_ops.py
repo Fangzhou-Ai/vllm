@@ -2233,6 +2233,8 @@ class rocm_aiter_ops:
     def is_triton_gemm_w8a8_tuned(n: int, k: int) -> bool:
         return (n, k) in [
             (1024, 8192),
+            # DeepSeek-V4 fused wqa/wkv input projection under TP=8.
+            (2048, 7168),
             (2112, 7168),
             (3072, 1536),
             (32768, 8192),
