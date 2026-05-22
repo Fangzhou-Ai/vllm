@@ -211,8 +211,8 @@ def _patch_make_bitmatrix_metadata() -> None:
     # module dict).  Patching through __globals__ works regardless of how
     # sys.modules maps "triton_kernels.tensor" vs
     # "vllm.third_party.triton_kernels.tensor".
-    from triton_kernels.tensor import SparseMatrix as _SparseMatrix
     import triton_kernels.tensor as _tensor_mod
+    from triton_kernels.tensor import SparseMatrix as _SparseMatrix
 
     _SparseMatrix.__post_init__.__globals__["make_bitmatrix_metadata"] = (
         _make_bitmatrix_metadata_pow2_safe
@@ -220,6 +220,222 @@ def _patch_make_bitmatrix_metadata() -> None:
     _tensor_mod.make_bitmatrix_metadata = _make_bitmatrix_metadata_pow2_safe
     # Also patch the bitmatrix module itself in case it is imported directly.
     _bm.make_bitmatrix_metadata = _make_bitmatrix_metadata_pow2_safe
+
+
+def _patch_legacy_routing_compute() -> None:
+    """Patch legacy triton_kernels routing for non-power-of-2 top_k.
+
+    The v3.5.1 routing kernel uses ``tl.arange(0, top_k * BLOCK_M)``.
+    DeepSeek-V4 has top_k=6, so ROCm Triton rejects the kernel because arange
+    ranges must be powers of two. Keep the public routing API unchanged and
+    dispatch to a padded helper range selected from constexpr top_k buckets.
+    """
+    import triton
+    import triton.language as tl
+
+    try:
+        import triton_kernels.routing as _routing_mod
+        from triton_kernels.routing_details import _routing_compute as _rc
+        from triton_kernels.routing_details._expt_data import _expt_data_compute
+    except ImportError:
+        return
+
+    _keyed_add = _rc._keyed_add
+
+    @triton.jit
+    def _routing_compute_indx_pow2(
+        pid_m,
+        GatherIndx,
+        ScatterIndx,
+        GateScal,
+        ExptScal,
+        ExptIndx,
+        PartialOffs,
+        stride_pm,
+        stride_pn,
+        TokensStart,
+        n_tokens,
+        BLOCK_M: tl.constexpr,
+        N_EXPTS_ACT: tl.constexpr,
+        BLOCK_GATES: tl.constexpr,
+    ):
+        if isinstance(n_tokens, tl.tensor) and n_tokens.dtype.is_ptr():
+            n_tokens = tl.load(n_tokens)
+        n_gates = n_tokens * N_EXPTS_ACT
+
+        tl.static_assert(N_EXPTS_ACT * BLOCK_M <= 32768)
+        tl.static_assert(BLOCK_GATES >= N_EXPTS_ACT * BLOCK_M)
+
+        local_offs = tl.arange(0, BLOCK_GATES)
+        local_mask = local_offs < N_EXPTS_ACT * BLOCK_M
+        offs = pid_m * BLOCK_M * N_EXPTS_ACT + local_offs
+        expert = tl.load(
+            ExptIndx + offs, mask=local_mask & (offs < n_gates), other=-1
+        ).to(tl.uint32)
+
+        kv_pairs = ((expert << 16) | local_offs).to(tl.uint32)
+        kv_pairs = tl.sort(kv_pairs, 0)
+        expert = kv_pairs >> 16
+        offs = pid_m * BLOCK_M * N_EXPTS_ACT + (kv_pairs & 0xFFFF)
+        mask = expert != 0xFFFF
+        gate_scal = tl.load(ExptScal + offs, mask=mask)
+
+        x = kv_pairs & 0xFFFF0000 | 0x00000001
+        expts_and_inclusive_run_lengths = tl.associative_scan(x, 0, _keyed_add)
+        exclusive_run_lengths = (expts_and_inclusive_run_lengths - 1) & 0xFFFF
+
+        gates = tl.load(PartialOffs + pid_m * stride_pm + expert * stride_pn, mask=mask)
+        gates += tl.load(TokensStart + expert, mask=mask)
+        gates += exclusive_run_lengths
+
+        tl.store(ScatterIndx + offs, gates, mask=mask)
+        tl.store(GatherIndx + gates, offs, mask=mask)
+        tl.store(GateScal + gates, gate_scal, mask=mask)
+
+    @triton.jit
+    def _combined_routing_compute_pow2(
+        GatherIndx,
+        ScatterIndx,
+        GateScal,
+        ExptScal,
+        ExptIndx,
+        PartialOffs,
+        stride_pm,
+        stride_pn,
+        TokensStart,
+        n_tokens,
+        BLOCK_M: tl.constexpr,
+        N_EXPTS_ACT: tl.constexpr,
+        Hist,
+        MDTileStarts,
+        tile_starts_stridem,
+        MDTileInfo,
+        tile_info_stridem,
+        first_tile_dim_log2,
+        SIZES: tl.constexpr,
+        BLOCK: tl.constexpr,
+        blocks2a,
+    ):
+        pid = tl.program_id(0)
+        if pid < blocks2a:
+            _expt_data_compute(
+                Hist,
+                MDTileStarts,
+                tile_starts_stridem,
+                MDTileInfo,
+                tile_info_stridem,
+                first_tile_dim_log2,
+                SIZES,
+                BLOCK,
+            )
+        else:
+            pid -= blocks2a
+            if N_EXPTS_ACT <= 1:
+                _routing_compute_indx_pow2(
+                    pid,
+                    GatherIndx,
+                    ScatterIndx,
+                    GateScal,
+                    ExptScal,
+                    ExptIndx,
+                    PartialOffs,
+                    stride_pm,
+                    stride_pn,
+                    TokensStart,
+                    n_tokens,
+                    BLOCK_M,
+                    N_EXPTS_ACT,
+                    BLOCK_M,
+                )
+            elif N_EXPTS_ACT <= 2:
+                _routing_compute_indx_pow2(
+                    pid,
+                    GatherIndx,
+                    ScatterIndx,
+                    GateScal,
+                    ExptScal,
+                    ExptIndx,
+                    PartialOffs,
+                    stride_pm,
+                    stride_pn,
+                    TokensStart,
+                    n_tokens,
+                    BLOCK_M,
+                    N_EXPTS_ACT,
+                    BLOCK_M * 2,
+                )
+            elif N_EXPTS_ACT <= 4:
+                _routing_compute_indx_pow2(
+                    pid,
+                    GatherIndx,
+                    ScatterIndx,
+                    GateScal,
+                    ExptScal,
+                    ExptIndx,
+                    PartialOffs,
+                    stride_pm,
+                    stride_pn,
+                    TokensStart,
+                    n_tokens,
+                    BLOCK_M,
+                    N_EXPTS_ACT,
+                    BLOCK_M * 4,
+                )
+            elif N_EXPTS_ACT <= 8:
+                _routing_compute_indx_pow2(
+                    pid,
+                    GatherIndx,
+                    ScatterIndx,
+                    GateScal,
+                    ExptScal,
+                    ExptIndx,
+                    PartialOffs,
+                    stride_pm,
+                    stride_pn,
+                    TokensStart,
+                    n_tokens,
+                    BLOCK_M,
+                    N_EXPTS_ACT,
+                    BLOCK_M * 8,
+                )
+            elif N_EXPTS_ACT <= 16:
+                _routing_compute_indx_pow2(
+                    pid,
+                    GatherIndx,
+                    ScatterIndx,
+                    GateScal,
+                    ExptScal,
+                    ExptIndx,
+                    PartialOffs,
+                    stride_pm,
+                    stride_pn,
+                    TokensStart,
+                    n_tokens,
+                    BLOCK_M,
+                    N_EXPTS_ACT,
+                    BLOCK_M * 16,
+                )
+            else:
+                _routing_compute_indx_pow2(
+                    pid,
+                    GatherIndx,
+                    ScatterIndx,
+                    GateScal,
+                    ExptScal,
+                    ExptIndx,
+                    PartialOffs,
+                    stride_pm,
+                    stride_pn,
+                    TokensStart,
+                    n_tokens,
+                    BLOCK_M,
+                    N_EXPTS_ACT,
+                    BLOCK_M * 32,
+                )
+
+    _rc._routing_compute_indx = _routing_compute_indx_pow2
+    _rc._combined_routing_compute = _combined_routing_compute_pow2
+    _routing_mod._combined_routing_compute = _combined_routing_compute_pow2
 
 
 # Two API generations of triton_kernels are supported:
@@ -260,7 +476,9 @@ if has_triton_kernels():
             # the gpt-oss perf regression in v3.6.0+ is resolved upstream.
             # Tracking: https://github.com/triton-lang/triton/issues/9969
             use_legacy_triton_kernels = True
-        if not use_legacy_triton_kernels:
+        if use_legacy_triton_kernels:
+            _patch_legacy_routing_compute()
+        else:
             _patch_make_bitmatrix_metadata()
     except (AttributeError, ImportError) as e:
         logger.error(
