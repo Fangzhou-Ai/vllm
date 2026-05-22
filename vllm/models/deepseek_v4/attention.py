@@ -59,7 +59,6 @@ from vllm.platforms import current_platform
 from vllm.utils.multi_stream_utils import (
     execute_in_parallel,
     maybe_execute_in_parallel,
-    record_tensors_on_stream,
 )
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.mla.flashmla_sparse import (
@@ -352,18 +351,22 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
-        aux_streams = self.aux_stream_list
-        if aux_streams is not None:
-            if current_platform.is_rocm():
-                aux_streams = aux_streams[:1]
-            else:
-                assert len(aux_streams) >= 3
-                aux_streams = aux_streams[:3]
+        # Input-GEMM 3-way overlap is a CUDA-only optimization: it needs 3 aux
+        # streams and only pays off when each GEMM is large enough to hide the
+        # event/stream-switch overhead. On ROCm we expose a single aux stream
+        # (used downstream for indexer-vs-default overlap) and run the input
+        # GEMMs serially — the tiny decode-batch GEMMs are dominated by launch
+        # overhead so per-layer event sync regresses TPOT.
+        aux_streams: list[torch.cuda.Stream] | None = self.aux_stream_list
+        if aux_streams is not None and current_platform.is_rocm():
+            aux_streams = None
+        elif aux_streams is not None:
+            assert len(aux_streams) >= 3
+            aux_streams = aux_streams[:3]
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
-        # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
 
         if self.compressor is not None:
@@ -403,22 +406,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             return qr_kv
 
         overlap_input_gemms = (
-            hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+            aux_streams is not None
+            and hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
         )
-        if current_platform.is_rocm():
-            from vllm.models.deepseek_v4.amd.multi_stream import (
-                should_overlap_dsv4_rocm_input_gemms,
-            )
-
-            forward_context = get_forward_context()
-            overlap_input_gemms = should_overlap_dsv4_rocm_input_gemms(
-                hidden_states.shape[0],
-                self.aux_stream_list,
-                forward_context.attn_metadata,
-                self.swa_cache_layer.prefix,
-            )
-            # ROCm input-GEMM overlap is disabled; no cross-stream records needed.
-
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
             aux_fns,
@@ -460,7 +450,8 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
-            if current_platform.is_rocm():
+            if current_platform.is_rocm() and aux_stream is not None:
+                # ROCm-only gate: opt in via env, default to decode steps only.
                 from vllm.models.deepseek_v4.amd.multi_stream import (
                     should_overlap_dsv4_rocm_indexer,
                 )
@@ -471,11 +462,6 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     self.swa_cache_layer.prefix,
                 ):
                     aux_stream = None
-                elif aux_stream is not None:
-                    record_tensors_on_stream(
-                        (hidden_states, qr, indexer_kv_score, indexer_weights),
-                        aux_stream,
-                    )
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -487,10 +473,7 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 compressor(kv_score, positions, self.rotary_emb)
                 return q
 
-            execute_parallel = maybe_execute_in_parallel
-            indexer_start_event = self.ln_events[2]
-            indexer_done_event = self.ln_events[3]
-            q, _ = execute_parallel(
+            q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert_and_compress,
                 lambda: indexer(
                     hidden_states,
@@ -500,28 +483,22 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                     positions,
                     self.indexer_rotary_emb,
                 ),
-                indexer_start_event,
-                indexer_done_event,
+                self.ln_events[0],
+                self.ln_events[1],
                 aux_stream,
             )
-            if aux_stream is not None and self.topk_indices_buffer is not None:
-                self.topk_indices_buffer.record_stream(torch.cuda.current_stream())
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
             if current_platform.is_rocm():
-                from vllm.models.deepseek_v4.amd.multi_stream import (
-                    should_overlap_dsv4_rocm_indexer,
-                )
-
-                if not should_overlap_dsv4_rocm_indexer(
-                    self.aux_stream_list,
-                    attn_metadata,
-                    self.swa_cache_layer.prefix,
-                ):
-                    aux_stream = None
+                # C128A layers do not benefit from aux-stream overlap on ROCm at
+                # the decode batch sizes we target: the per-layer event /
+                # stream-switch overhead exceeds the compressor savings. Keep
+                # serial; the indexer (c4a) path is where the blog-aligned win
+                # comes from.
+                aux_stream = None
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
@@ -529,12 +506,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            execute_parallel = maybe_execute_in_parallel
-            q, _ = execute_parallel(
+            q, _ = maybe_execute_in_parallel(
                 wq_b_kv_insert,
                 lambda: compressor(kv_score, positions, self.rotary_emb),
-                self.ln_events[2],
-                self.ln_events[3],
+                self.ln_events[0],
+                self.ln_events[1],
                 aux_stream,
             )
         else:

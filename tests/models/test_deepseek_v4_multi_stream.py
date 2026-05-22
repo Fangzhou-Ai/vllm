@@ -10,12 +10,8 @@ import torch
 from vllm.models.deepseek_v4.amd.multi_stream import (
     create_dsv4_rocm_aux_stream_list,
     should_overlap_dsv4_rocm_indexer,
-    should_overlap_dsv4_rocm_input_gemms,
 )
-from vllm.utils.multi_stream_utils import (
-    maybe_execute_in_parallel,
-    maybe_execute_in_parallel_rocm,
-)
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
 
 
 @dataclass
@@ -55,26 +51,24 @@ def test_should_overlap_dsv4_rocm_indexer_decode_only():
         )
 
 
-def test_should_overlap_dsv4_rocm_input_gemms_disabled():
+def test_should_overlap_dsv4_rocm_indexer_master_switch():
+    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=2)}
+    # aux_stream_list=None mirrors VLLM_DSV4_ROCM_MULTI_STREAM=0 → off.
+    assert not should_overlap_dsv4_rocm_indexer(None, attn_metadata, "swa.prefix")
+
+
+def test_should_overlap_dsv4_rocm_indexer_all_steps_when_decode_only_off():
+    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=0)}
     aux_streams = [torch.cuda.Stream()]
-    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=1)}
     with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
-        envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD = 4
-        envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = True
-        assert not should_overlap_dsv4_rocm_input_gemms(
-            4, aux_streams, attn_metadata, "swa.prefix"
-        )
-        assert not should_overlap_dsv4_rocm_input_gemms(
-            8, aux_streams, attn_metadata, "swa.prefix"
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = False
+        assert should_overlap_dsv4_rocm_indexer(
+            aux_streams, attn_metadata, "swa.prefix"
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
-@pytest.mark.parametrize(
-    "parallel_fn",
-    [maybe_execute_in_parallel, maybe_execute_in_parallel_rocm],
-)
-def test_maybe_execute_in_parallel_matches_sequential(parallel_fn):
+def test_maybe_execute_in_parallel_matches_sequential():
     device = torch.device("cuda")
     aux_stream = torch.cuda.Stream(device)
     event0 = torch.cuda.Event()
@@ -89,9 +83,9 @@ def test_maybe_execute_in_parallel_matches_sequential(parallel_fn):
     def fn1() -> torch.Tensor:
         return y + 1
 
-    parallel = parallel_fn(fn0, fn1, event0, event1, aux_stream)
-    sequential = parallel_fn(fn0, fn1, event0, event1, None)
-    torch.cuda.synchronize()
+    parallel = maybe_execute_in_parallel(fn0, fn1, event0, event1, aux_stream)
+    sequential = maybe_execute_in_parallel(fn0, fn1, event0, event1, None)
+    torch.accelerator.synchronize()
 
     assert torch.equal(parallel[0], sequential[0])
     assert torch.equal(parallel[1], sequential[1])
