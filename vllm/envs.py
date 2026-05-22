@@ -261,6 +261,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_DSV4_ROCM_MULTI_STREAM: bool = False
     VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY: bool = True
+    VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH: int = 513
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1885,6 +1886,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tokens (prefill stays serial). Ignored on CUDA.
     "VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY": lambda: bool(
         int(os.getenv("VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY", "1"))
+    ),
+    # Minimum active decode batch size needed before enabling the ROCm
+    # DeepSeek-V4 CSA indexer aux stream. Keep the default one above the
+    # default max CUDA graph capture size (512): CUDA graph replay fixes the
+    # stream topology captured at warmup, and the aux indexer path regresses
+    # the 1k/1k conc=4 decode graph because it contends with default-stream
+    # GEMMs without enough indexer work to hide.
+    "VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH": lambda: int(
+        os.getenv("VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH", "513")
     ),
     # Format for saving torch.compile cache artifacts
     # - "binary": saves as binary file

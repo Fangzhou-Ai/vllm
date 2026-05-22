@@ -624,9 +624,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 schedule_metadata=self.scheduler_metadata_buffer,
             )
 
+        max_seq_len = common_attn_metadata.max_seq_len
+        if self.compress_ratio > 1:
+            max_seq_len = max(1, max_seq_len // self.compress_ratio)
+
         attn_metadata = DeepseekV32IndexerMetadata(
             seq_lens=common_attn_metadata.seq_lens,
-            max_seq_len=common_attn_metadata.max_seq_len,
+            max_seq_len=max_seq_len,
             slot_mapping=compressed_slot_mapping,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,

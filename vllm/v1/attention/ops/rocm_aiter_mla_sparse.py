@@ -75,6 +75,21 @@ def _get_decode_logits_buffer(
     return _DECODE_LOGITS_BUFFERS[key]
 
 
+def _round_up_to_multiple(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _get_active_decode_logits_len(
+    max_model_len: int,
+    max_seq_len: int,
+    block_size: int,
+) -> int:
+    return min(
+        max_model_len,
+        max(block_size, _round_up_to_multiple(max_seq_len, block_size)),
+    )
+
+
 @triton.jit
 def _indexer_k_quant_and_cache_kernel(
     k_ptr,  # [num_tokens, head_dim]
@@ -807,6 +822,7 @@ def rocm_aiter_sparse_attn_indexer(
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
+        block_size = kv_cache.shape[1]
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
             # pad in edge case where we have short chunked prefill length <
@@ -826,8 +842,19 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
+        # The paged logits kernel only needs enough columns for the active
+        # compressed context in this step. Keeping the full model-length stride
+        # forces the downstream top-k dispatch to pick its long-sequence radix
+        # path even for 1k1k decode rows that only contain a few hundred valid
+        # compressed positions. Bucket by KV block size to keep the persistent
+        # buffer set small while preserving a stride large enough for every row.
+        active_max_model_len = _get_active_decode_logits_len(
+            max_model_len,
+            layer_attn_metadata.max_seq_len,
+            block_size,
+        )
         decode_logits_buffer = _get_decode_logits_buffer(
-            num_padded_tokens, max_model_len, device
+            num_padded_tokens, active_max_model_len, device
         )
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
@@ -836,7 +863,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.seq_lens,
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
-            max_model_len=max_model_len,
+            max_model_len=active_max_model_len,
             out_logits=decode_logits_buffer,
         )
 

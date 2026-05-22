@@ -11,6 +11,10 @@ Aligned with the DeepSeek-V4 blog/CSA design (issue #41820):
   on ROCm: at small decode batch sizes the per-layer event / stream-switch
   overhead exceeds the achievable savings, regressing TPOT (observed on
   1k1k conc=4).
+* C4A indexer overlap is also gated by active decode batch size. By default the
+  gate is above the standard CUDA graph capture range, because graph replay
+  fixes the captured stream topology and 1k1k conc=4 regresses when the aux
+  path contends with default-stream GEMMs.
 """
 
 from __future__ import annotations
@@ -41,19 +45,26 @@ def create_dsv4_rocm_aux_stream_list() -> list[torch.cuda.Stream] | None:
     return [torch.cuda.Stream()]
 
 
-def _has_decode_tokens(
+def _active_decode_batch_size(
     attn_metadata: dict[str, AttentionMetadata] | list | None,
     swa_cache_prefix: str,
-) -> bool:
+) -> int:
     if not isinstance(attn_metadata, dict):
-        return False
+        return 0
     swa_metadata = cast(
         "DeepseekSparseSWAMetadata | None",
         attn_metadata.get(swa_cache_prefix),
     )
     if swa_metadata is None:
-        return False
-    return swa_metadata.num_decodes > 0
+        return 0
+    num_decodes = int(swa_metadata.num_decodes)
+    query_start_loc_cpu = getattr(swa_metadata, "query_start_loc_cpu", None)
+    if query_start_loc_cpu is None or num_decodes == 0:
+        return num_decodes
+    query_lens = (
+        query_start_loc_cpu[1 : num_decodes + 1] - query_start_loc_cpu[:num_decodes]
+    )
+    return int(torch.count_nonzero(query_lens).item())
 
 
 def should_overlap_dsv4_rocm_indexer(
@@ -63,13 +74,14 @@ def should_overlap_dsv4_rocm_indexer(
 ) -> bool:
     """Whether to overlap the lightning indexer with main attention prep.
 
-    Gated on the master switch (via ``aux_stream_list`` being non-None) and,
-    by default, on the step containing at least one decode token. Prefill-only
-    steps stay serial because the GEMMs already saturate the GPU and aux-stream
-    overhead would only hurt.
+    Gated on the master switch (via ``aux_stream_list`` being non-None), decode
+    presence by default, and a minimum decode-batch threshold. Prefill-only and
+    small captured decode graphs stay serial because the GEMMs already saturate
+    the GPU and aux-stream overhead would only hurt.
     """
     if aux_stream_list is None:
         return False
-    if envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY:
-        return _has_decode_tokens(attn_metadata, swa_cache_prefix)
-    return True
+    num_decodes = _active_decode_batch_size(attn_metadata, swa_cache_prefix)
+    if envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY and num_decodes == 0:
+        return False
+    return num_decodes >= envs.VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH

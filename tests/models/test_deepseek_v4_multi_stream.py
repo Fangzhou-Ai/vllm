@@ -12,11 +12,15 @@ from vllm.models.deepseek_v4.amd.multi_stream import (
     should_overlap_dsv4_rocm_indexer,
 )
 from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+    _get_active_decode_logits_len,
+)
 
 
 @dataclass
 class _FakeSWAMetadata:
     num_decodes: int
+    query_start_loc_cpu: torch.Tensor | None = None
 
 
 def test_create_dsv4_rocm_aux_stream_list_disabled():
@@ -34,10 +38,11 @@ def test_create_dsv4_rocm_aux_stream_list_enabled():
 
 
 def test_should_overlap_dsv4_rocm_indexer_decode_only():
-    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=2)}
+    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=16)}
     aux_streams = [torch.cuda.Stream()]
     with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
         envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = True
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH = 16
         assert should_overlap_dsv4_rocm_indexer(
             aux_streams, attn_metadata, "swa.prefix"
         )
@@ -52,7 +57,7 @@ def test_should_overlap_dsv4_rocm_indexer_decode_only():
 
 
 def test_should_overlap_dsv4_rocm_indexer_master_switch():
-    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=2)}
+    attn_metadata = {"swa.prefix": _FakeSWAMetadata(num_decodes=16)}
     # aux_stream_list=None mirrors VLLM_DSV4_ROCM_MULTI_STREAM=0 → off.
     assert not should_overlap_dsv4_rocm_indexer(None, attn_metadata, "swa.prefix")
 
@@ -62,9 +67,88 @@ def test_should_overlap_dsv4_rocm_indexer_all_steps_when_decode_only_off():
     aux_streams = [torch.cuda.Stream()]
     with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
         envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = False
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH = 0
         assert should_overlap_dsv4_rocm_indexer(
             aux_streams, attn_metadata, "swa.prefix"
         )
+
+
+def test_should_overlap_dsv4_rocm_indexer_min_decode_batch_gate():
+    aux_streams = [torch.cuda.Stream()]
+    with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = True
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH = 16
+        assert not should_overlap_dsv4_rocm_indexer(
+            aux_streams,
+            {"swa.prefix": _FakeSWAMetadata(num_decodes=4)},
+            "swa.prefix",
+        )
+        assert should_overlap_dsv4_rocm_indexer(
+            aux_streams,
+            {"swa.prefix": _FakeSWAMetadata(num_decodes=16)},
+            "swa.prefix",
+        )
+
+
+def test_should_overlap_dsv4_rocm_indexer_default_cudagraph_gate():
+    aux_streams = [torch.cuda.Stream()]
+    with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = True
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH = 513
+        assert not should_overlap_dsv4_rocm_indexer(
+            aux_streams,
+            {"swa.prefix": _FakeSWAMetadata(num_decodes=512)},
+            "swa.prefix",
+        )
+        assert should_overlap_dsv4_rocm_indexer(
+            aux_streams,
+            {"swa.prefix": _FakeSWAMetadata(num_decodes=513)},
+            "swa.prefix",
+        )
+
+
+def test_should_overlap_dsv4_rocm_indexer_ignores_cudagraph_padding():
+    aux_streams = [torch.cuda.Stream()]
+    query_start_loc_cpu = torch.tensor([0, 1, 2, 3, 4, 4, 4, 4, 4])
+    attn_metadata = {
+        "swa.prefix": _FakeSWAMetadata(
+            num_decodes=8,
+            query_start_loc_cpu=query_start_loc_cpu,
+        )
+    }
+    with patch("vllm.models.deepseek_v4.amd.multi_stream.envs") as envs:
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY = True
+        envs.VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH = 8
+        assert not should_overlap_dsv4_rocm_indexer(
+            aux_streams, attn_metadata, "swa.prefix"
+        )
+
+
+def test_active_decode_logits_len_uses_active_context_bucket():
+    assert (
+        _get_active_decode_logits_len(
+            max_model_len=40960,
+            max_seq_len=257,
+            block_size=256,
+        )
+        == 512
+    )
+    assert (
+        _get_active_decode_logits_len(
+            max_model_len=40960,
+            max_seq_len=0,
+            block_size=256,
+        )
+        == 256
+    )
+    assert (
+        _get_active_decode_logits_len(
+            max_model_len=512,
+            max_seq_len=40960,
+            block_size=256,
+        )
+        == 512
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA/HIP required")
