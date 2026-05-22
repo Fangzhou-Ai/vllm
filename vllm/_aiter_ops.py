@@ -2233,8 +2233,12 @@ class rocm_aiter_ops:
     def is_triton_gemm_w8a8_tuned(n: int, k: int) -> bool:
         return (n, k) in [
             (1024, 8192),
+            # DeepSeek-V4 shared expert gate/up projection under TP=8.
+            (768, 7168),
             # DeepSeek-V4 fused wqa/wkv input projection under TP=8.
             (2048, 7168),
+            # DeepSeek-V4 wo_a projection under TP=8.
+            (2048, 4096),
             (2112, 7168),
             (3072, 1536),
             (32768, 8192),
@@ -2242,7 +2246,11 @@ class rocm_aiter_ops:
             (4608, 7168),
             (512, 7168),
             (7168, 2048),
+            # DeepSeek-V4 shared expert down projection under TP=8.
+            (7168, 384),
             (7168, 256),
+            # DeepSeek-V4 wq_b projection under TP=8.
+            (8192, 1536),
             (8192, 1024),
             (8192, 32768),
         ]
