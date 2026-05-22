@@ -290,8 +290,11 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Pre-allocate attention output with FlashMLA-padded head count.
         # The op writes into `o_padded`; we slice to n_local_heads after.
         num_tokens = hidden_states.shape[0]
+        output_heads = (
+            self.n_local_heads if current_platform.is_rocm() else self.padded_heads
+        )
         o_padded = torch.empty(
-            (num_tokens, self.padded_heads, self.head_dim),
+            (num_tokens, output_heads, self.head_dim),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
@@ -537,14 +540,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             out.zero_()
             return
 
-        # Pad q to FlashMLA-required head count (64 or 128)
+        # Pad q to FlashMLA-required head count (64 or 128). The ROCm sparse
+        # Triton path handles the true local head count directly.
+        output = out
         if self.n_local_heads < self.padded_heads:
-            pad_size = self.padded_heads - self.n_local_heads
-            q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
+            if current_platform.is_rocm():
+                output = out[:, : self.n_local_heads, :]
+            else:
+                pad_size = self.padded_heads - self.n_local_heads
+                q = F.pad(q, (0, 0, 0, pad_size), value=0.0)
 
         # MLA attention writes into the pre-allocated `out` buffer
-        # ([num_tokens, padded_heads, head_dim]).
-        self.mla_attn(q, kv, positions, output=out)
+        # ([num_tokens, padded_heads, head_dim]) or real local heads on ROCm.
+        self.mla_attn(q, kv, positions, output=output)
 
     def _fused_qnorm_rope_kv_insert(
         self,

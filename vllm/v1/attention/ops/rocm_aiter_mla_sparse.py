@@ -1136,6 +1136,49 @@ def build_ragged_indices_from_dense(
     return flat, indptr
 
 
+def build_ragged_indices_from_dense_into(
+    indices: torch.Tensor,
+    lengths: torch.Tensor,
+    ragged_indices_buffer: torch.Tensor,
+    ragged_indptr_buffer: torch.Tensor,
+    num_rows: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build ragged metadata directly into persistent CUDA-graph buffers."""
+    indices = indices.reshape(indices.shape[0], -1)
+    lengths = lengths.to(device=indices.device, dtype=torch.int32).reshape(-1)
+    assert lengths.numel() == indices.shape[0], (
+        f"Expected one length per row, got {lengths.shape} for indices {indices.shape}"
+    )
+
+    max_width = indices.shape[1] if indices.ndim == 2 else 0
+    lengths = lengths.clamp(min=0, max=max_width).contiguous()
+
+    assert ragged_indptr_buffer.numel() >= indices.shape[0] + 1
+    indptr = ragged_indptr_buffer[: indices.shape[0] + 1]
+    indptr[0] = 0
+    torch.cumsum(lengths, dim=0, out=indptr[1:])
+
+    max_entries = max(indices.shape[0] * max_width, 1)
+    assert ragged_indices_buffer.numel() >= max_entries
+    flat = ragged_indices_buffer[:max_entries]
+    if indices.numel() > 0:
+        block_size = 128
+        _pack_dense_prefix_to_ragged_kernel[
+            (indices.shape[0], triton.cdiv(max_width, block_size))
+        ](
+            indices,
+            lengths,
+            indptr,
+            flat,
+            indices.stride(0),
+            int(num_rows),
+            max_width,
+            BLOCK_SIZE=block_size,
+        )
+
+    return flat, indptr
+
+
 def _as_int32_contiguous_1d(x: torch.Tensor) -> torch.Tensor:
     if x.dtype == torch.int32 and x.ndim == 1 and x.is_contiguous():
         return x
