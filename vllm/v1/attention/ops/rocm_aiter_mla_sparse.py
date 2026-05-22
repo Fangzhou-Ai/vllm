@@ -23,6 +23,58 @@ else:
     _ON_GFX950 = False
 
 
+# Per-(device, bucket, max_model_len) persistent buffer for the AITER
+# paged_mqa_logits decode output, shared across all DeepSeek-V4 indexer layers.
+# Allocated lazily on first decode call at each bucket size; once a bucket's
+# buffer is allocated, its pointer is stable for the lifetime of the process.
+#
+# Why this exists: the AITER paged_mqa_logits kernel writes its dense FP32
+# logits into a caller-supplied buffer. Without this cache, every indexer call
+# does `torch.full([B*next_n, max_model_len], -inf, float32)` (~ a few MB) on
+# the current stream. On ROCm multi-stream overlap, that per-call allocation on
+# the aux stream forces PyTorch's caching allocator to insert
+# ``hipStreamWaitEvent`` whenever it must reuse a block last owned by the
+# default stream — serializing aux behind default and erasing the parallelism
+# the overlap was meant to expose. Reusing a persistent buffer eliminates the
+# cross-stream allocator interaction entirely.
+#
+# Why per-bucket (and never reallocate in place): under FULL cudagraph capture
+# the kernel pointer is baked into the captured graph. If a later call grew
+# the buffer, the previously captured graphs' pointers would dangle. Keying by
+# exact bucket size means each captured shape sees a stable, non-aliasing
+# buffer for the lifetime of its graph.
+_DECODE_LOGITS_BUFFERS: dict[tuple[str, int, int, torch.dtype], torch.Tensor] = {}
+
+
+def _get_decode_logits_buffer(
+    num_padded_tokens: int,
+    max_model_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return a persistent FP32 buffer sized for the AITER decode mqa_logits.
+
+    The buffer's column dim equals ``max_model_len`` (which the kernel uses
+    for strides), and the row dim is rounded up to a 64-token bucket so a
+    handful of common decode batch sizes converge to a small set of buffers
+    after warmup.
+    """
+    dtype = torch.float32
+    # Bucket to a 64-token multiple with a 256-row floor. Once a captured
+    # cudagraph references a given bucket's buffer, we must not reallocate
+    # that bucket (would dangle the captured pointer); a fresh bucket size
+    # creates a new entry instead.
+    bucket = max(256, ((num_padded_tokens + 63) // 64) * 64)
+    key = (str(device), bucket, max_model_len, dtype)
+    cached = _DECODE_LOGITS_BUFFERS.get(key)
+    if cached is None:
+        _DECODE_LOGITS_BUFFERS[key] = torch.empty(
+            (bucket, max_model_len),
+            dtype=dtype,
+            device=device,
+        )
+    return _DECODE_LOGITS_BUFFERS[key]
+
+
 @triton.jit
 def _indexer_k_quant_and_cache_kernel(
     k_ptr,  # [num_tokens, head_dim]
@@ -354,6 +406,7 @@ def rocm_fp8_paged_mqa_logits(
     block_tables: torch.Tensor,
     schedule_metadata: torch.Tensor,
     max_model_len: int,
+    out_logits: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute FP8 MQA logits using paged KV-cache.
 
@@ -371,6 +424,12 @@ def rocm_fp8_paged_mqa_logits(
         schedule_metadata: Returned by `get_paged_mqa_logits_metadata`;
             used to distribute work across SMs.
         max_model_len: Maximum sequence length used to size the logits output.
+        out_logits: Optional persistent fp32 buffer of shape
+            `[>= B*next_n, >= max_model_len]`. When provided, the requested
+            slice is reset to ``-inf`` in place and reused as the kernel output
+            (avoids the per-call ``torch.full`` allocation, which is critical
+            for multi-stream overlap on ROCm where cross-stream allocs can
+            force the caching allocator to insert sync events).
 
     Returns:
         Logits tensor of shape [B * next_n, max_model_len], dtype
@@ -392,17 +451,32 @@ def rocm_fp8_paged_mqa_logits(
                 aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits
             )
             batch_size, next_n, heads, _ = q_fp8.shape
-            out_logits = torch.full(
-                [batch_size * next_n, max_model_len],
-                float("-inf"),
-                device="cuda",
-                dtype=torch.float32,
-            )
+            num_tokens = batch_size * next_n
+            if out_logits is not None:
+                assert out_logits.shape[0] >= num_tokens, (
+                    f"out_logits.shape[0]={out_logits.shape[0]} < B*next_n={num_tokens}"
+                )
+                assert out_logits.shape[1] >= max_model_len, (
+                    f"out_logits.shape[1]={out_logits.shape[1]} < "
+                    f"max_model_len={max_model_len}"
+                )
+                assert out_logits.dtype == torch.float32
+                logits_view = out_logits[:num_tokens, :max_model_len]
+                # Kernel only writes valid (q,k) positions; padded entries must
+                # be -inf going in.
+                logits_view.fill_(float("-inf"))
+            else:
+                logits_view = torch.full(
+                    [num_tokens, max_model_len],
+                    float("-inf"),
+                    device="cuda",
+                    dtype=torch.float32,
+                )
             deepgemm_fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                out_logits,
+                logits_view,
                 context_lens,
                 block_tables,
                 max_model_len,
@@ -411,7 +485,7 @@ def rocm_fp8_paged_mqa_logits(
                 KVBlockSize=block_size,
                 WavePerEU=2,
             )
-            return out_logits
+            return logits_view
         deepgemm_fp8_paged_mqa_logits_stage1 = (
             aiter_paged_mqa_logits_module.deepgemm_fp8_paged_mqa_logits_stage1
         )
@@ -752,6 +826,9 @@ def rocm_aiter_sparse_attn_indexer(
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
 
+        decode_logits_buffer = _get_decode_logits_buffer(
+            num_padded_tokens, max_model_len, device
+        )
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -760,6 +837,7 @@ def rocm_aiter_sparse_attn_indexer(
             decode_metadata.block_table,
             decode_metadata.schedule_metadata,
             max_model_len=max_model_len,
+            out_logits=decode_logits_buffer,
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
