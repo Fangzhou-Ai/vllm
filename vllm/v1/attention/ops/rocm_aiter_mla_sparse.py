@@ -759,7 +759,6 @@ def rocm_aiter_sparse_attn_indexer(
                 scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
@@ -802,6 +801,7 @@ def rocm_aiter_sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
+            topk_indices.fill_(-1)
 
             num_rows = logits.shape[0]
 
@@ -868,6 +868,7 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        topk_indices.fill_(-1)
         num_rows = logits.shape[0]
 
         torch.ops._C.top_k_per_row_decode(
