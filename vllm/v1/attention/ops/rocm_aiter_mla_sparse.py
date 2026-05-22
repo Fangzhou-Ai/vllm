@@ -968,6 +968,47 @@ def _apply_inv_rope_ref(
     return _apply_gptj_inv_rope_ref(x, positions, rotary_emb.cos_sin_cache, rope_dim)
 
 
+_ROCM_WO_A_CACHE_ATTR = "_vllm_rocm_wo_a_bf16_weight"
+_ROCM_WO_A_CACHE_KEY_ATTR = "_vllm_rocm_wo_a_bf16_weight_key"
+
+
+def _get_rocm_wo_a_bf16_weight(
+    wo_a: torch.nn.Module,
+    n_local_groups: int,
+    o_lora_rank: int,
+    hidden_dim: int,
+) -> torch.Tensor:
+    weight = wo_a.weight
+    scale = wo_a.weight_scale_inv
+    cache_key = (
+        weight.data_ptr(),
+        scale.data_ptr(),
+        tuple(weight.shape),
+        tuple(scale.shape),
+        n_local_groups,
+        o_lora_rank,
+        hidden_dim,
+    )
+    cached_key = getattr(wo_a, _ROCM_WO_A_CACHE_KEY_ATTR, None)
+    cached_weight = getattr(wo_a, _ROCM_WO_A_CACHE_ATTR, None)
+    if cached_weight is not None and cached_key == cache_key:
+        return cached_weight
+
+    with torch.no_grad():
+        wo_a_weight = weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
+            torch.float32
+        )
+        wo_a_scale = _expand_2d_block_scales(
+            scale.view(n_local_groups, -1, scale.shape[-1]),
+            o_lora_rank,
+            hidden_dim,
+        )
+        cached_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
+    setattr(wo_a, _ROCM_WO_A_CACHE_ATTR, cached_weight)
+    setattr(wo_a, _ROCM_WO_A_CACHE_KEY_ATTR, cache_key)
+    return cached_weight
+
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,
@@ -985,17 +1026,12 @@ def rocm_inv_rope_einsum(
 
     hidden_dim = o_ref.shape[-1]
     if hasattr(wo_a, "weight_scale_inv"):
-        wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
-            torch.float32
-        )
-        wo_a_scale = _expand_2d_block_scales(
-            wo_a.weight_scale_inv.view(
-                n_local_groups, -1, wo_a.weight_scale_inv.shape[-1]
-            ),
+        wo_a_weight = _get_rocm_wo_a_bf16_weight(
+            wo_a,
+            n_local_groups,
             o_lora_rank,
             hidden_dim,
         )
-        wo_a_weight = (wo_a_weight * wo_a_scale).to(torch.bfloat16)
     else:
         wo_a_weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim).to(
             torch.bfloat16
