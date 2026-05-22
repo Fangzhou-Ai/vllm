@@ -329,6 +329,22 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
         out_dtype = self.config.out_dtype
         if self.use_triton:
+            # AITER Triton's default small-M config for DeepSeek-V4 shared
+            # expert down_proj (N=7168, K=384, M=1) trips the ROCm Triton
+            # pointer canonicalizer on gfx950. vLLM's block-scaled Triton
+            # kernel handles this capture shape, while AITER remains faster
+            # for the batched decode shapes.
+            if B.shape == (7168, 384) and A.shape[0] == 1:
+                import vllm.model_executor.kernels.linear.scaled_mm.triton  # noqa: F401
+
+                return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+                    A,
+                    B,
+                    As,
+                    Bs,
+                    list(self.weight_group_shape),
+                    out_dtype,
+                )
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
         else:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale
