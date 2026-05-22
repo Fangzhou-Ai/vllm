@@ -801,7 +801,6 @@ def rocm_aiter_sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
-            topk_indices.fill_(-1)
 
             num_rows = logits.shape[0]
 
@@ -868,7 +867,6 @@ def rocm_aiter_sparse_attn_indexer(
         )
 
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
-        topk_indices.fill_(-1)
         num_rows = logits.shape[0]
 
         torch.ops._C.top_k_per_row_decode(
