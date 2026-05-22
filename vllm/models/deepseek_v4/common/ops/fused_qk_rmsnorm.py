@@ -30,28 +30,33 @@ def _fused_q_kv_rmsnorm_kernel(
     token_idx = tl.program_id(0).to(tl.int64)
     pid_task = tl.program_id(1)
 
-    if pid_task == 0:
-        SIZE = Q_SIZE
-        row_in = q_ptr + token_idx * q_in_stride
-        weight_ptr = q_weight_ptr
-        row_out = q_out_ptr + token_idx * q_out_stride
-    else:
-        SIZE = KV_SIZE
-        row_in = kv_ptr + token_idx * kv_in_stride
-        weight_ptr = kv_weight_ptr
-        row_out = kv_out_ptr + token_idx * kv_out_stride
-
     # RMSNorm in fp32 throughout — matches csrc/layernorm_kernels.cu's
     # `(scalar_t)(x * s_variance * w)` and DeepseekV4's compressor kernel, which
     # keep x, rrms, and w all in fp32 and perform a single cast at store.
     block = tl.arange(0, BLOCK_SIZE)
-    mask = block < SIZE
-    x = tl.load(row_in + block, mask=mask, other=0.0).to(tl.float32)
-    variance = tl.sum(x * x, axis=0) / SIZE
+    is_q = pid_task == 0
+    q_mask = (block < Q_SIZE) & is_q
+    kv_mask = (block < KV_SIZE) & (pid_task != 0)
+
+    # Keep task selection branchless. ROCm Triton can fail pointer
+    # canonicalization for an scf.if that returns different pointer bases.
+    q_row_in = q_ptr + token_idx * q_in_stride
+    kv_row_in = kv_ptr + token_idx * kv_in_stride
+    q_x = tl.load(q_row_in + block, mask=q_mask, other=0.0).to(tl.float32)
+    kv_x = tl.load(kv_row_in + block, mask=kv_mask, other=0.0).to(tl.float32)
+    x = q_x + kv_x
+
+    size = tl.where(is_q, Q_SIZE, KV_SIZE)
+    variance = tl.sum(x * x, axis=0) / size
     rrms = tl.rsqrt(variance + eps)
-    w = tl.load(weight_ptr + block, mask=mask, other=0.0).to(tl.float32)
+    q_w = tl.load(q_weight_ptr + block, mask=q_mask, other=0.0).to(tl.float32)
+    kv_w = tl.load(kv_weight_ptr + block, mask=kv_mask, other=0.0).to(tl.float32)
+    w = q_w + kv_w
     y = x * rrms * w
-    tl.store(row_out + block, y.to(row_out.dtype.element_ty), mask=mask)
+    q_row_out = q_out_ptr + token_idx * q_out_stride
+    kv_row_out = kv_out_ptr + token_idx * kv_out_stride
+    tl.store(q_row_out + block, y.to(q_out_ptr.dtype.element_ty), mask=q_mask)
+    tl.store(kv_row_out + block, y.to(kv_out_ptr.dtype.element_ty), mask=kv_mask)
 
 
 def fused_q_kv_rmsnorm(
