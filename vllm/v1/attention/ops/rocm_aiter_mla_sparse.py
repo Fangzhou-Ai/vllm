@@ -958,7 +958,7 @@ def _apply_inv_rope_ref(
         try:
             query, _ = rotary_emb.forward_native(
                 positions,
-                x.clone(),
+                x,
                 None,
                 inverse=True,
             )
