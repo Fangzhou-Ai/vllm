@@ -4,6 +4,7 @@
 import json
 from argparse import ArgumentError
 from contextlib import AbstractContextManager, nullcontext
+from types import SimpleNamespace
 from typing import Annotated, Literal
 
 import pytest
@@ -13,6 +14,7 @@ from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
+    _get_rocm_dsv4_default_max_num_seqs,
     contains_type,
     get_kwargs,
     get_type,
@@ -44,6 +46,34 @@ def test_optional_type():
     optional_type_func = optional_type(int)
     assert optional_type_func("None") is None
     assert optional_type_func("42") == 42
+
+
+def test_rocm_dsv4_default_max_num_seqs(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model_config = SimpleNamespace(architectures=["DeepseekV4ForCausalLM"])
+
+    monkeypatch.setattr("vllm.engine.arg_utils.current_platform.is_rocm", lambda: False)
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.envs.VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS",
+        64,
+        raising=False,
+    )
+    assert _get_rocm_dsv4_default_max_num_seqs(model_config) is None
+
+    monkeypatch.setattr("vllm.engine.arg_utils.current_platform.is_rocm", lambda: True)
+    assert _get_rocm_dsv4_default_max_num_seqs(model_config) == 64
+
+    model_config.architectures = ["LlamaForCausalLM"]
+    assert _get_rocm_dsv4_default_max_num_seqs(model_config) is None
+
+    model_config.architectures = ["DeepseekV4ForCausalLM"]
+    monkeypatch.setattr(
+        "vllm.engine.arg_utils.envs.VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS",
+        0,
+        raising=False,
+    )
+    assert _get_rocm_dsv4_default_max_num_seqs(model_config) is None
 
 
 @pytest.mark.parametrize(

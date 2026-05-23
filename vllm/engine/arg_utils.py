@@ -132,10 +132,26 @@ else:
 
 logger = init_logger(__name__)
 
+_ROCM_DSV4_ARCHITECTURES = frozenset({"DeepseekV4ForCausalLM"})
+
 # object is used to allow for special typing forms
 T = TypeVar("T")
 TypeHint: TypeAlias = type[Any] | object
 TypeHintT: TypeAlias = type[T] | object
+
+
+def _get_rocm_dsv4_default_max_num_seqs(
+    model_config: ModelConfig,
+) -> int | None:
+    if not current_platform.is_rocm():
+        return None
+
+    architectures = model_config.architectures or []
+    if not any(arch in _ROCM_DSV4_ARCHITECTURES for arch in architectures):
+        return None
+
+    default_max_num_seqs = envs.VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS
+    return default_max_num_seqs if default_max_num_seqs > 0 else None
 
 
 def parse_type(return_type: Callable[[str], T]) -> Callable[[str], T]:
@@ -2515,6 +2531,23 @@ class EngineArgs:
                 self.max_num_batched_tokens *= 2
             if orig_max_num_seqs is None:
                 self.max_num_seqs *= 2
+
+        rocm_dsv4_max_num_seqs = (
+            _get_rocm_dsv4_default_max_num_seqs(model_config)
+            if orig_max_num_seqs is None
+            else None
+        )
+        if rocm_dsv4_max_num_seqs is not None:
+            assert self.max_num_seqs is not None  # For type checking
+            default_max_num_seqs = self.max_num_seqs
+            self.max_num_seqs = min(self.max_num_seqs, rocm_dsv4_max_num_seqs)
+            if self.max_num_seqs != default_max_num_seqs:
+                logger.info(
+                    "Defaulting max_num_seqs to %d for ROCm DeepSeek-V4 "
+                    "decode. Pass --max-num-seqs or set "
+                    "VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS to override.",
+                    self.max_num_seqs,
+                )
 
         if orig_max_num_batched_tokens is None:
             assert model_config.max_model_len is not None, (

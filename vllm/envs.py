@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_FP8_PADDING: bool = True
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
+    VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS: int = 64
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1176,6 +1177,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to use the shuffled kv cache layout
     "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT": lambda: (
         os.getenv("VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT", "False").lower() in ("true", "1")
+    ),
+    # Default max_num_seqs for ROCm DeepSeek-V4. MI355X 1k/1k decode favors
+    # admitting requests in 64-sequence waves instead of the generic 256
+    # default; explicit --max-num-seqs still takes precedence. Set to 0 to
+    # restore the generic default.
+    "VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS": lambda: int(
+        os.getenv("VLLM_ROCM_DSV4_DEFAULT_MAX_NUM_SEQS", "64")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4 or NONE
