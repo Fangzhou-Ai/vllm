@@ -356,15 +356,19 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         return self.wo_b(z.flatten(1))
 
     def attn_gemm_parallel_execute(self, hidden_states) -> tuple[Any, ...]:
-        aux_streams = self.aux_stream_list
-        if aux_streams is not None:
+        # The 3-way input-GEMM overlap needs three auxiliary streams. ROCm
+        # exposes a single aux stream for CSA indexer overlap, so run the
+        # input GEMMs serially there instead of asserting that three exist.
+        aux_streams: list[torch.cuda.Stream] | None = self.aux_stream_list
+        if aux_streams is not None and current_platform.is_rocm():
+            aux_streams = None
+        elif aux_streams is not None:
             assert len(aux_streams) >= 3
             aux_streams = aux_streams[:3]
 
         # fused_wqa_wkv (heaviest) on default; the three lighter input GEMMs
         # on aux streams 0..2 when their owning module exists. ln_events[0]
         # is the fan-out start event; ln_events[1..3] are per-aux done events.
-        # On ROCm, aux_streams is None and execute_in_parallel runs serially.
         aux_fns: list[Callable[[], Any] | None] = [None, None, None]
 
         if self.compressor is not None:
@@ -403,14 +407,17 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             qr_kv, _ = self.fused_wqa_wkv(hidden_states)
             return qr_kv
 
+        overlap_input_gemms = (
+            aux_streams is not None
+            and hidden_states.shape[0] <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD
+        )
         qr_kv, (kv_score, indexer_weights, indexer_kv_score) = execute_in_parallel(
             fused_wqa_wkv,
             aux_fns,
             self.ln_events[0],
             self.ln_events[1:4],
             aux_streams,
-            enable=hidden_states.shape[0]
-            <= envs.VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD,
+            enable=overlap_input_gemms,
         )
 
         return qr_kv, kv_score, indexer_kv_score, indexer_weights
@@ -437,12 +444,20 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
             self.eps,
         )
 
-        # wq_b + kv_insert (+ MLA compressor when an indexer is present) ride
-        # on the default stream so q stays on its consumer stream (mla_attn
-        # downstream reads q on default). Indexer/compressor go on aux for
-        # overlap with default's GEMM + cache write.
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
+            aux_stream = aux_streams[0] if aux_streams is not None else None
+            if current_platform.is_rocm() and aux_stream is not None:
+                from vllm.models.deepseek_v4.amd.multi_stream import (
+                    should_overlap_dsv4_rocm_indexer,
+                )
+
+                if not should_overlap_dsv4_rocm_indexer(
+                    self.aux_stream_list,
+                    attn_metadata,
+                    self.swa_cache_layer.prefix,
+                ):
+                    aux_stream = None
             indexer = self.indexer
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
@@ -453,13 +468,14 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
-            # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default runs
-            # wq_b+kv_insert; slot [0] runs the full indexer; slot [1] runs the
-            # MLA compressor. Slot [2] is reserved for the indexer's inner
-            # overlap. ROCm (aux_streams is None) falls back to sequential.
-            q, _ = execute_in_parallel(
-                wq_b_kv_insert,
-                [
+            def wq_b_kv_insert_and_compress() -> torch.Tensor:
+                q = wq_b_kv_insert()
+                compressor(kv_score, positions, self.rotary_emb)
+                return q
+
+            if current_platform.is_rocm():
+                q, _ = maybe_execute_in_parallel(
+                    wq_b_kv_insert_and_compress,
                     lambda: indexer(
                         hidden_states,
                         qr,
@@ -468,18 +484,44 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                         positions,
                         self.indexer_rotary_emb,
                     ),
-                    lambda: compressor(kv_score, positions, self.rotary_emb),
-                ],
-                self.ln_events[0],
-                [self.ln_events[1], self.ln_events[2]],
-                [aux_streams[0], aux_streams[1]] if aux_streams is not None else None,
-                enable=aux_streams is not None,
-            )
+                    self.ln_events[0],
+                    self.ln_events[1],
+                    aux_stream,
+                )
+            else:
+                # 3-way overlap (matches TRT-LLM PR #14142 Level 1): default
+                # runs wq_b+kv_insert; slot [0] runs the full indexer; slot [1]
+                # runs the MLA compressor. Slot [2] is reserved for the
+                # indexer's inner overlap.
+                q, _ = execute_in_parallel(
+                    wq_b_kv_insert,
+                    [
+                        lambda: indexer(
+                            hidden_states,
+                            qr,
+                            indexer_kv_score,
+                            indexer_weights,
+                            positions,
+                            self.indexer_rotary_emb,
+                        ),
+                        lambda: compressor(kv_score, positions, self.rotary_emb),
+                    ],
+                    self.ln_events[0],
+                    [self.ln_events[1], self.ln_events[2]],
+                    (
+                        [aux_streams[0], aux_streams[1]]
+                        if aux_streams is not None
+                        else None
+                    ),
+                    enable=aux_streams is not None,
+                )
         elif self.compressor is not None:
             # wq_b + kv_insert on default, compressor on aux.
             aux_stream = (
                 self.aux_stream_list[0] if self.aux_stream_list is not None else None
             )
+            if current_platform.is_rocm():
+                aux_stream = None
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:

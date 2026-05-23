@@ -47,6 +47,13 @@ from .model import (
 
 logger = init_logger(__name__)
 
+
+def _dsv4_aux_stream_list() -> list[torch.cuda.Stream] | None:
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        return None
+    return [torch.cuda.Stream() for _ in range(3)]
+
+
 # MoE expert scales are fused into per-layer w13/w2 tensors. The exact
 # parameter suffix depends on which FusedMoE method handles the experts:
 # - fp4 experts (Mxfp4MoEMethod) register ``w{1,2,3}_weight_scale``;
@@ -174,12 +181,8 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
         )
 
         # Three aux streams shared across all MTP layers, mirroring
-        # DeepseekV4Model. ROCm runs the same work serially for now.
-        aux_stream_list = (
-            None
-            if current_platform.is_rocm()
-            else [torch.cuda.Stream() for _ in range(3)]
-        )
+        # DeepseekV4Model.
+        aux_stream_list = _dsv4_aux_stream_list()
 
         # to map the exact layer index from weights
         self.layers = torch.nn.ModuleDict(

@@ -67,6 +67,12 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
+def _dsv4_aux_stream_list() -> list[torch.cuda.Stream] | None:
+    if current_platform.is_rocm() or current_platform.is_xpu():
+        return None
+    return [torch.cuda.Stream() for _ in range(3)]
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -1234,13 +1240,9 @@ class DeepseekV4Model(nn.Module):
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
         # (compressor kv_score, indexer.weights_proj, indexer.compressor
-        # kv_score). fused_wqa_wkv stays on the default stream.
-        # Disable them on ROCm / XPU because of hang issues / no overlap.
-        aux_stream_list = (
-            None
-            if current_platform.is_rocm() or current_platform.is_xpu()
-            else [torch.cuda.Stream() for _ in range(3)]
-        )
+        # kv_score). fused_wqa_wkv stays on the default stream. ROCm overrides
+        # the helper from amd/model.py to expose one opt-in CSA stream.
+        aux_stream_list = _dsv4_aux_stream_list()
 
         self.device = current_platform.device_type
         # Reserved topk indices buffer for all Indexer layers to reuse.
