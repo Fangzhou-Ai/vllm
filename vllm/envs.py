@@ -262,6 +262,7 @@ if TYPE_CHECKING:
     VLLM_DSV4_ROCM_MULTI_STREAM: bool = False
     VLLM_DSV4_ROCM_MULTI_STREAM_DECODE_ONLY: bool = True
     VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH: int = 513
+    VLLM_DSV4_ROCM_MULTI_STREAM_DEFAULT_MAX_NUM_SEQS: int = 64
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
@@ -1895,6 +1896,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # GEMMs without enough indexer work to hide.
     "VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH": lambda: int(
         os.getenv("VLLM_DSV4_ROCM_MULTI_STREAM_MIN_DECODE_BATCH", "513")
+    ),
+    # Default active sequence cap for opt-in ROCm DeepSeek-V4 multi-stream
+    # decode. 1k/1k decode on MI355x regresses at a 128-token decode graph
+    # because the CSA indexer and main attention path leave too little launch
+    # slack once all requests are admitted together. Keeping the default decode
+    # wave at 64 sequences improves high-concurrency output throughput while
+    # preserving explicit --max-num-seqs user overrides. Set to 0 to disable.
+    "VLLM_DSV4_ROCM_MULTI_STREAM_DEFAULT_MAX_NUM_SEQS": lambda: int(
+        os.getenv(
+            "VLLM_DSV4_ROCM_MULTI_STREAM_DEFAULT_MAX_NUM_SEQS",
+            "64",
+        )
     ),
     # Format for saving torch.compile cache artifacts
     # - "binary": saves as binary file
