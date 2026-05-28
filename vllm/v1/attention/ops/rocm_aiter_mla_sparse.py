@@ -1729,6 +1729,60 @@ def rocm_sparse_attn_decode(
         if topk_indices is not None:
             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
 
+    import vllm.envs as envs
+
+    if envs.VLLM_ROCM_DSV4_SGL_SPARSE_DECODE:
+        # WIP: SGLang-inspired FP8-resident decode kernel. The kernel itself is
+        # not yet implemented; the dispatcher is here so a future commit can
+        # land the kernel in one place. See
+        # bench_results/sgl_paged_mqa_port/PORT_DESIGN.md.
+        from vllm.v1.attention.ops.rocm_dsv4_sgl_sparse_attn import (
+            rocm_sparse_attn_decode_fp8_resident,
+        )
+
+        if swa_ragged_indices is None or swa_ragged_indptr is None:
+            main_ragged_indices, main_ragged_indptr = build_ragged_indices_from_dense(
+                main_indices,
+                swa_lens
+                if swa_lens is not None
+                else (main_indices >= 0).sum(dim=-1, dtype=torch.int32),
+                num_rows=swa_k_cache.shape[0] * swa_k_cache.shape[1],
+            )
+        else:
+            main_ragged_indices = swa_ragged_indices
+            main_ragged_indptr = swa_ragged_indptr
+
+        extra_ragged_indices = topk_ragged_indices
+        extra_ragged_indptr = topk_ragged_indptr
+        if (
+            extra_cache is not None
+            and (extra_ragged_indices is None or extra_ragged_indptr is None)
+            and extra_indices is not None
+        ):
+            extra_ragged_indices, extra_ragged_indptr = build_ragged_indices_from_dense(
+                extra_indices,
+                topk_lens
+                if topk_lens is not None
+                else (extra_indices >= 0).sum(dim=-1, dtype=torch.int32),
+                num_rows=extra_cache.shape[0] * extra_cache.shape[1],
+            )
+
+        attn_out = rocm_sparse_attn_decode_fp8_resident(
+            q=q,
+            main_cache=swa_k_cache,
+            main_indices=main_ragged_indices,
+            main_indptr=main_ragged_indptr,
+            scale=scale,
+            attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+            nope_head_dim=nope_head_dim,
+            rope_head_dim=rope_head_dim,
+            extra_cache=extra_cache,
+            extra_indices=extra_ragged_indices,
+            extra_indptr=extra_ragged_indptr,
+        )
+        output.copy_(attn_out.to(output.dtype))
+        return
+
     attn_out = _rocm_sparse_attn_decode_triton(
         q=q,
         main_cache=swa_k_cache,

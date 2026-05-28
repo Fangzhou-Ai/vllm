@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
+    VLLM_ROCM_DSV4_SGL_SPARSE_DECODE: bool = False
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
@@ -1164,6 +1165,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_TRITON_GEMM", "True").lower() in ("true", "1")
+    ),
+    # Enable the SGLang-inspired FP8-resident Triton kernel for DSV4 sparse-attn
+    # decode on ROCm. WIP: kernel is unimplemented (see
+    # bench_results/sgl_paged_mqa_port/PORT_DESIGN.md). Off by default until the
+    # kernel lands and benches better than the existing path.
+    "VLLM_ROCM_DSV4_SGL_SPARSE_DECODE": lambda: (
+        os.getenv("VLLM_ROCM_DSV4_SGL_SPARSE_DECODE", "False").lower() in ("true", "1")
     ),
     # use rocm skinny gemms
     "VLLM_ROCM_USE_SKINNY_GEMM": lambda: (
