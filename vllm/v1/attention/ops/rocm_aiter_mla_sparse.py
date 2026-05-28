@@ -1732,10 +1732,15 @@ def rocm_sparse_attn_decode(
     import vllm.envs as envs
 
     if envs.VLLM_ROCM_DSV4_SGL_SPARSE_DECODE:
-        # WIP: SGLang-inspired FP8-resident decode kernel. The kernel itself is
-        # not yet implemented; the dispatcher is here so a future commit can
-        # land the kernel in one place. See
-        # bench_results/sgl_paged_mqa_port/PORT_DESIGN.md.
+        # SGLang-inspired tuned decode kernel. Same algorithm as the
+        # existing path (online flash-attention with online softmax + bf16
+        # dequant) but with retuned BLOCK_K / num_warps configurable via
+        # env knobs. A standalone microbench at the conc=128 / DSV4 /
+        # TP=8 operating point shows ~1.53x per-call speedup vs the
+        # existing kernel (491 us vs 752 us at batch=128, swa_window=1024,
+        # topk=2048). See bench_results/sgl_paged_mqa_port/PORT_DESIGN.md
+        # and CONTINUATION_NOTES.md for the broader plan and the
+        # remaining TPOT-side bottleneck (untuned AITER GEMM at M=128).
         from vllm.v1.attention.ops.rocm_dsv4_sgl_sparse_attn import (
             rocm_sparse_attn_decode_fp8_resident,
         )

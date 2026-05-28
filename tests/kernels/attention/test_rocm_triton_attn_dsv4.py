@@ -329,6 +329,67 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
 
 
 @torch.inference_mode()
+def test_sparse_attn_decode_v2_matches_baseline() -> None:
+    """The SGL-port v2 decode kernel must match the existing decode kernel.
+
+    The two kernels run the same online flash-attention algorithm but
+    differ in tile sizes / number of warps / pipeline stages. Output
+    differences are fp32 reduction-order noise plus bf16 rounding, so we
+    use the same loose tolerance as the baseline test.
+    """
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _rocm_sparse_attn_decode_ragged_triton,
+    )
+    from vllm.v1.attention.ops.rocm_dsv4_sgl_sparse_attn import (
+        rocm_sparse_attn_decode_fp8_resident,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(1)
+    block_size = 4
+    q = torch.randn(2, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    main_kv = torch.randn(6, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    extra_kv = torch.randn(5, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size)
+    main_indices = torch.tensor([0, 2, 4, 1], dtype=torch.int32, device=device)
+    main_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    extra_indices = torch.tensor([1, 3, 0], dtype=torch.int32, device=device)
+    extra_indptr = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
+    attn_sink = torch.tensor([-0.1, 0.0, 0.1], dtype=torch.float32, device=device)
+    scale = HEAD_DIM**-0.5
+
+    baseline = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=main_cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+    )
+    v2 = rocm_sparse_attn_decode_fp8_resident(
+        q=q,
+        main_cache=main_cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+    )
+
+    torch.testing.assert_close(v2, baseline, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
 def test_combine_topk_swa_indices_ragged() -> None:
     from vllm.models.deepseek_v4.amd.rocm import (
         combine_topk_swa_indices_ragged,
