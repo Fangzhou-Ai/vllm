@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_TILELANG_MHC: bool = False
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1130,6 +1131,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to use the tilelang fused post+pre mHC kernel for DeepSeek V4 on
+    # ROCm instead of the default aiter mHC pre/post ops. The aiter mHC path is
+    # the default (it is faster); set this to opt into the tilelang fused path.
+    # Only takes effect on ROCm with VLLM_ROCM_USE_AITER enabled. On CUDA the
+    # tilelang kernel is always used regardless of this flag.
+    "VLLM_ROCM_USE_TILELANG_MHC": lambda: (
+        os.getenv("VLLM_ROCM_USE_TILELANG_MHC", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.
