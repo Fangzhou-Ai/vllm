@@ -120,6 +120,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_RMSNORM: bool = True
     VLLM_ROCM_USE_AITER_MLA: bool = True
     VLLM_ROCM_USE_AITER_MHA: bool = True
+    VLLM_ROCM_USE_AITER_MHC: bool = True
     VLLM_ROCM_USE_AITER_FP4_ASM_GEMM: bool = False
     VLLM_ROCM_USE_AITER_TRITON_ROPE: bool = False
     VLLM_ROCM_USE_AITER_FP8BMM: bool = True
@@ -1128,6 +1129,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_MHA": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_MHA", "True").lower() in ("true", "1")
+    ),
+    # Whether to use the aiter mHC (multi-head consensus) pre/post ops for
+    # DeepSeek V4. Requires aiter >= 0.1.14 (which contains the sqrsum race
+    # condition fix in mhc_pre_gemm_sqrsum_kernel). When disabled, falls back
+    # to the tilelang fused post+pre kernel (if available) or the torch impl.
+    # Gated by the master VLLM_ROCM_USE_AITER switch. By default is enabled.
+    "VLLM_ROCM_USE_AITER_MHC": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_MHC", "True").lower() in ("true", "1")
     ),
     # Whether to use aiter fp4 gemm asm.
     # By default is disabled.
