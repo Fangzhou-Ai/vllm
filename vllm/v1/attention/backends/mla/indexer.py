@@ -177,6 +177,7 @@ class DeepseekV32IndexerPrefillChunkMetadata:
     token_end: int
     num_reqs: int
     skip_kv_gather: bool = False
+    use_dense_topk: bool = False
 
 
 @dataclass
@@ -195,6 +196,7 @@ class DeepSeekV32IndexerDecodeMetadata:
     decode_lens: torch.Tensor
     requires_padding: bool
     schedule_metadata: torch.Tensor
+    use_dense_topk: bool = False
 
 
 @dataclass
@@ -533,6 +535,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             chunks = []
             for req_slice, query_slice in chunk_specs:
+                use_dense_topk = (
+                    self.compress_ratio > 1
+                    and int(compressed_seq_lens_cpu[req_slice].max().item())
+                    <= self.vllm_config.model_config.hf_config.index_topk
+                )
                 metadata = build_prefill_chunk_metadata(
                     req_slice.start,
                     req_slice.stop,
@@ -545,6 +552,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     self.compress_ratio,
                     query_slice=query_slice,
                     skip_kv_gather=query_slice.start > 0,
+                    use_dense_topk=use_dense_topk,
                 )
                 # Skip when total_seq_lens is 0 (i.e., no compressed token).
                 if metadata is not None:
@@ -622,6 +630,19 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 decode_lens=decode_lens,
                 requires_padding=requires_padding,
                 schedule_metadata=self.scheduler_metadata_buffer,
+                use_dense_topk=(
+                    self.compress_ratio > 1
+                    and common_attn_metadata.seq_lens_cpu_upper_bound is not None
+                    and int(
+                        (
+                            common_attn_metadata.seq_lens_cpu_upper_bound[:num_decodes]
+                            // self.compress_ratio
+                        )
+                        .max()
+                        .item()
+                    )
+                    <= self.vllm_config.model_config.hf_config.index_topk
+                ),
             )
 
         attn_metadata = DeepseekV32IndexerMetadata(
@@ -651,6 +672,7 @@ def build_prefill_chunk_metadata(
     compress_ratio: int,
     query_slice: slice | None = None,
     skip_kv_gather: bool = False,
+    use_dense_topk: bool = False,
 ) -> DeepseekV32IndexerPrefillChunkMetadata | None:
     total_seq_lens = compressed_seq_lens_cpu[start_idx:end_idx].sum().item()
     if total_seq_lens == 0:
@@ -715,6 +737,7 @@ def build_prefill_chunk_metadata(
         token_end=token_end,
         num_reqs=num_reqs,
         skip_kv_gather=skip_kv_gather,
+        use_dense_topk=use_dense_topk,
     )
 
 
