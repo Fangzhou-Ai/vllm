@@ -1287,7 +1287,7 @@ def test_rocm_mxfp4_moe_oracle(
     from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
         Mxfp4MoeBackend,
         backend_to_kernel_cls,
-        convert_weight_to_mxfp4_moe_kernel_format,
+        convert_to_mxfp4_moe_kernel_format,
         make_mxfp4_moe_kernel,
         make_mxfp4_moe_quant_config,
     )
@@ -1387,7 +1387,7 @@ def test_rocm_mxfp4_moe_oracle(
 
     # Convert weights using oracle
     w13_conv, w2_conv, w13_scale_conv, w2_scale_conv, w13_bias_conv, w2_bias_conv = (
-        convert_weight_to_mxfp4_moe_kernel_format(
+        convert_to_mxfp4_moe_kernel_format(
             mxfp4_backend=backend,
             layer=layer,  # type: ignore[arg-type]
             w13_weight=w13_quant,
@@ -1423,6 +1423,7 @@ def test_rocm_mxfp4_moe_oracle(
             mxfp4_backend=backend,
             experts_cls=experts_cls,
             routing_tables=None,
+            shared_experts=None,
         )
 
         # Create inputs
