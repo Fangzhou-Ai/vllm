@@ -15,6 +15,23 @@ ROPE_HEAD_DIM = 64
 HEAD_DIM = NOPE_HEAD_DIM + ROPE_HEAD_DIM
 
 
+def test_deepseek_v4_rocm_a8w8_blockscale_splitk() -> None:
+    from vllm._aiter_ops import _deepseek_v4_rocm_a8w8_blockscale_splitk
+
+    assert _deepseek_v4_rocm_a8w8_blockscale_splitk(4, 2048, 7168, torch.bfloat16) == 2
+    assert _deepseek_v4_rocm_a8w8_blockscale_splitk(16, 768, 7168, torch.bfloat16) == 2
+    assert (
+        _deepseek_v4_rocm_a8w8_blockscale_splitk(4, 7168, 384, torch.bfloat16) is None
+    )
+    assert (
+        _deepseek_v4_rocm_a8w8_blockscale_splitk(256, 2048, 7168, torch.bfloat16)
+        is None
+    )
+    assert (
+        _deepseek_v4_rocm_a8w8_blockscale_splitk(4, 2048, 7168, torch.float16) is None
+    )
+
+
 def _ref_global_topk_ragged(
     topk_indices: torch.Tensor,
     token_to_req_indices: torch.Tensor,
@@ -161,28 +178,28 @@ def _ref_combine_topk_swa_ragged(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     expected_ragged = torch.tensor(
         [
-            100,
-            101,
+            0,
+            1,
             7,
             8,
             9,
-            110,
-            111,
+            4,
+            -1,
             8,
             9,
             10,
-            120,
-            121,
-            122,
+            1,
+            2,
+            3,
             9,
             10,
             11,
-            150,
+            20,
             27,
             28,
             29,
-            160,
-            161,
+            24,
+            -1,
             28,
             29,
             30,
@@ -247,6 +264,69 @@ def test_compute_global_topk_ragged_indices_and_indptr() -> None:
     torch.testing.assert_close(actual_indptr, expected_indptr)
     torch.testing.assert_close(actual_lens, expected_lens)
 
+    actual_ragged, actual_indptr, actual_lens = (
+        compute_global_topk_ragged_indices_and_indptr(
+            topk_indices,
+            token_to_req_indices,
+            block_table,
+            block_size,
+            is_valid_token,
+            topk_lens=expected_lens,
+            topk_indptr=expected_indptr,
+        )
+    )
+
+    torch.testing.assert_close(actual_ragged[expected_positions], expected_values)
+    torch.testing.assert_close(actual_indptr, expected_indptr)
+    torch.testing.assert_close(actual_lens, expected_lens)
+
+
+@torch.inference_mode()
+def test_compute_decode_c4_topk_lens_kernel() -> None:
+    from vllm.models.deepseek_v4.amd.rocm import (
+        _compute_decode_c4_topk_lens_indptr_kernel,
+        _compute_decode_c4_topk_lens_kernel,
+    )
+
+    device = torch.device("cuda")
+    query_start_loc = torch.tensor([0, 1, 3, 4], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([1024, 1030, 3], dtype=torch.int32, device=device)
+    token_to_req_indices = torch.tensor([0, 1, 1, 2], dtype=torch.int32, device=device)
+    is_valid_token = torch.tensor([True, True, False, True], device=device)
+    actual = torch.empty(4, dtype=torch.int32, device=device)
+
+    _compute_decode_c4_topk_lens_kernel[(4,)](
+        actual,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        TOPK=300,
+        COMPRESS_RATIO=4,
+    )
+
+    expected = torch.tensor([256, 257, 0, 0], dtype=torch.int32, device=device)
+    torch.testing.assert_close(actual, expected)
+
+    actual_fused = torch.empty(4, dtype=torch.int32, device=device)
+    actual_indptr = torch.empty(5, dtype=torch.int32, device=device)
+    _compute_decode_c4_topk_lens_indptr_kernel[(1,)](
+        actual_fused,
+        actual_indptr,
+        query_start_loc,
+        seq_lens,
+        token_to_req_indices,
+        is_valid_token,
+        N=4,
+        TOPK=300,
+        COMPRESS_RATIO=4,
+        BLOCK=4,
+    )
+    expected_indptr = torch.zeros(5, dtype=torch.int32, device=device)
+    torch.cumsum(expected, dim=0, out=expected_indptr[1:])
+    torch.testing.assert_close(actual_fused, expected)
+    torch.testing.assert_close(actual_indptr, expected_indptr)
+
 
 @torch.inference_mode()
 def test_sparse_attn_prefill_ragged_kernel() -> None:
@@ -278,6 +358,107 @@ def test_sparse_attn_prefill_ragged_kernel() -> None:
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_sparse_attn_prefill_wrapper_uses_ragged_metadata() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_prefill
+
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    q = torch.randn(3, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    kv = torch.randn(5, 1, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    indices = torch.tensor([0, 2, 1, 3, 4], dtype=torch.int32, device=device)
+    indptr = torch.tensor([0, 2, 5, 5], dtype=torch.int32, device=device)
+    lens = torch.tensor([2, 3, 0], dtype=torch.int32, device=device)
+    attn_sink = torch.tensor([-0.25, 0.0, 0.25], dtype=torch.float32, device=device)
+    scale = HEAD_DIM**-0.5
+    actual = torch.empty_like(q)
+
+    rocm_sparse_attn_prefill(
+        q=q,
+        kv=kv,
+        indices=indices,
+        topk_length=lens,
+        scale=scale,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        attn_sink=attn_sink,
+        output=actual,
+        ragged_indices=indices,
+        ragged_indptr=indptr,
+    )
+    expected = _ref_sparse_prefill_ragged(
+        q, kv.squeeze(1), [[0, 2], [1, 3, 4], []], scale, attn_sink
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
+def test_rocm_inv_rope_einsum_caches_wo_a_weight() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_inv_rope_einsum
+
+    class FakeRotary(torch.nn.Module):
+        def __init__(self, device: torch.device) -> None:
+            super().__init__()
+            half_rot = ROPE_HEAD_DIM // 2
+            cache = torch.cat(
+                [
+                    torch.ones(8, half_rot, dtype=torch.float32, device=device),
+                    torch.zeros(8, half_rot, dtype=torch.float32, device=device),
+                ],
+                dim=-1,
+            )
+            self.cos_sin_cache = cache
+
+    class FakeWOA(torch.nn.Module):
+        def __init__(self, device: torch.device) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(
+                torch.randn(4, HEAD_DIM, dtype=torch.bfloat16, device=device),
+                requires_grad=False,
+            )
+            self.weight_scale_inv = torch.ones(
+                1, 1, 1, dtype=torch.float32, device=device
+            )
+
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    o = torch.randn(2, 1, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    positions = torch.tensor([0, 1], dtype=torch.long, device=device)
+    rotary = FakeRotary(device)
+    wo_a = FakeWOA(device)
+
+    actual = rocm_inv_rope_einsum(
+        rotary,
+        o,
+        positions,
+        ROPE_HEAD_DIM,
+        n_local_groups=1,
+        o_lora_rank=4,
+        wo_a=wo_a,
+    )
+    cached = wo_a._vllm_rocm_bf16_weight
+    actual_again = rocm_inv_rope_einsum(
+        rotary,
+        o,
+        positions,
+        ROPE_HEAD_DIM,
+        n_local_groups=1,
+        o_lora_rank=4,
+        wo_a=wo_a,
+    )
+
+    expected = torch.einsum(
+        "tgd,grd->tgr",
+        o.view(2, 1, HEAD_DIM),
+        wo_a.weight.view(1, 4, HEAD_DIM),
+    )
+    assert wo_a._vllm_rocm_bf16_weight is cached
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_again, expected, atol=2e-2, rtol=2e-2)
 
 
 @torch.inference_mode()
@@ -329,6 +510,108 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
 
 
 @torch.inference_mode()
+def test_sparse_attn_decode_wrapper_uses_ragged_metadata() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import rocm_sparse_attn_decode
+
+    device = torch.device("cuda")
+    torch.manual_seed(1)
+    block_size = 4
+    q = torch.randn(2, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    main_kv = torch.randn(6, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    extra_kv = torch.randn(5, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size)
+    main_indices = torch.tensor([0, 2, 4, 1], dtype=torch.int32, device=device)
+    main_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    extra_indices = torch.tensor([1, 3, 0], dtype=torch.int32, device=device)
+    extra_indptr = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
+    swa_indices = main_indices.view(2, 1, 2)
+    swa_lens = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    attn_sink = torch.tensor([-0.1, 0.0, 0.1], dtype=torch.float32, device=device)
+    scale = HEAD_DIM**-0.5
+    actual = torch.empty_like(q)
+    actual_split = torch.empty_like(q)
+    actual_split16 = torch.empty_like(q)
+
+    rocm_sparse_attn_decode(
+        q=q,
+        kv_cache=extra_cache,
+        swa_k_cache=main_cache,
+        swa_only=False,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_ragged_indices=main_indices,
+        swa_ragged_indptr=main_indptr,
+        topk_ragged_indices=extra_indices,
+        topk_ragged_indptr=extra_indptr,
+        attn_sink=attn_sink,
+        scale=scale,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        output=actual,
+    )
+    rocm_sparse_attn_decode(
+        q=q,
+        kv_cache=extra_cache,
+        swa_k_cache=main_cache,
+        swa_only=False,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_ragged_indices=main_indices,
+        swa_ragged_indptr=main_indptr,
+        topk_ragged_indices=extra_indices,
+        topk_ragged_indptr=extra_indptr,
+        attn_sink=attn_sink,
+        scale=scale,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        output=actual_split,
+        kv_splits=4,
+    )
+    rocm_sparse_attn_decode(
+        q=q,
+        kv_cache=extra_cache,
+        swa_k_cache=main_cache,
+        swa_only=False,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=swa_indices,
+        swa_lens=swa_lens,
+        swa_ragged_indices=main_indices,
+        swa_ragged_indptr=main_indptr,
+        topk_ragged_indices=extra_indices,
+        topk_ragged_indptr=extra_indptr,
+        attn_sink=attn_sink,
+        scale=scale,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        output=actual_split16,
+        kv_splits=16,
+    )
+    expected = _ref_sparse_decode_ragged(
+        q=q,
+        main_cache=main_cache,
+        main_rows=[[0, 2], [4, 1]],
+        scale=scale,
+        attn_sink=attn_sink,
+        block_size=block_size,
+        extra_cache=extra_cache,
+        extra_rows=[[1], [3, 0]],
+    )
+
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_split, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_split16, expected, atol=2e-2, rtol=2e-2)
+
+
+@torch.inference_mode()
 def test_combine_topk_swa_indices_ragged() -> None:
     from vllm.models.deepseek_v4.amd.rocm import (
         combine_topk_swa_indices_ragged,
@@ -337,11 +620,11 @@ def test_combine_topk_swa_indices_ragged() -> None:
     device = torch.device("cuda")
     topk_indices = torch.tensor(
         [
-            [100, 101, 102, 103],
-            [110, 111, 112, 113],
-            [120, 121, 122, 123],
-            [130, 131, 132, 133],
-            [140, 141, 142, 143],
+            [0, 1, 2, 3],
+            [4, 8, 6, 7],
+            [1, 2, 3, 4],
+            [0, 1, 2, 3],
+            [4, -1, 6, 7],
         ],
         dtype=torch.int32,
         device=device,

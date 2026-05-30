@@ -650,6 +650,22 @@ def _rocm_aiter_triton_gemm_a8w8_blockscale_fake(
     return Y
 
 
+def _deepseek_v4_rocm_a8w8_blockscale_splitk(
+    m: int,
+    n: int,
+    k: int,
+    output_dtype: torch.dtype,
+) -> int | None:
+    if (
+        output_dtype == torch.bfloat16
+        and m <= 16
+        and k == 7168
+        and n in (768, 2048, 16160)
+    ):
+        return 2
+    return None
+
+
 def _rocm_aiter_gemm_a8w8_blockscale_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -657,6 +673,23 @@ def _rocm_aiter_gemm_a8w8_blockscale_impl(
     Bs: torch.Tensor,
     output_dtype: torch.dtype = torch.float16,
 ) -> torch.Tensor:
+    splitk = _deepseek_v4_rocm_a8w8_blockscale_splitk(
+        A.shape[0],
+        B.shape[0],
+        A.shape[1],
+        output_dtype,
+    )
+    if splitk is not None:
+        from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck
+
+        out = torch.empty(
+            A.shape[0],
+            B.shape[0],
+            dtype=output_dtype,
+            device=A.device,
+        )
+        return gemm_a8w8_blockscale_ck(A, B, As, Bs, out, splitK=splitk)
+
     from aiter import gemm_a8w8_blockscale
 
     return gemm_a8w8_blockscale(A, B, As, Bs, dtype=output_dtype)
