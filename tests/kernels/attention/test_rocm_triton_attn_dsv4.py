@@ -329,6 +329,36 @@ def test_compute_decode_c4_topk_lens_kernel() -> None:
 
 
 @torch.inference_mode()
+def test_dense_local_topk_fill_helpers() -> None:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        _fill_dense_local_topk_from_bounds,
+        _fill_dense_local_topk_from_lens,
+    )
+
+    device = torch.device("cuda")
+    expected = torch.tensor(
+        [
+            [0, 1, 2, -1, -1, -1, -1, -1],
+            [-1, -1, -1, -1, -1, -1, -1, -1],
+            [0, 1, 2, 3, 4, 5, 6, 7],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    out_from_bounds = torch.empty((3, 8), dtype=torch.int32, device=device)
+    starts = torch.tensor([4, 8, 16], dtype=torch.int32, device=device)
+    ends = torch.tensor([7, 8, 24], dtype=torch.int32, device=device)
+    _fill_dense_local_topk_from_bounds(out_from_bounds, starts, ends)
+    torch.testing.assert_close(out_from_bounds, expected)
+
+    out_from_lens = torch.empty((3, 8), dtype=torch.int32, device=device)
+    lens = torch.tensor([3, 0, 8], dtype=torch.int32, device=device)
+    _fill_dense_local_topk_from_lens(out_from_lens, lens)
+    torch.testing.assert_close(out_from_lens, expected)
+
+
+@torch.inference_mode()
 def test_sparse_attn_prefill_ragged_kernel() -> None:
     from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
         _rocm_sparse_attn_prefill_ragged_triton,

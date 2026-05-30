@@ -602,6 +602,85 @@ def _topk_indices_torch(
     return padded
 
 
+@triton.jit
+def _fill_dense_local_topk_from_bounds_kernel(
+    out_ptr,
+    starts_ptr,
+    ends_ptr,
+    out_stride,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    row_len = tl.load(ends_ptr + row_idx) - tl.load(starts_ptr + row_idx)
+    vals = tl.where(offsets < row_len, offsets, -1)
+    tl.store(
+        out_ptr + row_idx * out_stride + offsets,
+        vals,
+        mask=offsets < TOPK,
+    )
+
+
+@triton.jit
+def _fill_dense_local_topk_from_lens_kernel(
+    out_ptr,
+    lens_ptr,
+    out_stride,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    offsets = tl.arange(0, BLOCK)
+    row_len = tl.load(lens_ptr + row_idx)
+    vals = tl.where(offsets < row_len, offsets, -1)
+    tl.store(
+        out_ptr + row_idx * out_stride + offsets,
+        vals,
+        mask=offsets < TOPK,
+    )
+
+
+def _fill_dense_local_topk_from_bounds(
+    out: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+) -> None:
+    num_rows = out.shape[0]
+    if num_rows == 0:
+        return
+    topk = out.shape[1]
+    block = triton.next_power_of_2(topk)
+    _fill_dense_local_topk_from_bounds_kernel[(num_rows,)](
+        out,
+        starts,
+        ends,
+        out.stride(0),
+        TOPK=topk,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+
+def _fill_dense_local_topk_from_lens(
+    out: torch.Tensor,
+    lens: torch.Tensor,
+) -> None:
+    num_rows = out.shape[0]
+    if num_rows == 0:
+        return
+    topk = out.shape[1]
+    block = triton.next_power_of_2(topk)
+    _fill_dense_local_topk_from_lens_kernel[(num_rows,)](
+        out,
+        lens,
+        out.stride(0),
+        TOPK=topk,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+
 def rocm_aiter_sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: LayerNameType,
@@ -704,6 +783,17 @@ def rocm_aiter_sparse_attn_indexer(
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
         for chunk in prefill_metadata.chunks:
+            topk_indices = topk_indices_buffer[
+                chunk.token_start : chunk.token_end, :topk_tokens
+            ]
+            if chunk.use_dense_topk:
+                _fill_dense_local_topk_from_bounds(
+                    topk_indices,
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+                continue
+
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
                 device=device,
@@ -739,9 +829,6 @@ def rocm_aiter_sparse_attn_indexer(
                 chunk.cu_seqlen_ks,
                 chunk.cu_seqlen_ke,
             )
-            topk_indices = topk_indices_buffer[
-                chunk.token_start : chunk.token_end, :topk_tokens
-            ]
 
             num_rows = logits.shape[0]
 
@@ -780,6 +867,24 @@ def rocm_aiter_sparse_attn_indexer(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+
+        if decode_metadata.use_dense_topk:
+            _fill_dense_local_topk_from_lens(
+                topk_indices,
+                decode_metadata.seq_lens.reshape(-1),
+            )
+            if decode_metadata.requires_padding:
+                # if padded, we need to unpack the topk indices removing
+                # padded tokens.
+                topk_indices = unpack_seq_triton(
+                    topk_indices.reshape(batch_size, next_n, topk_indices.shape[-1]),
+                    decode_lens,
+                )
+                topk_indices_buffer[:num_decode_tokens, : topk_indices.shape[-1]] = (
+                    topk_indices
+                )
+            return topk_indices_buffer
 
         logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
@@ -791,7 +896,6 @@ def rocm_aiter_sparse_attn_indexer(
             max_model_len=max_model_len,
         )
 
-        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
         num_rows = logits.shape[0]
 
         torch.ops._C.top_k_per_row_decode(
