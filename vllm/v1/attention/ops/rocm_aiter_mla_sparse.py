@@ -613,12 +613,13 @@ def _fill_dense_local_topk_from_bounds_kernel(
 ):
     row_idx = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    row_len = tl.load(ends_ptr + row_idx) - tl.load(starts_ptr + row_idx)
-    vals = tl.where(offsets < row_len, offsets, -1)
+    row_len = tl.minimum(
+        tl.load(ends_ptr + row_idx) - tl.load(starts_ptr + row_idx), TOPK
+    )
     tl.store(
         out_ptr + row_idx * out_stride + offsets,
-        vals,
-        mask=offsets < TOPK,
+        offsets,
+        mask=offsets < row_len,
     )
 
 
@@ -632,12 +633,11 @@ def _fill_dense_local_topk_from_lens_kernel(
 ):
     row_idx = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    row_len = tl.load(lens_ptr + row_idx)
-    vals = tl.where(offsets < row_len, offsets, -1)
+    row_len = tl.minimum(tl.load(lens_ptr + row_idx), TOPK)
     tl.store(
         out_ptr + row_idx * out_stride + offsets,
-        vals,
-        mask=offsets < TOPK,
+        offsets,
+        mask=offsets < row_len,
     )
 
 
@@ -778,7 +778,6 @@ def rocm_aiter_sparse_attn_indexer(
                 scale_fmt,
             )
 
-    topk_indices_buffer[: hidden_states.shape[0]] = -1
     if has_prefill:
         prefill_metadata = layer_attn_metadata.prefill
         assert prefill_metadata is not None
