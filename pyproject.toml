@@ -46,6 +46,15 @@ vllm = "vllm.entrypoints.cli.main:main"
 [project.entry-points."vllm.general_plugins"]
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
+# vLLM-flavored ATOM (vendored under vllm/_atom): registers ATOM model overrides
+# (e.g. DeepseekV4ForCausalLM -> ATOM wrapper). Self-contained; no external `atom`
+# install. Gated at runtime by ATOM_DISABLE_VLLM_PLUGIN in vllm/_atom/utils/envs.
+atom_model_registry = "vllm._atom.plugin.vllm.register:register_model"
+
+[project.entry-points."vllm.platform_plugins"]
+# vLLM-flavored ATOM platform (vendored). Returns the ATOM platform class so vLLM
+# uses ATOM's device/attention wiring. Self-contained under vllm/_atom.
+atom = "vllm._atom.plugin.vllm.register:register_platform"
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

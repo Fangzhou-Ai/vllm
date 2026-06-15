@@ -1,0 +1,697 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+from typing import Optional
+
+import aiter
+import torch
+from aiter import fused_qk_norm_rope_cache_quant_shuffle
+from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
+from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+from aiter.ops.triton.unified_attention import unified_attention
+from vllm._atom.config import get_current_atom_config
+from vllm._atom.utils import envs
+from vllm._atom.utils.forward_context import ForwardContext, get_forward_context
+from torch import nn
+
+from .attention_mla import MLAModules
+
+import logging
+
+from vllm._atom.utils.decorators import mark_trace
+from vllm._atom.model_ops.base_attention import (
+    cp_mha_gather_cache,
+    run_pa_decode_gluon,
+    run_pa_fwd_asm,
+)
+
+logger = logging.getLogger("atom")
+
+
+class PagedAttentionImpl(nn.Module):
+    """
+    Attention paged implementation
+    """
+
+    def __init__(
+        self,
+        num_heads,
+        head_dim,
+        scale,
+        num_kv_heads,
+        alibi_slopes: list[float] | None,
+        sliding_window: Optional[int] = None,
+        kv_cache_dtype="bf16",
+        logits_soft_cap: float | None = None,
+        attn_type=None,
+        kv_sharing_target_layer_name: int | None = None,
+        layer_num=0,
+        mla_modules: Optional[MLAModules] = None,
+        sinks: Optional[nn.Parameter] = None,
+        rotary_emb: Optional[torch.nn.Module] = None,
+        q_norm: Optional[torch.nn.Module] = None,
+        k_norm: Optional[torch.nn.Module] = None,
+        **kwargs,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        # for upper framework, it uses head_size in built-in methods
+        self.head_size = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.alibi_slopes = alibi_slopes
+        self.k_cache = self.v_cache = torch.tensor([])
+        self.kv_cache_dtype = kv_cache_dtype
+        self.max_model_len = 0
+        self.k_scale = self.v_scale = None
+        self.device = "cuda:" + str(torch.cuda.current_device())
+        self.layer_num = layer_num
+        self.kv_scale_float = (
+            torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max
+            if self.kv_cache_dtype == "fp8"
+            else 1.0
+        )
+        self.kv_scale = torch.tensor(self.kv_scale_float, dtype=torch.float32)
+        self.per_token_quant = True
+        self.sinks = sinks
+        self.sliding_window = sliding_window if sliding_window is not None else -1
+        self.rotary_emb = rotary_emb
+        self.q_norm = q_norm
+        self.k_norm = k_norm
+        # Set by the attention backend's build_kv_cache_tensor when KV cache is
+        # allocated in flash layout [num_blocks, block_size, num_kv_heads, head_dim]
+        # for aiter triton unified_attention. AiterBackend keeps this False.
+        self.use_flash_layout = False
+
+        self.supports_quant_query_input = False
+
+    def forward_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        position: torch.Tensor = None,
+        q_scale: torch.Tensor = None,
+        qkv: torch.Tensor = None,
+    ):
+
+        fwd_ctx: ForwardContext = get_forward_context()
+
+        # dummy run will skip attention in cuda graph capture phase
+        if fwd_ctx.context.is_dummy_run:
+            o = torch.empty_like(q)
+            return o
+
+        o: torch.Tensor
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+
+        # rope cache
+        q, k, v, k_cache, v_cache, k_scale, v_scale = self.rope_cache(
+            q, k, v, qkv, position, fwd_ctx
+        )
+
+        attn_impl = self.dispatch_backend(fwd_ctx)
+
+        o = attn_impl(q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx)
+
+        o = o.view(-1, self.num_heads * self.head_dim)
+
+        return o
+
+    @mark_trace(prefix="rope_cache", torch_compile=False)
+    def rope_cache(self, q, k, v, qkv, position, fwd_ctx: ForwardContext):
+        attn_metadata = fwd_ctx.attn_metadata
+        kv_cache_data = fwd_ctx.kv_cache_data
+
+        k_cache = kv_cache_data[f"layer_{self.layer_num}"].k_cache
+        v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
+        k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
+        v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
+
+        # MTP MHA must go through triton/gluon; aiter ASM non-persistent path may have some unexpected behavior.
+        use_triton_attn = (
+            self.sliding_window != -1
+            or self.head_dim != 128
+            or self.num_heads == self.num_kv_heads
+        )
+        self.use_triton_attn = use_triton_attn
+
+        if (
+            self.rotary_emb is not None
+            and self.q_norm is not None
+            and self.k_norm is not None
+        ):
+            from vllm._atom.model_ops.layernorm import GemmaRMSNorm
+
+            if isinstance(self.q_norm, GemmaRMSNorm):
+                # GemmaRMSNorm (1+w) path — use the Triton fused kernel
+                from vllm._atom.model_ops.triton_fused_qkv_norm_rope_cache import (
+                    triton_fused_norm_rope_cache,
+                )
+
+                # qkv is a packed [q, k, v] tensor — split
+                q_size = self.num_heads * self.head_dim
+                kv_size = self.num_kv_heads * self.head_dim
+                q_raw, k_raw, v_raw = torch.split(
+                    qkv, [q_size, kv_size, kv_size], dim=-1
+                )
+                # Reshape V cache to SHUFFLE layout for the Triton kernel
+                x = 16 // k_cache.element_size()
+                if k_cache.dim() == 5 and v_cache.dim() == 4:
+                    n, nh, hd, bs = v_cache.shape
+                    v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+                else:
+                    v_cache_shuffle = v_cache
+                q, k = triton_fused_norm_rope_cache(
+                    q_raw,
+                    k_raw,
+                    v_raw,
+                    position,
+                    q_norm=self.q_norm,
+                    k_norm=self.k_norm,
+                    rotary_emb=self.rotary_emb,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    k_cache=k_cache,
+                    v_cache=v_cache_shuffle,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                )
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v_raw.view(-1, self.num_kv_heads, self.head_dim)
+            else:
+                # Standard RMSNorm — use existing aiter kernel
+                # fused_qk_norm_rope_cache_quant_shuffle expects V cache layout
+                # [num_blocks, num_kv_heads, block_size//x, head_size, x]
+                x = 16 // k_cache.element_size()
+                if k_cache.dim() == 5 and v_cache.dim() == 4:
+                    n, nh, hd, bs = v_cache.shape
+                    v_cache_shuffle = v_cache.view(n, nh, bs // x, hd, x)
+                else:
+                    v_cache_shuffle = v_cache
+                fused_qk_norm_rope_cache_quant_shuffle(
+                    q=q,
+                    k=k,
+                    v=v,
+                    num_heads_q=self.num_heads,
+                    num_heads_k=self.num_kv_heads,
+                    num_heads_v=self.num_kv_heads,
+                    head_dim=self.head_dim,
+                    eps=self.q_norm.eps,
+                    qw=self.q_norm.weight,
+                    kw=self.k_norm.weight,
+                    cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                    is_neox_style=self.rotary_emb.is_neox_style,
+                    pos_ids=position,
+                    k_cache=k_cache,
+                    v_cache=v_cache_shuffle,
+                    slot_mapping=attn_metadata.slot_mapping,
+                    kv_cache_dtype=(
+                        "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
+                    ),
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                )
+
+                q = q.view(-1, self.num_heads, self.head_dim)
+                k = k.view(-1, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, self.num_kv_heads, self.head_dim)
+            self._cache_format = "SHUFFLE"
+        elif use_triton_attn and self.rotary_emb is not None:
+            self.per_token_quant = False
+            k_scale = v_scale = self.kv_scale
+            if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+                q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
+            else:
+                q_out = q
+            q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                attn_metadata.slot_mapping,
+                position,
+                self.rotary_emb.cos_cache,
+                self.rotary_emb.sin_cache,
+                k_scale,
+                v_scale,
+                self.rotary_emb.is_neox_style,
+                flash_layout=self.use_flash_layout,
+                apply_scale=self.kv_cache_dtype.startswith("fp8"),
+                offs=None,
+                q_out=q_out,
+                k_out=k,
+                output_zeros=False,
+            )
+            self._cache_format = "NHD"
+        else:
+            # for asm paged attention
+            asm_layout = True
+            if use_triton_attn and v_cache.dim() != 5:
+                asm_layout = False
+            if self.rotary_emb is not None:
+                assert position is not None
+                q, k = self.rotary_emb(position, q, k)
+            if self.q_norm is not None:
+                q = self.q_norm(q)
+            if self.k_norm is not None:
+                k = self.k_norm(k)
+            if self.kv_cache_dtype == "fp8":
+                aiter.reshape_and_cache_with_pertoken_quant(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    k_scale,
+                    v_scale,
+                    attn_metadata.slot_mapping,
+                    asm_layout=asm_layout,
+                )
+            else:
+                aiter.reshape_and_cache(
+                    k,
+                    v,
+                    k_cache,
+                    v_cache,
+                    attn_metadata.slot_mapping,
+                    kv_cache_dtype="auto",
+                    k_scale=None,
+                    v_scale=None,
+                    asm_layout=asm_layout,
+                )
+            self._cache_format = "SHUFFLE" if asm_layout else "NHD"
+
+        # Prefix cache hit: gather cached KV from paged cache and concat with new tokens
+        if attn_metadata.has_cached:
+            q, k, v, k_cache, v_cache, k_scale, v_scale = (
+                self._gather_prefix_and_concat_kv(
+                    q, k, v, k_cache, v_cache, k_scale, v_scale, attn_metadata
+                )
+            )
+
+        return q, k, v, k_cache, v_cache, k_scale, v_scale
+
+    def _gather_prefix_and_concat_kv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        attn_metadata,
+    ):
+        """
+        When prefix cache hits, gather full KV (cached + new) from paged cache in
+        one pass. New tokens are already written by fused_qk_rope_reshape_and_cache.
+        Same flow as gather_kv_b_proj: write new first, then read cached+new together.
+        """
+        cu_seqlens_k = attn_metadata.cu_seqlens_k
+        total_tokens = attn_metadata.total_kv
+        bs = attn_metadata.context_lens.shape[0]
+        token_to_batch = torch.repeat_interleave(
+            torch.arange(
+                bs, dtype=torch.int32, device=attn_metadata.context_lens.device
+            ),
+            attn_metadata.context_lens.long(),
+        )
+
+        num_kv_heads = k.shape[1]
+        head_dim = k.shape[2]
+
+        k_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )
+        v_full = torch.empty(
+            (total_tokens, num_kv_heads, head_dim), dtype=k.dtype, device=k.device
+        )
+
+        # Convert cache for cp_mha_gather_cache
+        # The cache format depends on which rope_cache branch wrote the data:
+        # - SHUFFLE: fused_qk_norm_rope_cache_quant_shuffle or reshape_and_cache(asm_layout=True)
+        #   K [n, nh, hd//x, bs, x], V viewed as [n, nh, bs//x, hd, x]
+        # - NHD: fused_qk_rope_reshape_and_cache or reshape_and_cache(asm_layout=False)
+        #   K [n, nh, hd//x, bs, x] -> permute to [n, bs, nh, hd], V [n, nh, hd, bs] -> [n, bs, nh, hd]
+        use_shuffle = getattr(self, "_cache_format", "SHUFFLE") == "SHUFFLE"
+        if k_cache.dim() == 5:
+            x = 16 // k_cache.element_size()
+            n, nh, _, block_size, _ = k_cache.shape
+            if use_shuffle:
+                k_cache_gather = k_cache
+                v_cache_gather = v_cache.view(n, nh, block_size // x, head_dim, x)
+            elif v_cache.dim() == 5:
+                # MiMo-V2-Flash per-layer allocator (aiter_attention.py:461) emits
+                # v_cache natively as 5D SHUFFLE [n, nh, bs//x, hd, x]; pass through.
+                use_shuffle = True
+                k_cache_gather = k_cache
+                v_cache_gather = v_cache
+            else:
+                # V is in ASM/NHD format [n, nh, hd, bs], convert to [n, bs, nh, hd]
+                k_cache_gather = (
+                    k_cache.permute(0, 3, 1, 2, 4)
+                    .contiguous()
+                    .view(n, block_size, nh, head_dim)
+                )
+                v_cache_gather = v_cache.permute(0, 3, 1, 2).contiguous()
+        else:
+            use_shuffle = False
+            k_cache_gather = k_cache
+            v_cache_gather = v_cache
+            block_size = k_cache.shape[1]
+
+        block_tables = attn_metadata.block_tables
+        per_token_quant = (
+            self.kv_cache_dtype.startswith("fp8")
+            and k_scale is not None
+            and v_scale is not None
+            and k_scale.numel() > 1
+            and v_scale.numel() > 1
+        )
+        cp_mha_gather_cache(
+            key_cache=k_cache_gather,
+            value_cache=v_cache_gather,
+            key=k_full,
+            value=v_full,
+            block_tables=block_tables,
+            k_scales=k_scale,
+            v_scales=v_scale,
+            cu_seqlens_kv=cu_seqlens_k,
+            token_to_batch=token_to_batch,
+            seq_starts=attn_metadata.seq_starts,
+            dequant=self.kv_cache_dtype.startswith("fp8"),
+            kv_cache_layout="SHUFFLE" if use_shuffle else "NHD",
+            total_tokens=total_tokens,
+            per_token_quant=per_token_quant,
+        )
+
+        return q, k_full, v_full, k_cache, v_cache, k_scale, v_scale
+
+    @mark_trace(prefix="paged_attention_triton", torch_compile=False)
+    def paged_attention_triton(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+
+        attn_metadata = fwd_ctx.attn_metadata
+
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
+        num_seqs = attn_metadata.context_lens.shape[0]
+
+        if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
+            # print(q.shape, k_cache.shape, v_cache.shape)
+            sliding_window = (
+                (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
+            )
+
+            shuffled_kv_cache = not self.use_flash_layout
+
+            unified_attention(
+                q,
+                k_cache,
+                v_cache,
+                o,
+                cu_seqlens_q=attn_metadata.cu_seqlens_q,
+                seqused_k=attn_metadata.context_lens,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_seqlen_k=attn_metadata.max_seqlen_k,
+                softmax_scale=self.scale,
+                causal=True,
+                alibi_slopes=None,
+                window_size=sliding_window,
+                block_table=attn_metadata.block_tables,
+                softcap=0,
+                q_descale=None,
+                k_descale=self.kv_scale,
+                v_descale=self.kv_scale,
+                sinks=self.sinks,
+                shuffled_kv_cache=shuffled_kv_cache,
+            )
+        else:
+            _, num_q_heads_total, head_size = q.shape
+            num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
+            query_group_size = attn_metadata.max_seqlen_q * (
+                num_q_heads_total // num_kv_heads
+            )
+            assert num_q_heads_total % num_kv_heads == 0
+
+            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+
+            context_partition_size = 256
+            if self.sliding_window > 0:
+                max_context_partition_num = 1
+                context_partition_size = 128
+
+            intermediate_shape = (
+                num_seqs,
+                num_kv_heads,
+                max_context_partition_num,
+                query_group_size,
+            )
+            exp_sums = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            max_logits = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
+            temporary_output = torch.empty(
+                *intermediate_shape,
+                head_size,
+                dtype=q.dtype,
+                device=q.device,
+            )
+
+            if k_scale is not None and k_scale.numel() > 1:
+                k_scale = k_scale.unsqueeze(-1)
+                v_scale = v_scale.unsqueeze(-1)
+
+            compute_type = (
+                torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
+            )
+            run_pa_decode_gluon(
+                output=o,
+                q=q,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                context_lens=attn_metadata.context_lens,
+                block_tables=attn_metadata.block_tables,
+                softmax_scale=self.scale,
+                max_seqlen_q=attn_metadata.max_seqlen_q,
+                max_context_partition_num=max_context_partition_num,
+                context_partition_size=context_partition_size,
+                compute_type=compute_type,
+                q_scale=None,
+                k_scale=None if self.kv_cache_dtype == "bf16" else k_scale,
+                v_scale=None if self.kv_cache_dtype == "bf16" else v_scale,
+                exp_sums=exp_sums,
+                max_logits=max_logits,
+                temporary_output=temporary_output,
+                alibi_slopes=None,
+                sinks=self.sinks,
+                sliding_window=self.sliding_window,
+                ps=True,
+            )
+
+        return o
+
+    @mark_trace(prefix="paged_attention_asm", torch_compile=False)
+    def paged_attention_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+
+        attn_metadata = fwd_ctx.attn_metadata
+        o = run_pa_fwd_asm(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=attn_metadata.block_tables,
+            context_lens=attn_metadata.context_lens,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            max_qlen=attn_metadata.max_seqlen_q,
+            qo_indptr=attn_metadata.cu_seqlens_q,
+        )
+
+        return o
+
+    @mark_trace(prefix="paged_attention_persistent_asm", torch_compile=False)
+    def paged_attention_persistent_asm(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+        attn_metadata = fwd_ctx.attn_metadata
+        output = torch.empty_like(q)
+
+        aiter.pa_persistent_fwd(
+            Q=q,
+            K=k_cache,
+            V=v_cache,
+            output=output,
+            max_qlen=attn_metadata.max_seqlen_q,
+            qo_indptr=attn_metadata.cu_seqlens_q,
+            kv_indptr=attn_metadata.kv_indptr,
+            kv_indices=attn_metadata.kv_indices,
+            context_lens=attn_metadata.context_lens,
+            K_QScale=k_scale,
+            V_QScale=v_scale,
+            work_indptr=attn_metadata.work_indptr,
+            work_info=attn_metadata.work_info_set,
+            reduce_indptr=attn_metadata.reduce_indptr,
+            reduce_final_map=attn_metadata.reduce_final_map,
+            reduce_partial_map=attn_metadata.reduce_partial_map,
+            softmax_scale=self.scale,
+            mask=1,
+        )
+
+        return output
+
+    @mark_trace(prefix="prefill_attention", torch_compile=False)
+    def prefill_attention(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+
+        # variable lenth attention use key value as input
+        attn_metadata = fwd_ctx.attn_metadata
+        sliding_window = (
+            (self.sliding_window, 0, 0) if self.sliding_window > 0 else (-1, -1, 0)
+        )
+        o = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            cu_seqlens_k=attn_metadata.cu_seqlens_k,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
+            min_seqlen_q=attn_metadata.min_seqlen_q,
+            dropout_p=attn_metadata.dropout_p,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=sliding_window,
+            sink_ptr=self.sinks,
+        )
+        return o
+
+    def prefill_attention_triton(
+        self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
+    ):
+
+        # unified_attention supports both prefill and decode, over either the 4D
+        # flash layout (shuffled_kv_cache=False) or the 5D SHUFFLE layout
+        # (shuffled_kv_cache=True):
+        #
+        # flash    K/V: [num_blocks, block_size, num_kv_heads, head_size]
+        # shuffle  K:   [num_blocks, num_kv_heads, head_size // x, block_size, x]
+        # shuffle  V:   [num_blocks, num_kv_heads, block_size // x, head_size, x]
+        #
+        # For pure prefill (no cached tokens), raw key/value are passed as a
+        # block_size=1 flash-layout cache with a fake block_table:
+        #
+        # key:    [num_tokens, 1, num_kv_heads, head_size]
+        # value:  [num_tokens, 1, num_kv_heads, head_size]
+
+        attn_metadata = fwd_ctx.attn_metadata
+
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
+        sliding_window = (
+            (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
+        )
+
+        # `block_tables` is always populated by TritonMHAMetadataBuilder.
+        # For pure prefill (no cached tokens) it is, by default, the fake table
+        # built in prepare_prefill that maps seq i to token indices
+        # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
+        # treated as kv_cache with block_size=1.
+        #
+        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
+        # per-seq block_table and reads from KV cache, the new tokens
+        # already written into the paged flash-layout cache during rope_cache
+        # are read straight from `k_cache`/`v_cache`, identical to the
+        # prefix-cache-hit path.
+        if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
+            k_for_attn = k_cache
+            v_for_attn = v_cache
+            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
+            # 4D flash layout is in use.
+            shuffled_kv_cache = not self.use_flash_layout
+        else:
+            #   k: [total_tokens, num_kv_heads, head_size]
+            #     -> [total_tokens, 1, num_kv_heads, head_size]
+            k_for_attn = k.unsqueeze(1)
+            v_for_attn = v.unsqueeze(1)
+            # Raw K/V is fed as a block_size=1 flash-layout cache, never shuffled.
+            shuffled_kv_cache = False
+
+        unified_attention(
+            q,
+            k_for_attn,
+            v_for_attn,
+            o,
+            cu_seqlens_q=attn_metadata.cu_seqlens_q,
+            seqused_k=attn_metadata.context_lens,
+            max_seqlen_q=attn_metadata.max_seqlen_q,
+            max_seqlen_k=attn_metadata.max_seqlen_k,
+            softmax_scale=self.scale,
+            causal=True,
+            alibi_slopes=None,
+            window_size=sliding_window,
+            block_table=attn_metadata.block_tables,
+            softcap=0,
+            q_descale=None,
+            k_descale=self.kv_scale,
+            v_descale=self.kv_scale,
+            sinks=self.sinks,
+            shuffled_kv_cache=shuffled_kv_cache,
+        )
+
+        return o
+
+    def dispatch_backend(self, fwd_ctx: ForwardContext):
+
+        ctx = fwd_ctx.context
+
+        use_unified_attn = envs.ATOM_USE_UNIFIED_ATTN
+        if ctx.is_prefill:
+            if use_unified_attn or self.use_flash_layout:
+                return self.prefill_attention_triton
+            return self.prefill_attention
+        else:
+            if use_unified_attn or self.use_triton_attn or self.use_flash_layout:
+                return self.paged_attention_triton
+            else:
+                # Only use pa persistent when block_size == 1024
+                atom_config = get_current_atom_config()
+                if atom_config.kv_cache_block_size == 1024:
+                    return self.paged_attention_persistent_asm
+                return self.paged_attention_asm
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor = None,
+        attn_metadata=None,
+        position: torch.Tensor = None,
+        q_scale: Optional[torch.Tensor] = None,
+        qkv: torch.Tensor = None,
+        output: torch.Tensor = None,
+        **kwargs,
+    ):
+        return self.forward_impl(
+            q=query, k=key, v=value, position=position, q_scale=q_scale, qkv=qkv
+        )
