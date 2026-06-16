@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+from __future__ import annotations
+
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
@@ -8,10 +10,13 @@ from typing import TYPE_CHECKING, Any, Dict, Generic, Optional, Type, TypeVar
 if TYPE_CHECKING:
     from vllm._atom.kv_transfer.disaggregation.types import KVTransferTensors
 
+    # ScheduledBatch is only a type annotation here; under vLLM the scheduler is
+    # vLLM's, and ATOM's model_engine has been pruned out.
+    from vllm._atom.model_engine.scheduler import ScheduledBatch
+
 import numpy as np
 import torch
 from aiter.dist.parallel_state import get_tp_group
-from vllm._atom.model_engine.scheduler import ScheduledBatch
 from vllm._atom.model_ops.attention_mla import MLAModules
 from vllm._atom.utils import CpuGpuBuffer
 from vllm._atom.utils.tbo.ubatch_splitting import UBatchSlice, split_attn_metadata

@@ -307,6 +307,8 @@ class GDNAttentionBackend:
 
     @staticmethod
     def get_impl_cls() -> Type:
-        from vllm._atom.plugin.vllm.attention.layer_gdn import GatedDeltaNet
-
-        return GatedDeltaNet
+        # Gated-Delta-Net (Qwen3-Next/MiniMax) was removed from this pruned
+        # DeepSeek-V4 build along with model_ops/fla_ops + mamba_ops.
+        raise NotImplementedError(
+            "Gated-Delta-Net attention was removed from this DeepSeek-V4 build"
+        )

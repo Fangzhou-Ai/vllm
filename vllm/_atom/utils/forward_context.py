@@ -652,38 +652,12 @@ def get_kvconnector(role: str = "worker", config: Optional[Config] = None) -> An
     if not (hasattr(config, "kv_transfer_config") and config.kv_transfer_config):
         return _global_kvconnector
 
-    if role == "worker":
-        from aiter.dist.parallel_state import get_tp_group
-
-        try:
-            tp_rank = get_tp_group().rank_in_group
-        except Exception:
-            _logger.warning(
-                "get_tp_group() failed (dist not initialized?), returning None"
-            )
-            return None
-
-        if _global_kvconnector is None:
-            from vllm._atom.kv_transfer.disaggregation import KVConnectorFactory
-
-            _global_kvconnector = KVConnectorFactory.create_connector(
-                config, role="worker"
-            )
-            _logger.debug("Initialized global KVConnector at tp_rank %d", tp_rank)
-
-    elif role == "scheduler":
-        from vllm._atom.kv_transfer.disaggregation import KVConnectorFactory
-
-        _global_kvconnector_scheduler = KVConnectorFactory.create_connector(
-            config, role="scheduler"
-        )
-        _logger.debug("Initialized global KVConnectorScheduler")
-        return _global_kvconnector_scheduler
-
-    else:
-        raise ValueError(f"Unknown KV connector role: {role!r}")
-
-    return _global_kvconnector
+    # KV disaggregation (kv_transfer) was removed from this pruned DeepSeek-V4
+    # build. The early return above handles the single-node (no-transfer) case;
+    # reaching here means kv_transfer_config was set, which is unsupported now.
+    raise NotImplementedError(
+        "KV disaggregation (kv_transfer) was removed from this DeepSeek-V4 build"
+    )
 
 
 def set_kv_cache_data(
