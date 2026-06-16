@@ -1,14 +1,14 @@
-"""ATOM vLLM platform integration."""
+"""DeepSeek-V4 ROCm config constraints (native path).
+
+Formerly the ATOM vLLM platform plugin (``ATOMPlatform``). Stage 2 dropped the
+out-of-tree platform plugin; these constraints are now invoked directly from the
+native ``RocmPlatform.check_and_update_config`` (see ``vllm/platforms/rocm.py``).
+"""
 
 import logging
 import os
 
-from vllm._atom.utils import envs
-
 logger = logging.getLogger("atom")
-
-# This flag is used to enable the vLLM plugin mode.
-disable_vllm_plugin = envs.ATOM_DISABLE_VLLM_PLUGIN
 
 # Largest single-forward token count we allow for DeepSeek-V4 when chunked
 # prefill is disabled. Beyond this, a single forward overflows int32 element
@@ -92,24 +92,3 @@ def _enforce_deepseek_v4_constraints(vllm_config) -> None:
         )
         logger.error(msg)
         raise ValueError(msg)
-
-
-if not disable_vllm_plugin:
-    from vllm.platforms.rocm import RocmPlatform
-
-    class ATOMPlatform(RocmPlatform):
-        """ATOM platform wrapper.
-
-        Attention backend selection is owned by ATOM's vLLM attention layers
-        (`AttentionForVllm*`). We intentionally do not override
-        `get_attn_backend_cls()` here, so any fallback vLLM standard attention
-        keeps ROCmPlatform's native backend selection.
-        """
-
-        @classmethod
-        def check_and_update_config(cls, vllm_config) -> None:
-            super().check_and_update_config(vllm_config)
-            _enforce_deepseek_v4_constraints(vllm_config)
-
-else:
-    ATOMPlatform = None

@@ -117,6 +117,7 @@ if TYPE_CHECKING:
     VLLM_USE_OINK_OPS: bool = False
     VLLM_MXFP8_EMULATION_DEQUANT_AT_LOAD: bool = True
     VLLM_ROCM_USE_AITER: bool = False
+    VLLM_DSV4_USE_ATOM: bool = True
     VLLM_ROCM_USE_AITER_PAGED_ATTN: bool = False
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
@@ -1127,6 +1128,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER", "False").lower() in ("true", "1")
+    ),
+    # On ROCm, route DeepSeek-V4 through the vendored ATOM model path
+    # (vllm/_atom) instead of the native vllm/models/deepseek_v4/amd impl.
+    # This is the native replacement for the former ATOM out-of-tree plugin
+    # (its pyproject entry points were removed); ATOM_DISABLE_VLLM_PLUGIN
+    # remains a kill-switch back to the native AMD path. Default on.
+    "VLLM_DSV4_USE_ATOM": lambda: (
+        os.getenv("VLLM_DSV4_USE_ATOM", "True").lower() in ("true", "1")
+        and os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() not in ("true", "1")
     ),
     # Whether to use aiter paged attention.
     # By default is disabled.

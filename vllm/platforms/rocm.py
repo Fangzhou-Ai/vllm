@@ -786,6 +786,24 @@ class RocmPlatform(Platform):
         if parallel_config.worker_cls == "auto":
             parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
 
+        # DeepSeek-V4 ATOM path (native replacement for the former ATOM platform
+        # plugin / ATOMPlatform): enforce V4 config constraints (disable prefix
+        # caching for the SWA window; guard oversized non-chunked forwards).
+        # Gated on arch first so ATOM is never imported for other ROCm models.
+        if envs.VLLM_DSV4_USE_ATOM:
+            model_config = vllm_config.model_config
+            arches = (
+                getattr(model_config, "architectures", None) or []
+                if model_config is not None
+                else []
+            )
+            if any("DeepseekV4" in str(a) for a in arches):
+                from vllm._atom.plugin.vllm.platform import (
+                    _enforce_deepseek_v4_constraints,
+                )
+
+                _enforce_deepseek_v4_constraints(vllm_config)
+
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
         if model_arch in _ROCM_UNSUPPORTED_MODELS:
