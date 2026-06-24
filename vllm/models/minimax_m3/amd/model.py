@@ -266,12 +266,9 @@ def _m3_fused_shared_experts_enabled() -> bool:
 
     if not (current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER):
         return False
-    try:
-        from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950
 
-        if not on_gfx950():
-            return False
-    except ImportError:
+    if not on_gfx950():
         return False
 
     os.environ.setdefault("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "1")
