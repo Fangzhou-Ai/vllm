@@ -4,7 +4,6 @@ from enum import IntEnum
 from functools import lru_cache
 
 import torch
-from aiter.ops.flydsl.moe_common import GateMode
 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm._aiter_ops import rocm_aiter_ops
@@ -371,6 +370,8 @@ def rocm_aiter_fused_experts(
         # `rocm_aiter_ops.shuffle_weight_a16w4` in `oracle/mxfp4.py`,
         # which always sets `is_guinterleave=True`.
         # Hence, we pass in GateMode.INTERLEAVE to match the weight shuffling.
+        from aiter.ops.flydsl.moe_common import GateMode
+
         gate_mode = ""
         if quant_config.use_mxfp4_w4a16:
             gate_mode = GateMode.INTERLEAVE.value
