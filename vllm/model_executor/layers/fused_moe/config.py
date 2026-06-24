@@ -1278,7 +1278,6 @@ class FusedMoEConfig:
     # Defaults to intermediate_size_per_partition if not specified.
     intermediate_size_per_partition_unpadded: int | None = None
     # Model specific override
-    hidden_pad: int | None = None
     intermediate_pad: int | None = None
 
     moe_backend: MoEBackend = "auto"

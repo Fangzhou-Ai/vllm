@@ -339,11 +339,7 @@ def rocm_aiter_fused_experts(
         intermediate_pad = 0
         assert moe_config.hidden_dim_unpadded is not None
         assert moe_config.intermediate_size_per_partition_unpadded is not None
-        hidden_pad = (
-            hidden_states.shape[1] - moe_config.hidden_dim_unpadded
-            if moe_config.hidden_pad is None
-            else moe_config.hidden_pad
-        )
+        hidden_pad = hidden_states.shape[1] - moe_config.hidden_dim_unpadded
         intermediate_pad = (
             (
                 moe_config.intermediate_size_per_partition
