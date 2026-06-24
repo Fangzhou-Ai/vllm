@@ -1223,12 +1223,12 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
     def process_weights_after_loading(self, layer):
         self._setup_kernel(layer)
 
-    def _m3_ck_moe_enabled(self) -> bool:
-        """MiniMax-M3 MXFP4 W4A8 routed through aiter CK ``fused_moe``.
+    def _ck_moe_enabled(self) -> bool:
+        """MXFP4 W4A8 MoE routed through aiter's CK ``fused_moe``.
 
         Enabled by default for the W4A8 (``AITER_MXFP4_FP8``) backend on gfx950,
         where the tuned CK MoE kernels live. Mirrors ATOM's CK MoE path and lets
-        the always-on shared expert fuse into one grouped call.
+        an always-on shared expert (when present) fuse into one grouped call.
         """
         if self.mxfp4_backend != Mxfp4MoeBackend.AITER_MXFP4_FP8:
             return False
@@ -1238,7 +1238,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
     def _setup_kernel(self, layer: RoutedExperts):
         """Setup kernel using oracle functions for MXFP4 schemes (W4A16, W4A8)."""
-        if self._m3_ck_moe_enabled():
+        if self._ck_moe_enabled():
             self._setup_ck_moe(layer)
             return
 
@@ -1312,7 +1312,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
 
         num_experts = layer.w13_weight_scale.shape[0]
 
-        # M3 uses the separated (non-interleaved) gate_up layout.
+        # W4A8 CK MoE uses the separated (non-interleaved) gate_up layout.
         is_guinterleave = False
 
         if getattr(layer, "w13_bias", None) is not None:
@@ -1458,7 +1458,7 @@ class QuarkOCP_MX_MoEMethod(QuarkMoEMethod):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self._m3_ck_moe_enabled():
+        if self._ck_moe_enabled():
             from aiter.fused_moe import fused_moe
 
             return fused_moe(
