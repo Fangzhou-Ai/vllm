@@ -257,9 +257,7 @@ def _m3_fused_shared_experts_enabled() -> bool:
     Mirrors ATOM.
 
     Force-enables aiter's shared-expert fusion (which gates
-    ``num_fused_shared_experts`` in the MoE layer) and pins bf16 MoE activations
-    -- gfx950 lacks the fp4 prefill FlyDSL kernels the tuned config references,
-    so the fp4 activation path would crash. Both are ``setdefault`` so an
+    ``num_fused_shared_experts`` in the MoE layer) via ``setdefault`` so an
     explicit user override still wins.
     """
     from vllm.platforms import current_platform
@@ -272,7 +270,6 @@ def _m3_fused_shared_experts_enabled() -> bool:
         return False
 
     os.environ.setdefault("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "1")
-    os.environ.setdefault("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "100000000")
     rocm_aiter_ops.refresh_env_variables()
     return rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
 
