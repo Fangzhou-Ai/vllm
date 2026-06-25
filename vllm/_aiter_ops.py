@@ -1650,6 +1650,17 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._FMOE_ENABLED
 
     @classmethod
+    def set_fusion_moe_shared_experts_enabled(cls, enabled: bool = True) -> None:
+        """Hint that the loaded model wants aiter fused shared experts (FSE).
+
+        Lets a model (e.g. MiniMax-M3) request shared-expert fusion without
+        mutating the environment. An explicit user setting of
+        VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS still takes precedence.
+        """
+        if not envs.is_set("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS"):
+            cls._MOE_SHARED_EXPERTS_ENABLED = enabled
+
+    @classmethod
     @if_aiter_supported
     def is_fusion_moe_shared_experts_enabled(cls) -> bool:
         return cls.is_fused_moe_enabled() and cls._MOE_SHARED_EXPERTS_ENABLED

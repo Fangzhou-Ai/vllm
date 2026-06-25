@@ -17,7 +17,6 @@ The MiniMax-M3-preview config selects a single set of branches:
       "index" attention branch.
 """
 
-import os
 from collections.abc import Iterable
 
 import torch
@@ -256,9 +255,9 @@ def _m3_fused_shared_experts_enabled() -> bool:
     129-expert / topk-5 grouped call instead of a separate per-layer MLP).
     Mirrors ATOM.
 
-    Force-enables aiter's shared-expert fusion (which gates
-    ``num_fused_shared_experts`` in the MoE layer) via ``setdefault`` so an
-    explicit user override still wins.
+    Hints aiter that the model wants fused shared experts (which gates
+    ``num_fused_shared_experts`` in the MoE layer); an explicit
+    VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS override still wins.
     """
     from vllm.platforms import current_platform
 
@@ -269,8 +268,7 @@ def _m3_fused_shared_experts_enabled() -> bool:
     if not on_gfx950():
         return False
 
-    os.environ.setdefault("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "1")
-    rocm_aiter_ops.refresh_env_variables()
+    rocm_aiter_ops.set_fusion_moe_shared_experts_enabled()
     return rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
 
 
