@@ -587,6 +587,7 @@ class GroupCoordinator:
         # so we don't abstract it into the base class
         maybe_ca_context = nullcontext()
         maybe_aiter_context = nullcontext()
+        maybe_aiter_dist_context = nullcontext()
         from vllm.distributed.device_communicators.cuda_communicator import (
             CudaCommunicator,
         )
@@ -610,13 +611,42 @@ class GroupCoordinator:
                 if aiter_ar is not None:
                     maybe_aiter_context = aiter_ar.capture()  # type: ignore
 
+            # The DeepSeek-V4 ROCm full-attention path issues fused
+            # allreduce+rmsnorm through aiter's own tp-group ca_comm (set up
+            # from vLLM's TP group). Nest its capture so the collective is
+            # registered for HIP-graph replay instead of falling back to a
+            # per-call hipMemcpyAsync. No-op unless aiter's dist tp group is
+            # initialized (only that path does so). (Ported from ATOM.)
+            try:
+                from aiter.dist.parallel_state import (
+                    get_tp_group as _aiter_get_tp_group,
+                )
+
+                _aiter_tp = _aiter_get_tp_group()
+                _aiter_ca = getattr(
+                    getattr(_aiter_tp, "device_communicator", None),
+                    "ca_comm",
+                    None,
+                )
+                if _aiter_ca is not None and not getattr(
+                    _aiter_ca, "disabled", True
+                ):
+                    maybe_aiter_dist_context = _aiter_ca.capture()  # type: ignore
+            except Exception:
+                pass
+
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
         curr_stream = torch.cuda.current_stream()
         if curr_stream != stream:
             stream.wait_stream(curr_stream)
 
-        with torch.cuda.stream(stream), maybe_ca_context, maybe_aiter_context:
+        with (
+            torch.cuda.stream(stream),
+            maybe_ca_context,
+            maybe_aiter_context,
+            maybe_aiter_dist_context,
+        ):
             yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:

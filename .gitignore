@@ -213,6 +213,7 @@ cython_debug/
 .DS_Store
 
 # Results
+*_bench/
 *.csv
 
 # Python pickle files
