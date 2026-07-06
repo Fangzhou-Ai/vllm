@@ -243,13 +243,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
 
         self.rms_norm_eps = config.rms_norm_eps
+        from vllm.models.deepseek_v4.amd.atom_integration import dsv4_use_atom_moe
+
+        # This branch ports ONLY the MoE — attention stays vLLM's original
+        # DeepSeek-V4 ROCm MLA path (so the perf delta is attributable to the
+        # ATOM MoE alone).
         self.attn = DeepseekV4ROCMAiterMLAAttention(
             vllm_config,
             prefix=f"{prefix}.attn",
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        if dsv4_use_atom_moe():
+            # Ported ATOM MoE replaces vLLM's FusedMoE MoE path. Set up the ATOM
+            # engine-config singleton + args here (no ATOM attention path to do
+            # it); hash-routed layers read input_ids from the minimal ATOM
+            # forward context entered in DeepseekV4ForCausalLM.forward.
+            from vllm.models.deepseek_v4.amd.atom_integration import (
+                AtomV4MoE,
+                setup_atom_config_and_args,
+            )
+
+            _args = setup_atom_config_and_args(vllm_config)
+            self.ffn = AtomV4MoE(vllm_config, prefix=f"{prefix}.ffn", args=_args)
+        else:
+            self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -480,6 +498,9 @@ class DeepseekV4Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
+        # MoE-only branch: attention is vLLM's original MLA path, so there is no
+        # ATOM proxy KV layer to register (that belongs to the ported attention).
+
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: DeepseekV4DecoderLayer(
@@ -604,6 +625,11 @@ class DeepseekV4Model(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        from vllm.models.deepseek_v4.amd.atom_integration import dsv4_use_atom_moe
+
+        use_atom_moe = dsv4_use_atom_moe()
+        # vLLM's original attention fusion (this branch keeps vLLM attention).
+        # gate_up_proj covers the shared expert (vLLM MLP or ATOM Expert).
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "w1", 0),
@@ -662,6 +688,20 @@ class DeepseekV4Model(nn.Module):
                         if is_pp_missing_parameter(name_mapped, self):
                             continue
                         param = params_dict[name_mapped]
+                        if use_atom_moe:
+                            # ATOM's FusedMoE.weight_loader keys off
+                            # (weight_name, shard_id, expert_id) and has no
+                            # ``return_success`` param; at TP (non-EP) every
+                            # expert is local so the load always succeeds.
+                            param.weight_loader(
+                                param,
+                                loaded_weight,
+                                name_mapped,
+                                shard_id=expert_shard_id,
+                                expert_id=expert_id,
+                            )
+                            name = name_mapped
+                            break
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
                         # available replicas.
@@ -705,6 +745,25 @@ class DeepseekV4Model(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        from vllm.models.deepseek_v4.amd.atom_integration import dsv4_use_atom_moe
+
+        if dsv4_use_atom_moe():
+            # ATOM's FusedMoE isn't a vLLM FusedMoE (so vLLM's introspecting
+            # ``fused_moe_make_expert_params_mapping`` would return nothing);
+            # use ATOM's own mapping. Shared-expert fusion is OFF for V4-Pro
+            # (shared experts are FP8, routed are FP4 — differing quant specs),
+            # so the shared expert loads as a standalone ``Expert`` and only the
+            # ``n_routed_experts`` routed experts are enumerated here.
+            from vllm.models.deepseek_v4.amd.atom.model_ops.moe import (
+                FusedMoE as _AtomFusedMoE,
+            )
+
+            return _AtomFusedMoE.make_expert_params_mapping(
+                ckpt_gate_proj_name="w1",
+                ckpt_down_proj_name="w2",
+                ckpt_up_proj_name="w3",
+                num_experts=self.config.n_routed_experts,
+            )
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
@@ -751,6 +810,39 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
+def _make_vllm_attn_atom_moe_mapper(expert_dtype: str) -> WeightsMapper:
+    """Weights mapper for vLLM's original attention + the ATOM MoE.
+
+    Same as the pure-vLLM mapper for attention / prefixes / suffixes, but the
+    MoE is ATOM's: the standalone shared expert is an ATOM ``Expert`` built from
+    ATOM FP8 linears (registers ``weight_scale``, keeps the ``w2`` down-proj
+    name), and the FP4 routed experts (``Mxfp4MoEMethod``) register
+    ``weight_scale`` too. Attention FP8 scales still fall through to
+    ``weight_scale_inv`` (vLLM linear naming).
+    """
+    scale_regex = {
+        re.compile(r"(\.experts\.\d+\.w[123])\.scale$"): r"\1.weight_scale",
+        re.compile(r"(\.shared_experts\.w[123])\.scale$"): r"\1.weight_scale",
+        re.compile(r"\.scale$"): ".weight_scale_inv",
+    }
+    return WeightsMapper(
+        orig_to_new_prefix={
+            "layers.": "model.layers.",
+            "embed.": "model.embed.",
+            "norm.": "model.norm.",
+            "hc_head": "model.hc_head",
+            "mtp.": "model.mtp.",
+        },
+        orig_to_new_regex=scale_regex,
+        orig_to_new_suffix={
+            "head.weight": "lm_head.weight",
+            "embed.weight": "embed_tokens.weight",
+            ".ffn.gate.bias": ".ffn.gate.e_score_correction_bias",
+        },
+        orig_to_new_substr={},
+    )
+
+
 class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     model_cls = DeepseekV4Model
 
@@ -763,8 +855,21 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
         config = vllm_config.model_config.hf_config
         self.config = config
+        self.vllm_config = vllm_config
         expert_dtype = getattr(config, "expert_dtype", "fp4")
-        if expert_dtype != "fp4":
+        from vllm.models.deepseek_v4.amd.atom_integration import dsv4_use_atom_moe
+
+        self._use_atom_moe = dsv4_use_atom_moe()
+        if self._use_atom_moe:
+            # vLLM's original attention + the ATOM MoE: the MoE weights follow
+            # ATOM naming (shared expert keeps w2; scales -> weight_scale).
+            from vllm.models.deepseek_v4.amd.atom_integration import (
+                setup_atom_config_and_args,
+            )
+
+            self.hf_to_vllm_mapper = _make_vllm_attn_atom_moe_mapper(expert_dtype)
+            self.args = setup_atom_config_and_args(vllm_config)
+        elif expert_dtype != "fp4":
             self.hf_to_vllm_mapper = _make_deepseek_v4_weights_mapper(expert_dtype)
 
         self.model = self.model_cls(
@@ -800,6 +905,20 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        if getattr(self, "_use_atom_moe", False):
+            # Enter a minimal ATOM forward context so the ATOM MoE's hash-routed
+            # layers can read input_ids (the moe_forward op can't take it as an
+            # arg). input_ids is vLLM's persistent model-input buffer, so this is
+            # cudagraph-replay-safe. No ATOM attention infra is used.
+            from vllm.models.deepseek_v4.amd.atom_integration import (
+                atom_moe_forward_context,
+            )
+
+            with atom_moe_forward_context(input_ids, positions):
+                hidden_states = self.model(
+                    input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+            return hidden_states
         hidden_states = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
@@ -814,6 +933,34 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        if getattr(self, "_use_atom_moe", False):
+            # Run ATOM's post-load prep on each ATOM MoE subtree (vLLM's post-load
+            # hook only fires for vLLM Attention modules). Per-module ATOM loader
+            # ordering: (1) module.process_weights_after_loading (ATOM linear FP8
+            # shuffle; FusedMoE._online_quant — a no-op here since routed experts
+            # are FP4 on disk = the online target), (2) quant_method
+            # .process_weights_after_loading (Mxfp4MoEMethod scale/weight shuffle),
+            # (3) init_prepare_finalize (builds the moe_quant_config apply() needs).
+            from vllm.models.deepseek_v4.amd.atom.model_ops.base_config import (
+                QuantizeMethodBase,
+            )
+            from vllm.models.deepseek_v4.amd.atom.model_ops.moe import (
+                FusedMoEMethodBase,
+            )
+
+            for layer in self.model.layers:
+                ffn = getattr(layer, "ffn", None)
+                if ffn is None:
+                    continue
+                for m in ffn.modules():
+                    pw = getattr(m, "process_weights_after_loading", None)
+                    if callable(pw):
+                        pw()
+                    qm = getattr(m, "quant_method", None)
+                    if isinstance(qm, QuantizeMethodBase):
+                        qm.process_weights_after_loading(m)
+                    if isinstance(qm, FusedMoEMethodBase):
+                        qm.init_prepare_finalize(m)
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:

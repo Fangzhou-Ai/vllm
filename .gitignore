@@ -214,6 +214,8 @@ cython_debug/
 
 # Results
 *.csv
+# do not commit
+*_bench/
 
 # Python pickle files
 *.pkl
