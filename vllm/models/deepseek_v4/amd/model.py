@@ -8,16 +8,20 @@ import regex as re
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
+    RoutedExperts,
     fused_moe_make_expert_params_mapping,
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -35,6 +39,7 @@ from vllm.model_executor.layers.mhc import (
     MHCPreOp,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4MoEMethod
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -56,7 +61,243 @@ from vllm.model_executor.models.utils import (
 )
 from vllm.models.deepseek_v4.amd.rocm import DeepseekV4ROCMAiterMLAAttention
 from vllm.platforms import current_platform
+from vllm.platforms.rocm import on_gfx950
 from vllm.sequence import IntermediateTensors
+
+logger = init_logger(__name__)
+
+
+def _should_fuse_shared_expert(vllm_config: VllmConfig) -> bool:
+    if not envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS:
+        return False
+
+    config = vllm_config.model_config.hf_config
+    quant_config = vllm_config.quant_config
+    parallel_config = vllm_config.parallel_config
+    reasons = []
+
+    if not current_platform.is_rocm() or not on_gfx950():
+        reasons.append("the device is not ROCm gfx950")
+    if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
+        reasons.append("AITER fused shared experts are not enabled")
+    if vllm_config.kernel_config.moe_backend != "aiter":
+        reasons.append("the MoE backend is not AITER")
+    if getattr(parallel_config, "enable_expert_parallel", False):
+        reasons.append("expert parallelism is enabled")
+    if getattr(parallel_config, "enable_eplb", False):
+        reasons.append("EPLB is enabled")
+    if getattr(config, "n_routed_experts", None) != 384:
+        reasons.append("the model does not have 384 routed experts")
+    if getattr(config, "num_experts_per_tok", None) != 6:
+        reasons.append("the model does not route to 6 experts per token")
+    if getattr(config, "n_shared_experts", None) != 1:
+        reasons.append("the model does not have exactly one shared expert")
+    if getattr(config, "expert_dtype", None) != "fp4":
+        reasons.append("routed experts are not FP4")
+    if quant_config is None or quant_config.get_name() != "deepseek_v4_fp8":
+        reasons.append("the DeepSeek V4 FP8 quantization config is not active")
+    else:
+        if getattr(quant_config, "moe_quant_algo", "").upper() == "NVFP4":
+            reasons.append("routed experts use NVFP4 instead of MXFP4")
+        if getattr(quant_config, "weight_block_size", None) != [128, 128]:
+            reasons.append("shared experts are not 128x128 block FP8")
+        if not getattr(quant_config, "is_checkpoint_fp8_serialized", False):
+            reasons.append("shared experts are not serialized as FP8")
+        if not getattr(quant_config, "is_scale_e8m0", False):
+            reasons.append("shared-expert scales are not E8M0")
+        if getattr(quant_config, "ignored_layers", None):
+            reasons.append("the quantization config has ignored layers")
+
+    if reasons:
+        logger.warning_once(
+            "DeepSeek V4 fused shared expert was requested but is unsupported: %s. "
+            "Falling back to the separate shared MLP.",
+            "; ".join(reasons),
+        )
+        return False
+
+    logger.info_once(
+        "Fusing the DeepSeek V4 shared expert into AITER MoE (E=385, top-k=7)."
+    )
+    return True
+
+
+def _remap_shared_expert_to_routed(name: str, expert_id: int) -> str:
+    marker = ".shared_experts."
+    if marker not in name:
+        return name
+
+    prefix, suffix = name.split(marker, 1)
+    if not suffix.startswith(("w1.", "w2.", "w3.")):
+        return name
+    return f"{prefix}.experts.{expert_id}.{suffix}"
+
+
+@torch.no_grad()
+def _fp8_block_weight_to_mxfp4(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    device: torch.device,
+    block_size: tuple[int, int] = (128, 128),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert FP8 blocks with strict-midpoint MXFP4 packing."""
+    if weight.dtype != torch.float8_e4m3fn or weight.ndim != 2:
+        raise ValueError("Fused DeepSeek V4 shared-expert weights must be 2D FP8 E4M3.")
+    if scale.dtype == torch.uint8:
+        scale = scale.view(torch.float8_e8m0fnu)
+    if scale.dtype != torch.float8_e8m0fnu or scale.ndim != 2:
+        raise ValueError("Fused DeepSeek V4 shared-expert scales must be 2D E8M0.")
+
+    block_n, block_k = block_size
+    n, k = weight.shape
+    if n % block_n or k % block_k:
+        raise ValueError(
+            f"Shared-expert weight shape {(n, k)} is not divisible by "
+            f"the FP8 block size {block_size}."
+        )
+    expected_scale_shape = (n // block_n, k // block_k)
+    if scale.shape != expected_scale_shape:
+        raise ValueError(
+            f"Shared-expert scale shape {tuple(scale.shape)} does not match "
+            f"the expected shape {expected_scale_shape}."
+        )
+
+    weight_fp32 = weight.to(device=device, dtype=torch.float32)
+    scale_fp32 = scale.to(device=device, dtype=torch.float32)
+    weight_blocks = weight_fp32.view(n // block_n, block_n, k // block_k, block_k)
+    weight_blocks.mul_(scale_fp32[:, None, :, None])
+    weight_bf16 = weight_blocks.view(n, k).to(torch.bfloat16)
+    del weight_fp32, weight_blocks, scale_fp32
+
+    mxfp4_block_size = 32
+    blocks = weight_bf16.view(-1, mxfp4_block_size)
+    block_amax = blocks.abs().amax(dim=-1, keepdim=True)
+    descale = block_amax / 6.0
+    min_scale_exp = torch.tensor(-127.0, device=device)
+    scale_exp = torch.ceil(torch.maximum(torch.log2(descale), min_scale_exp))
+    blocks.div_(torch.exp2(scale_exp))
+
+    magnitude = blocks.abs()
+    values = torch.zeros_like(blocks, dtype=torch.uint8)
+    for bound in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        values.add_(magnitude > bound)
+    sign_bit = ((2 - torch.sign(blocks)) // 2).to(torch.uint8)
+    values.add_(sign_bit << 3)
+    packed = values[:, 0::2] + (values[:, 1::2] << 4)
+
+    packed = packed.view(n, k // 2).contiguous()
+    mxfp4_scale = (scale_exp + 127).to(torch.uint8)
+    mxfp4_scale = mxfp4_scale.view(n, k // mxfp4_block_size).contiguous()
+    return packed, mxfp4_scale
+
+
+class DeepseekV4FusedSharedRoutedExperts(RoutedExperts):
+    def __init__(self, *args, **kwargs):
+        self._pending_shared_expert_weights: dict[
+            tuple[int, str], dict[str, torch.Tensor]
+        ] = {}
+        self._loaded_shared_expert_shards: set[str] = set()
+        super().__init__(*args, **kwargs)
+        if not isinstance(self.quant_method, Mxfp4MoEMethod):
+            raise ValueError(
+                "DeepSeek V4 shared-expert fusion requires MXFP4 routed experts."
+            )
+        if self.expert_map_manager.num_fused_shared_experts != 1:
+            raise ValueError(
+                "DeepSeek V4 shared-expert fusion requires one appended expert."
+            )
+
+    def _load_fused_shared_expert(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+    ) -> bool | None:
+        if expert_id != self.global_num_experts:
+            return None
+
+        if param is self.w13_weight or param is self.w2_weight:
+            tensor_kind = "weight"
+        elif param is self.w13_weight_scale or param is self.w2_weight_scale:
+            tensor_kind = "scale"
+        else:
+            raise ValueError(
+                "Unexpected parameter for the fused DeepSeek V4 shared expert."
+            )
+
+        key = (expert_id, shard_id)
+        pair = self._pending_shared_expert_weights.setdefault(key, {})
+        if tensor_kind in pair:
+            raise ValueError(
+                f"Duplicate fused shared-expert {tensor_kind} for {shard_id}."
+            )
+        pair[tensor_kind] = loaded_weight
+        if pair.keys() != {"weight", "scale"}:
+            return True
+
+        packed_weight, packed_scale = _fp8_block_weight_to_mxfp4(
+            pair["weight"], pair["scale"], param.device
+        )
+        local_expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if local_expert_id == -1:
+            raise ValueError("The appended shared expert is not local to this rank.")
+
+        shard_dim = 1 if shard_id == "w2" else 0
+        weight_param = self.w2_weight if shard_id == "w2" else self.w13_weight
+        scale_param = (
+            self.w2_weight_scale if shard_id == "w2" else self.w13_weight_scale
+        )
+        for target, converted in (
+            (weight_param, packed_weight),
+            (scale_param, packed_scale),
+        ):
+            self._load_model_weight_or_group_weight_scale(
+                shard_dim=shard_dim,
+                expert_data=target.data[local_expert_id],
+                shard_id=shard_id,
+                loaded_weight=converted,
+                tp_rank=self.moe_config.tp_rank,
+            )
+
+        del self._pending_shared_expert_weights[key]
+        self._loaded_shared_expert_shards.add(shard_id)
+        return True
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        shard_id: str,
+        expert_id: int,
+        return_success: bool = False,
+    ) -> bool | None:
+        loaded = self._load_fused_shared_expert(
+            param, loaded_weight, shard_id, expert_id
+        )
+        if loaded is not None:
+            return loaded if return_success else None
+        return super().weight_loader(
+            param,
+            loaded_weight,
+            weight_name,
+            shard_id,
+            expert_id,
+            return_success,
+        )
+
+    def validate_fused_shared_expert_weights(self) -> None:
+        pending = {
+            shard_id: sorted({"weight", "scale"} - pair.keys())
+            for (_, shard_id), pair in self._pending_shared_expert_weights.items()
+        }
+        missing_shards = {"w1", "w2", "w3"} - self._loaded_shared_expert_shards
+        if pending or missing_shards:
+            raise ValueError(
+                "Incomplete fused DeepSeek V4 shared-expert checkpoint weights: "
+                f"pending={pending}, missing_shards={sorted(missing_shards)}."
+            )
 
 
 class DeepseekV4MLP(nn.Module):
@@ -115,6 +356,7 @@ class DeepseekV4MoE(nn.Module):
         self,
         vllm_config: VllmConfig,
         prefix: str = "",
+        fuse_shared_expert: bool = False,
     ):
         super().__init__()
 
@@ -164,7 +406,7 @@ class DeepseekV4MoE(nn.Module):
                 requires_grad=False,
             )
 
-        if config.n_shared_experts is None:
+        if config.n_shared_experts is None or fuse_shared_expert:
             self.shared_experts = None
         else:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
@@ -202,6 +444,10 @@ class DeepseekV4MoE(nn.Module):
             hash_indices_table=self.gate.tid2eid,
             swiglu_limit=self.swiglu_limit,
             router_logits_dtype=torch.float32,
+            n_shared_experts=(config.n_shared_experts if fuse_shared_expert else None),
+            routed_experts_cls=(
+                DeepseekV4FusedSharedRoutedExperts if fuse_shared_expert else None
+            ),
         )
 
     def forward(
@@ -236,6 +482,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         prefix,
         topk_indices_buffer: torch.Tensor | None = None,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
+        fuse_shared_expert: bool = False,
     ):
         super().__init__()
 
@@ -253,7 +500,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             topk_indices_buffer=topk_indices_buffer,
             aux_stream_list=aux_stream_list,
         )
-        self.ffn = DeepseekV4MoE(vllm_config, prefix=f"{prefix}.ffn")
+        self.ffn = DeepseekV4MoE(
+            vllm_config,
+            prefix=f"{prefix}.ffn",
+            fuse_shared_expert=fuse_shared_expert,
+        )
 
         self.attn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
         self.ffn_norm = RMSNorm(self.hidden_size, self.rms_norm_eps)
@@ -453,6 +704,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        self.fuse_shared_expert = _should_fuse_shared_expert(vllm_config)
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4Attention.attn_gemm_parallel_execute
@@ -491,6 +743,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 prefix=prefix,
                 topk_indices_buffer=self.topk_indices_buffer,
                 aux_stream_list=aux_stream_list,
+                fuse_shared_expert=self.fuse_shared_expert,
             ),
             prefix=f"{prefix}.layers",
         )
@@ -740,17 +993,23 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     loaded_params.add(name)
                     continue
 
+        if self.fuse_shared_expert:
+            for module in self.modules():
+                if isinstance(module, DeepseekV4FusedSharedRoutedExperts):
+                    module.validate_fused_shared_expert_weights()
+
         return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        num_experts = self.config.n_routed_experts + int(self.fuse_shared_expert)
         return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.n_routed_experts,
+            num_experts=num_experts,
         )
 
 
@@ -852,6 +1111,15 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.model.fuse_shared_expert:
+            shared_expert_id = self.config.n_routed_experts
+            weights = (
+                (
+                    _remap_shared_expert_to_routed(name, shared_expert_id),
+                    weight,
+                )
+                for name, weight in weights
+            )
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
         loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
         return loaded_params
