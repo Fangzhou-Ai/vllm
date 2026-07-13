@@ -75,22 +75,21 @@ def determine_expert_counts(
     num_redundant_experts: int,
     n_shared_experts: int | None,
     is_act_and_mul: bool,
+    enable_shared_expert_fusion: bool | None = None,
 ) -> tuple[int, int, int]:
     global_num_experts = num_experts + num_redundant_experts
     logical_num_experts = num_experts
-    # Shared-expert fusion: append the shared expert(s) as routed-expert slots
-    # so they run in the same grouped GEMM. Gated by
-    # VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: either the native aiter fused-MoE
-    # path (env + master switch, via is_fusion_moe_shared_experts_enabled) or the
-    # backend-neutral router-append path (env alone, independent of the master
-    # switch; e.g. the MM3 triton/flydsl mxfp8 MoE). Gated activations only.
-    fuse_shared_enabled = (
-        rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
-        or envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-    ) and is_act_and_mul
-
+    if enable_shared_expert_fusion is None:
+        enable_shared_expert_fusion = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+            or envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
+        )
     num_fused_shared_experts = (
-        n_shared_experts if n_shared_experts is not None and fuse_shared_enabled else 0
+        n_shared_experts
+        if n_shared_experts is not None
+        and enable_shared_expert_fusion
+        and is_act_and_mul
+        else 0
     )
 
     return global_num_experts, logical_num_experts, num_fused_shared_experts
@@ -130,6 +129,7 @@ def FusedMoE(
     reduce_results: bool = True,
     ckpt_names: tuple[str, str, str] = ("gate_proj", "down_proj", "up_proj"),
     n_shared_experts: int | None = None,
+    enable_shared_expert_fusion: bool | None = None,
     router_logits_dtype: torch.dtype | None = None,
     gate: torch.nn.Module | None = None,
     shared_experts: torch.nn.Module | None = None,
@@ -192,6 +192,8 @@ def FusedMoE(
             up_proj) used for weight loading
         n_shared_experts: Number of shared experts to fuse into the routed
             grouped GEMM (ROCm; requires aiter FSE or the router-append path)
+        enable_shared_expert_fusion: Explicitly enable or disable shared-expert
+            fusion, or use the legacy global gate when unset
         router_logits_dtype: Data type for router logits buffers
         gate: Pre-configured gate module
         shared_experts: Pre-configured shared experts module
@@ -239,6 +241,7 @@ def FusedMoE(
             num_redundant_experts,
             n_shared_experts,
             is_act_and_mul,
+            enable_shared_expert_fusion,
         )
     )
 
