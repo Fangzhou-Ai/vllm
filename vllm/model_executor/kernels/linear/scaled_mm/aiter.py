@@ -3,6 +3,7 @@
 
 
 import torch
+from packaging.version import Version
 
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import (
@@ -26,6 +27,22 @@ from .ScaledMMLinearKernel import (
 )
 
 logger = init_logger(__name__)
+
+
+def _supports_block_fp8_bpreshuffle() -> bool:
+    if not current_platform.is_rocm() or torch.version.hip is None:
+        return False
+
+    from vllm.platforms.rocm import on_gfx950
+
+    if not on_gfx950() or Version(torch.version.hip) < Version("7.2"):
+        return False
+
+    try:
+        import aiter
+    except Exception:
+        return False
+    return hasattr(aiter, "gemm_a8w8_blockscale_bpreshuffle")
 
 
 class AiterInt8ScaledMMLinearKernel(CutlassInt8ScaledMMLinearKernel):
@@ -366,6 +383,8 @@ class AiterPerTokenFp8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
 
 
 class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
+    _BPRESHUFFLE_SHAPES = {(2048, 7168)}
+
     def __init__(self, config: FP8ScaledMMLinearLayerConfig):
         super().__init__(config)
         n, k = config.weight_shape
@@ -374,6 +393,24 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             not current_platform.is_fp8_fnuz()
             and rocm_aiter_ops.is_triton_gemm_w8a8_tuned(n, k)
         )
+        self.use_bpreshuffle = (
+            not self.use_triton
+            and (n, k) in self._BPRESHUFFLE_SHAPES
+            and self.weight_group_shape == GroupShape(128, 128)
+            and config.out_dtype is torch.bfloat16
+            and _supports_block_fp8_bpreshuffle()
+        )
+        if self.use_bpreshuffle:
+            self.quant_fp8.column_major_scales = True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if not self.use_bpreshuffle:
+            return
+
+        params = self._get_layer_params(layer)
+        shuffled_weight = rocm_aiter_ops.shuffle_weight(params.weight, layout=(16, 16))
+        replace_parameter(layer, params.WEIGHT, shuffled_weight.data)
 
     @classmethod
     def is_supported(cls, compute_capability=None):
@@ -421,7 +458,9 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 Bs = Bs.to(torch.float32)
 
         out_dtype = self.config.out_dtype
-        if self.use_triton:
+        if self.use_bpreshuffle:
+            gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle
+        elif self.use_triton:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.triton_gemm_a8w8_blockscale
         else:
             gemm_a8w8_blockscale_op = rocm_aiter_ops.gemm_a8w8_blockscale

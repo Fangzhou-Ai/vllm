@@ -65,12 +65,13 @@ def test_per_token_quant_dynamic_schema():
     )
 
 
-def test_group_fp8_quant_schema():
-    """Dynamic per-token-group quant."""
-    x = _x()
+@pytest.mark.parametrize("transpose_scale", [False, True])
+def test_group_fp8_quant_schema(transpose_scale):
+    """Dynamic per-token-group quant supports both scale layouts."""
+    x = _x(M=4, N=256)
     opcheck(
         torch.ops.vllm.rocm_aiter_group_fp8_quant,
-        (x, 128),
+        (x, 128, transpose_scale),
     )
 
 
