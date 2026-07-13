@@ -5759,6 +5759,7 @@ class GPUModelRunner(
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
         profile_seq_lens: int | None = None,
+        cudagraph_warmup_mode: CUDAGraphMode | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5786,6 +5787,8 @@ class GPUModelRunner(
             profile_seq_lens: If provided, use this value for seq_lens instead
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
+            cudagraph_warmup_mode: Target graph mode for an uncaptured warmup.
+                None for other dummy runs.
         """
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
@@ -6060,6 +6063,7 @@ class GPUModelRunner(
                     batch_descriptor=batch_desc,
                     ubatch_slices=ubatch_slices_padded,
                     slot_mapping=slot_mappings,
+                    cudagraph_warmup_mode=cudagraph_warmup_mode,
                 ),
             ):
                 outputs = self.model(
@@ -6792,6 +6796,7 @@ class GPUModelRunner(
                 remove_lora=False,
                 num_active_loras=desc.num_active_loras,
                 profile_seq_lens=profile_seq_lens,
+                cudagraph_warmup_mode=cudagraph_runtime_mode,
             )
         self._dummy_run(
             desc.num_tokens,

@@ -513,6 +513,11 @@ class ModelCudaGraphManager(CudaGraphManager):
                     slot_mapping=slot_mappings,
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
+                    cudagraph_warmup_mode=(
+                        desc.cg_mode
+                        if warmup and cg_mode == CUDAGraphMode.NONE
+                        else None
+                    ),
                 ):
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside

@@ -775,7 +775,7 @@ class DeepseekV4Indexer(nn.Module):
         hidden_states: torch.Tensor,
         qr: torch.Tensor,
         compressed_kv_score: torch.Tensor,
-        indexer_weights: torch.Tensor,
+        indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
         rotary_emb: nn.Module,
     ) -> torch.Tensor:
@@ -785,11 +785,14 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
+            weights = indexer_weights
+            if weights is None:
+                weights, _ = self.weights_proj(hidden_states)
             return fused_indexer_q_rope_quant(
                 positions,
                 q,
                 rotary_emb.cos_sin_cache,
-                indexer_weights,
+                weights,
                 self.softmax_scale,
                 self.n_head**-0.5,
                 use_fp4=self.use_fp4_kv,
