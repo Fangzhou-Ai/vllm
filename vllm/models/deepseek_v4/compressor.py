@@ -81,6 +81,9 @@ class CompressorMetadata:
     block_size: int
 
     token_to_req_indices: torch.Tensor | None = None  # [num_tokens]
+    seq_lens: torch.Tensor | None = None
+    compression_plan: torch.Tensor | None = None
+    tail_only: bool = False
 
 
 class CompressorMetadataBuilder(AttentionMetadataBuilder):
@@ -97,6 +100,25 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
             dtype=torch.int32,
             device=self.device,
         )
+        self._rocm_compress_ratio: int | None = None
+        self._rocm_compression_plan_buffer: torch.Tensor | None = None
+        self._rocm_tail_only = False
+        if current_platform.is_rocm():
+            from .amd.compressor import (
+                infer_compress_ratio,
+                use_tail_only_state_writes,
+            )
+
+            self._rocm_compress_ratio = infer_compress_ratio(
+                self.block_size, mla_spec.sliding_window
+            )
+            self._rocm_compression_plan_buffer = torch.full(
+                (self.vllm_config.scheduler_config.max_num_batched_tokens, 4),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._rocm_tail_only = use_tail_only_state_writes(self.vllm_config)
 
     def build(
         self,
@@ -107,11 +129,24 @@ class CompressorMetadataBuilder(AttentionMetadataBuilder):
         token_to_req_indices = common_attn_metadata.token_to_req_indices(
             self.token_to_req_indices
         )
+        compression_plan = None
+        if self._rocm_compress_ratio is not None:
+            from .amd.compressor import build_compression_plan
+
+            assert self._rocm_compression_plan_buffer is not None
+            compression_plan = build_compression_plan(
+                self._rocm_compression_plan_buffer,
+                common_attn_metadata,
+                self._rocm_compress_ratio,
+            )
         return CompressorMetadata(
             block_table=common_attn_metadata.block_table_tensor.clamp_(min=0),
             slot_mapping=common_attn_metadata.slot_mapping,
             block_size=self.block_size,
             token_to_req_indices=token_to_req_indices,
+            seq_lens=common_attn_metadata.seq_lens,
+            compression_plan=compression_plan,
+            tail_only=self._rocm_tail_only,
         )
 
 
@@ -300,6 +335,21 @@ class DeepseekCompressor(nn.Module):
         state_cache = self.state_cache.kv_cache
         # kv_state stored in first half, score_state stored in second half
         state_width = state_cache.shape[-1] // 2
+
+        if current_platform.is_rocm():
+            from .amd.compressor import rocm_compressor_forward
+
+            rocm_compressor_forward(
+                self,
+                kv,
+                score,
+                positions,
+                rotary_emb,
+                state_metadata,
+                attn_metadata,
+            )
+            return
+
         pdl_kwargs = (
             {}
             if current_platform.is_rocm() or current_platform.is_xpu()
@@ -347,7 +397,7 @@ class DeepseekCompressor(nn.Module):
             else None
         )
 
-        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
+        # cutedsl (head=512) accepts the full-cache flags; triton (indexer/XPU)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
         if current_platform.is_cuda() and self.head_dim == 512:
@@ -365,7 +415,7 @@ class DeepseekCompressor(nn.Module):
                 fp8_scale=fp8_scale,
             )
         else:
-            # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
+            # Indexer path (head_dim == 128) or non-CUDA GPUs such as XPU.
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
             extra_kwargs = {}
 

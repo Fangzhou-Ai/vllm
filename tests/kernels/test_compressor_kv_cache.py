@@ -12,11 +12,20 @@ These tests cover:
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.models.deepseek_v4.amd.compressor import (
+    build_compression_plan,
+    compress_current_and_paged_state,
+    compression_plan_capacity,
+    make_compression_plan_template,
+    save_compressor_states,
+    use_tail_only_state_writes,
+)
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
     quantize_and_insert_k_cache,
@@ -27,6 +36,40 @@ from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
 )
 
 from .test_fused_indexer_q_rope_quant import quantize_to_mxfp4
+
+
+def test_rocm_compressor_plan_template_is_compact():
+    query_start_loc = torch.tensor([0, 1, 6, 6, 140], dtype=torch.int32)
+
+    c4_plan = make_compression_plan_template(query_start_loc, 4)
+    c128_plan = make_compression_plan_template(query_start_loc, 128)
+
+    assert c4_plan.shape == (37, 4)
+    assert c128_plan.tolist() == [
+        [0, 1, 0, 0],
+        [1, 6, 1, 0],
+        [6, 140, 3, 0],
+        [6, 140, 3, 1],
+    ]
+    assert compression_plan_capacity(140, 4, 4) == 39
+    assert c4_plan.shape[0] <= compression_plan_capacity(140, 4, 4)
+
+
+@pytest.mark.parametrize(
+    ("prefix_caching", "has_connector", "expected"),
+    [(False, False, True), (True, False, False), (False, True, False)],
+)
+def test_rocm_tail_state_writes_are_safe_only_without_cache_reuse(
+    prefix_caching: bool, has_connector: bool, expected: bool
+):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(enable_prefix_caching=prefix_caching),
+        kv_transfer_config=(
+            SimpleNamespace(is_kv_transfer_instance=True) if has_connector else None
+        ),
+    )
+
+    assert use_tail_only_state_writes(config) is expected
 
 
 def _ue8m0_reference(x: torch.Tensor, block_size: int, fp8_max: float):
@@ -536,6 +579,243 @@ def _reference_kv_compress_norm_rope(
         ]
         quants, scales = zip(*pairs)
         return torch.stack(quants), torch.cat(scales)
+
+
+def test_rocm_compressor_plan_resolves_aligned_boundaries():
+    device = "cuda"
+    positions = torch.tensor(
+        [5, 6, 7, 8, 9, 12, 13, 14, 15, 16],
+        dtype=torch.int64,
+        device=device,
+    )
+    slot_mapping = torch.arange(10, dtype=torch.int64, device=device)
+    metadata = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 5, 10], dtype=torch.int32),
+        positions=positions,
+        slot_mapping=slot_mapping,
+        num_actual_tokens=10,
+        num_reqs=2,
+    )
+    plan_buffer = torch.empty((10, 4), dtype=torch.int32, device=device)
+
+    plan = build_compression_plan(plan_buffer, metadata, compress_ratio=4).cpu()
+
+    assert plan.shape == (4, 4)
+    assert plan[0].tolist() == [2, 0, 7, 5]
+    assert plan[2].tolist() == [8, 1, 15, 4]
+    assert plan[[1, 3], 2].tolist() == [-1, -1]
+
+
+def test_rocm_compressor_plan_reuse_clears_descriptor_stable_tail():
+    device = "cuda"
+    plan_buffer = torch.full((8, 4), 99, dtype=torch.int32, device=device)
+    slot_mapping = torch.arange(8, dtype=torch.int64, device=device)
+    first_metadata = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 1, 8], dtype=torch.int32),
+        positions=torch.tensor(
+            [3, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int64, device=device
+        ),
+        slot_mapping=slot_mapping,
+        num_actual_tokens=8,
+        num_reqs=2,
+    )
+    second_metadata = SimpleNamespace(
+        query_start_loc_cpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+        positions=torch.arange(8, dtype=torch.int64, device=device),
+        slot_mapping=slot_mapping,
+        num_actual_tokens=8,
+        num_reqs=2,
+    )
+
+    first_plan = build_compression_plan(plan_buffer, first_metadata, 4)
+    first_shape = first_plan.shape
+    assert first_plan[2, 2].item() >= 0
+
+    second_plan = build_compression_plan(plan_buffer, second_metadata, 4)
+
+    assert second_plan.shape == first_shape == (4, 4)
+    assert second_plan[:, 2].tolist() == [3, 7, -1, -1]
+
+
+def test_rocm_compressor_mixes_paged_prefix_and_current_chunk():
+    device = "cuda"
+    torch.manual_seed(31)
+    head_dim = 128
+    rope_dim = 64
+    ratio = 4
+    state_block_size = 4
+    state_width = 2 * head_dim
+    num_query_tokens = 8
+
+    kv = torch.randn(num_query_tokens, state_width, dtype=torch.float32, device=device)
+    score = torch.randn_like(kv)
+    ape = torch.randn(ratio, state_width, dtype=torch.float32, device=device)
+    state_cache = torch.randn(
+        4,
+        state_block_size,
+        2 * state_width,
+        dtype=torch.float32,
+        device=device,
+    )
+    block_table = torch.arange(4, dtype=torch.int32, device=device).unsqueeze(0)
+    plan = torch.tensor(
+        [
+            [0, 0, 7, 7],
+            [2, 0, 7, 5],
+            [6, 0, 11, 1],
+            [7, 0, 15, 0],
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    rms_weight = torch.randn(head_dim, dtype=torch.bfloat16, device=device)
+    cos_sin_cache = torch.randn(16, rope_dim, dtype=torch.float32, device=device)
+
+    kv_block_size = 16
+    token_stride = head_dim
+    scale_dim = 4
+    kv_cache = torch.zeros(
+        1,
+        kv_block_size,
+        token_stride + scale_dim,
+        dtype=torch.uint8,
+        device=device,
+    )
+    kv_slot_mapping = torch.full(
+        (num_query_tokens,), -1, dtype=torch.int64, device=device
+    )
+    kv_slot_mapping[0] = 0
+    kv_slot_mapping[2] = 1
+    kv_slot_mapping[6] = 2
+    kv_slot_mapping[7] = 3
+
+    compress_current_and_paged_state(
+        state_cache=state_cache,
+        kv=kv,
+        score=score,
+        ape=ape,
+        plan=plan,
+        block_table=block_table,
+        block_size=state_block_size,
+        state_width=state_width,
+        cos_sin_cache=cos_sin_cache,
+        kv_cache=kv_cache,
+        kv_slot_mapping=kv_slot_mapping,
+        rms_norm_weight=rms_weight,
+        rms_norm_eps=1e-6,
+        head_dim=head_dim,
+        rope_head_dim=rope_dim,
+        compress_ratio=ratio,
+        overlap=True,
+        use_fp4_cache=False,
+        quant_block=head_dim,
+        token_stride=token_stride,
+        scale_dim=scale_dim,
+    )
+
+    expected_values = []
+    expected_scales = []
+    for token_idx, position, window_len in [
+        (0, 7, 7),
+        (2, 7, 5),
+        (6, 11, 1),
+        (7, 15, 0),
+    ]:
+        kv_rows = []
+        score_rows = []
+        for source_idx in range(2 * ratio):
+            source_position = position - 2 * ratio + 1 + source_idx
+            offset = head_dim if source_idx >= ratio else 0
+            dims = slice(offset, offset + head_dim)
+            if source_idx < window_len:
+                page = block_table[0, source_position // state_block_size]
+                row = state_cache[page, source_position % state_block_size]
+                kv_rows.append(row[dims])
+                score_rows.append(
+                    row[state_width + offset : state_width + offset + head_dim]
+                )
+            else:
+                input_row = token_idx - (2 * ratio - 1 - source_idx)
+                kv_rows.append(kv[input_row, dims])
+                score_rows.append(
+                    score[input_row, dims] + ape[source_position % ratio, dims]
+                )
+        kv_stack = torch.stack(kv_rows)
+        weights = torch.softmax(torch.stack(score_rows), dim=0)
+        compressed = (kv_stack * weights).sum(dim=0)
+        normed = compressed * torch.rsqrt(compressed.square().mean() + 1e-6)
+        normed *= rms_weight.float()
+        cos, sin = cos_sin_cache[position // ratio * ratio].chunk(2)
+        rope = normed[-rope_dim:]
+        rotated = torch.stack(
+            [
+                rope[0::2] * cos - rope[1::2] * sin,
+                rope[1::2] * cos + rope[0::2] * sin,
+            ],
+            dim=-1,
+        ).flatten()
+        result = torch.cat((normed[:-rope_dim], rotated)).to(torch.bfloat16)
+        quant, scales = _ue8m0_reference(result.float(), head_dim, 448.0)
+        expected_values.append(quant.view(torch.uint8))
+        expected_scales.append(scales)
+
+    flat_cache = kv_cache.view(-1)
+    values = []
+    scales = []
+    for slot in range(4):
+        values.append(flat_cache[slot * token_stride : (slot + 1) * token_stride])
+        scale_start = kv_block_size * token_stride + slot * scale_dim
+        scales.append(
+            flat_cache[scale_start : scale_start + scale_dim].view(torch.float32)
+        )
+    assert torch.equal(torch.stack(values), torch.stack(expected_values))
+    assert torch.equal(torch.cat(scales), torch.cat(expected_scales))
+
+
+def test_rocm_compressor_tail_write_preserves_only_future_state():
+    device = "cuda"
+    head_size = 8
+    positions = torch.tensor(
+        [*range(10), *range(20, 25)], dtype=torch.int64, device=device
+    )
+    num_tokens = positions.shape[0]
+    kv = torch.arange(num_tokens * head_size, dtype=torch.float32, device=device).view(
+        num_tokens, head_size
+    )
+    score = -kv
+    ape = torch.arange(4 * head_size, dtype=torch.float32, device=device).view(
+        4, head_size
+    )
+    state_cache = torch.full(
+        (4, 4, 2 * head_size), -999.0, dtype=torch.float32, device=device
+    )
+    slot_mapping = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    token_to_req = torch.tensor([0] * 10 + [1] * 5, dtype=torch.int32, device=device)
+
+    save_compressor_states(
+        kv=kv,
+        score=score,
+        ape=ape,
+        positions=positions,
+        seq_lens=torch.tensor([10, 25], dtype=torch.int32, device=device),
+        token_to_req_indices=token_to_req,
+        state_cache=state_cache,
+        slot_mapping=slot_mapping,
+        block_size=4,
+        state_width=head_size,
+        compress_ratio=4,
+        overlap=True,
+        tail_only=True,
+    )
+
+    state_rows = state_cache.view(-1, 2 * head_size)
+    assert torch.all(state_rows[:2] == -999.0)
+    assert torch.equal(state_rows[2:num_tokens, :head_size], kv[2:])
+    assert torch.equal(
+        state_rows[2:num_tokens, head_size:],
+        score[2:] + ape[positions[2:] % 4],
+    )
+    assert torch.all(state_rows[num_tokens:] == -999.0)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 7, 32])
