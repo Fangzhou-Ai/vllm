@@ -10,6 +10,7 @@ from vllm.model_executor.kernels.linear import (
     _POSSIBLE_FP8_KERNELS,
     _POSSIBLE_INT8_KERNELS,
     _POSSIBLE_NVFP4_KERNELS,
+    AiterFp8BlockScaledMMKernel,
 )
 from vllm.model_executor.kernels.linear.nvfp4.base import (
     NvFp4LinearKernel,
@@ -18,6 +19,9 @@ from vllm.model_executor.kernels.linear.nvfp4.base import (
 from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
     FlashInferCutlassNvFp4LinearKernel,
     FlashInferTrtllmNvFp4LinearKernel,
+)
+from vllm.model_executor.kernels.linear.scaled_mm.BlockScaledMMLinearKernel import (
+    Fp8BlockScaledMMLinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm.cutlass import (
     CutlassFP8ScaledMMLinearKernel,
@@ -36,6 +40,8 @@ from vllm.model_executor.layers.fusion.quant_activation import (
     expose_input_quant_key,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+    kFp8Static128BlockSym,
     kFp8StaticTensorSym,
     kNvfp4Dynamic,
 )
@@ -43,6 +49,7 @@ from vllm.platforms import current_platform
 
 # The only backends that consume a pre-quantized activation.
 SUPPORTING = {
+    AiterFp8BlockScaledMMKernel,
     CutlassFP8ScaledMMLinearKernel,
     FlashInferFP8ScaledMMLinearKernel,
     FlashInferCutlassNvFp4LinearKernel,
@@ -73,6 +80,16 @@ def _probe(cls: type):
         obj.config = Int8ScaledMMLinearLayerConfig(
             is_static_input_scheme=True, is_channelwise=False, input_symmetric=True
         )
+    elif issubclass(cls, Fp8BlockScaledMMLinearKernel):
+        obj.config = FP8ScaledMMLinearLayerConfig(
+            weight_quant_key=kFp8Static128BlockSym,
+            activation_quant_key=kFp8Dynamic128Sym,
+            weight_shape=(128, 128),
+            input_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
+        )
+        obj.use_bpreshuffle = False
+        obj.use_triton = False
     else:
         obj.config = FP8ScaledMMLinearLayerConfig(
             weight_quant_key=kFp8StaticTensorSym,
@@ -113,6 +130,117 @@ def test_bridge_marks_supporting_and_skips_others():
     layer = torch.nn.Module()
     expose_input_quant_key(layer, unsupported)
     assert not hasattr(layer, "input_quant_key")
+
+
+def test_aiter_block_kernel_rejects_external_bpreshuffle_scales():
+    kernel = _probe(AiterFp8BlockScaledMMKernel)
+    assert kernel.input_quant_key() == kFp8Dynamic128Sym
+
+    kernel.use_bpreshuffle = True
+    assert kernel.input_quant_key() is None
+    assert kernel.input_quantizer_id() is None
+
+
+@pytest.mark.parametrize("use_triton", [False, True])
+def test_aiter_block_kernel_exposes_its_input_quantizer(use_triton):
+    calls = []
+
+    def quant_fp8(x, scale, scale_ub, *, use_triton):
+        calls.append(use_triton)
+        data = torch.empty_like(x, dtype=current_platform.fp8_dtype())
+        scales = torch.empty(
+            (x.shape[0], x.shape[1] // 128),
+            dtype=torch.float32,
+            device=x.device,
+        )
+        return data, scales
+
+    kernel = _probe(AiterFp8BlockScaledMMKernel)
+    kernel.use_triton = use_triton
+    kernel.quant_fp8 = quant_fp8
+    layer = torch.nn.Module()
+    expose_input_quant_key(layer, kernel)
+
+    x = torch.empty(2, 256, dtype=torch.bfloat16)
+    qa = layer.quantize_input(x)
+
+    assert layer.input_quantizer_id == kernel.input_quantizer_id()
+    assert calls == [use_triton]
+    assert qa.data.shape == x.shape
+    assert qa.scale.shape == (2, 2)
+    assert qa.orig_dtype == x.dtype
+    assert qa.orig_shape == x.shape
+    assert qa.quant_key == kFp8Dynamic128Sym
+
+
+def test_aiter_block_quantizer_identity_distinguishes_backends():
+    aiter_kernel = _probe(AiterFp8BlockScaledMMKernel)
+    triton_kernel = _probe(AiterFp8BlockScaledMMKernel)
+    triton_kernel.use_triton = True
+
+    assert aiter_kernel.input_quantizer_id() != triton_kernel.input_quantizer_id()
+
+
+@pytest.mark.parametrize(
+    ("data_dtype", "scale_dtype", "scale_shape"),
+    [
+        (torch.bfloat16, torch.float32, (2, 2)),
+        (None, torch.bfloat16, (2, 2)),
+        (None, torch.float32, (2, 1)),
+    ],
+)
+def test_aiter_block_kernel_validates_external_fp8_tensors(
+    data_dtype, scale_dtype, scale_shape
+):
+    kernel = _probe(AiterFp8BlockScaledMMKernel)
+    fp8_dtype = current_platform.fp8_dtype()
+    qa = QuantizedActivation(
+        data=torch.empty(2, 256, dtype=data_dtype or fp8_dtype),
+        scale=torch.empty(scale_shape, dtype=scale_dtype),
+        orig_dtype=torch.bfloat16,
+        orig_shape=torch.Size([2, 256]),
+        quant_key=kFp8Dynamic128Sym,
+    )
+    layer = torch.nn.Module()
+    layer.weight = torch.empty(128, 256, dtype=fp8_dtype)
+    layer.weight_scale_inv = torch.empty(1, 2, dtype=torch.float32)
+    layer.weight_scale = None
+    layer.input_scale = None
+    layer.input_scale_ub = None
+
+    with pytest.raises(AssertionError):
+        kernel.apply_weights(layer, qa)
+
+
+@pytest.mark.parametrize("invalid_field", ["data_layout", "scale_layout", "dtype"])
+def test_aiter_block_kernel_validates_external_fp8_metadata(invalid_field):
+    fp8_dtype = current_platform.fp8_dtype()
+    data = torch.empty(2, 256, dtype=fp8_dtype)
+    scale = torch.empty(2, 2, dtype=torch.float32)
+    orig_dtype = torch.bfloat16
+    if invalid_field == "data_layout":
+        data = torch.empty(2, 512, dtype=fp8_dtype)[:, ::2]
+    elif invalid_field == "scale_layout":
+        scale = torch.empty(2, 4, dtype=torch.float32)[:, ::2]
+    else:
+        orig_dtype = torch.float32
+
+    qa = QuantizedActivation(
+        data=data,
+        scale=scale,
+        orig_dtype=orig_dtype,
+        orig_shape=torch.Size([2, 256]),
+        quant_key=kFp8Dynamic128Sym,
+    )
+    layer = torch.nn.Module()
+    layer.weight = torch.empty(128, 256, dtype=fp8_dtype)
+    layer.weight_scale_inv = torch.empty(1, 2, dtype=torch.float32)
+    layer.weight_scale = None
+    layer.input_scale = None
+    layer.input_scale_ub = None
+
+    with pytest.raises(AssertionError):
+        _probe(AiterFp8BlockScaledMMKernel).apply_weights(layer, qa)
 
 
 def test_as_quantized_activation_validates_key():

@@ -36,12 +36,17 @@ class QuantizedActivation:
 
 
 def expose_input_quant_key(layer: torch.nn.Module, kernel) -> None:
-    """Advertise the kernel's pre-quantized input key on the layer, if any.
+    """Advertise the kernel's external-input contract on the layer, if any.
 
     This is the bridge from a kernel's input_quant_key() to the
     layer.input_quant_key attribute that fusion call sites read. The attribute
     is left unset when the kernel quantizes its own input, so non-supporting
     backends never receive a QuantizedActivation.
+
+    Kernels that can also produce their external input may provide an opaque
+    input_quantizer_id() and a quantize_input() method. These are exposed
+    together so fusion call sites can require identical producer semantics
+    without duplicating backend-selection policy.
 
     TODO(mgoin): Producers also need the consumer's quantization scales (e.g.
     static input scale, global scale). Expose those here as well so producers
@@ -50,6 +55,14 @@ def expose_input_quant_key(layer: torch.nn.Module, kernel) -> None:
     key = kernel.input_quant_key()
     if key is not None:
         layer.input_quant_key = key
+
+        quantizer_id_fn = getattr(kernel, "input_quantizer_id", None)
+        quantize_input = getattr(kernel, "quantize_input", None)
+        if quantizer_id_fn is not None and quantize_input is not None:
+            quantizer_id = quantizer_id_fn()
+            if quantizer_id is not None:
+                layer.input_quantizer_id = quantizer_id
+                layer.quantize_input = quantize_input
 
 
 def as_quantized_activation(

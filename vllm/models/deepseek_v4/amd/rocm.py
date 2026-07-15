@@ -10,6 +10,10 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CUDAGraphMode
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    kFp8Dynamic128Sym,
+)
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
 from vllm.models.deepseek_v4.common.ops import (
     dequantize_and_gather_k_cache,
@@ -36,6 +40,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_sparse_attn_prefill,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
+
 
 def _build_indptr_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     lengths = lengths.to(dtype=torch.int32).contiguous()
@@ -447,6 +452,29 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     backend_cls = DeepseekV4ROCMAiterMLASparseBackend
 
+    def _prepare_qr_for_wq_b(
+        self, qr: torch.Tensor
+    ) -> torch.Tensor | QuantizedActivation:
+        indexer = self.indexer
+        main_quantizer_id = getattr(self.wq_b, "input_quantizer_id", None)
+        quantize_input = getattr(self.wq_b, "quantize_input", None)
+        if (
+            indexer is None
+            or getattr(self.wq_b, "input_quant_key", None) != kFp8Dynamic128Sym
+            or getattr(indexer.wq_b, "input_quant_key", None) != kFp8Dynamic128Sym
+            or main_quantizer_id is None
+            or main_quantizer_id != getattr(indexer.wq_b, "input_quantizer_id", None)
+            or not callable(quantize_input)
+            or qr.dtype != torch.bfloat16
+            or qr.dim() != 2
+            or qr.numel() == 0
+            or not qr.is_contiguous()
+            or qr.shape[-1] % 128 != 0
+        ):
+            return qr
+
+        return quantize_input(qr)
+
     def _use_aiter_tgemm(self, hidden_states: torch.Tensor) -> bool:
         forward_context = get_forward_context()
         return (
@@ -528,7 +556,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.kv_norm.weight.data,
             self.eps,
         )
-        q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+        qr_for_wq_b = self._prepare_qr_for_wq_b(qr) if self.indexer is not None else qr
+        q = self.wq_b(qr_for_wq_b).view(-1, self.n_local_heads, self.head_dim)
         q = self._fused_qnorm_rope_kv_insert(
             q,
             kv,
@@ -541,7 +570,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             assert indexer_kv_score is not None
             self.indexer(
                 hidden_states,
-                qr,
+                qr_for_wq_b,
                 indexer_kv_score,
                 None,
                 positions,

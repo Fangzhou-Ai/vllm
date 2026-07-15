@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from enum import Enum, auto
+
 import torch
 from packaging.version import Version
 
@@ -10,8 +12,10 @@ from vllm._aiter_ops import (
     rocm_aiter_ops,
 )
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     GroupShape,
+    QuantKey,
 )
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
@@ -27,6 +31,11 @@ from .ScaledMMLinearKernel import (
 )
 
 logger = init_logger(__name__)
+
+
+class _InputQuantizer(Enum):
+    AITER_ROW_MAJOR = auto()
+    TRITON_ROW_MAJOR = auto()
 
 
 def _supports_block_fp8_bpreshuffle() -> bool:
@@ -402,6 +411,36 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         )
         if self.use_bpreshuffle:
             self.quant_fp8.column_major_scales = True
+
+    def input_quant_key(self) -> QuantKey | None:
+        if self.use_bpreshuffle:
+            return None
+        return self.config.activation_quant_key
+
+    def input_quantizer_id(self) -> _InputQuantizer | None:
+        if self.input_quant_key() is None:
+            return None
+        if self.use_triton:
+            return _InputQuantizer.TRITON_ROW_MAJOR
+        return _InputQuantizer.AITER_ROW_MAJOR
+
+    def quantize_input(self, x: torch.Tensor) -> QuantizedActivation:
+        quant_key = self.input_quant_key()
+        assert quant_key is not None, "Kernel does not accept row-major input scales"
+        input_2d = x.view(-1, x.shape[-1])
+        data, scale = self.quant_fp8(
+            input_2d,
+            None,
+            None,
+            use_triton=self.use_triton,
+        )
+        return QuantizedActivation(
+            data=data,
+            scale=scale,
+            orig_dtype=x.dtype,
+            orig_shape=x.shape,
+            quant_key=quant_key,
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)

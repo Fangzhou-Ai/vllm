@@ -8,6 +8,10 @@ from typing import ClassVar
 import torch
 from typing_extensions import Self
 
+from vllm.model_executor.layers.fusion.quant_activation import (
+    QuantizedActivation,
+    as_quantized_activation,
+)
 from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_weight_block_strategy,
@@ -97,7 +101,7 @@ class Fp8BlockScaledMMLinearKernel(
     def apply_weights(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
+        x: torch.Tensor | QuantizedActivation,
         bias: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -112,14 +116,40 @@ class Fp8BlockScaledMMLinearKernel(
         input_scale = params.input_scale
         scale_up = params.input_scale_ub
 
-        # View input as 2D matrix for fp8 methods
-        input_2d = x.view(-1, x.shape[-1])
-        output_shape = [*x.shape[:-1], weight.shape[0]]
+        qa = as_quantized_activation(x, self.input_quant_key())
+        if qa is not None:
+            quant_key = self.config.activation_quant_key
+            assert qa.data.dtype == quant_key.dtype
+            assert qa.scale.dtype == quant_key.scale.dtype
+            assert qa.data.is_contiguous()
+            assert qa.scale.is_contiguous()
+            assert qa.orig_dtype == self.config.input_dtype
+            assert len(qa.orig_shape) >= 2
+            assert qa.data.numel() == qa.orig_shape.numel()
+            assert qa.data.shape[-1] == qa.orig_shape[-1]
+            input_2d = qa.data.view(-1, qa.data.shape[-1])
+            group_size = quant_key.scale.group_shape.col
+            assert group_size > 0
+            assert input_2d.shape[-1] % group_size == 0
+            expected_scale_shape = (
+                input_2d.shape[0],
+                input_2d.shape[1] // group_size,
+            )
+            assert qa.scale.shape == expected_scale_shape
+            input_scale = qa.scale
+            output_shape = [*qa.orig_shape[:-1], weight.shape[0]]
+        else:
+            assert isinstance(x, torch.Tensor)
+            input_2d = x.view(-1, x.shape[-1])
+            output_shape = [*x.shape[:-1], weight.shape[0]]
 
         if self.apply_input_quant:
-            q_input, input_scale = self.quant_fp8(
-                input_2d, input_scale, scale_up, use_triton=self.use_triton
-            )
+            if qa is None:
+                q_input, input_scale = self.quant_fp8(
+                    input_2d, input_scale, scale_up, use_triton=self.use_triton
+                )
+            else:
+                q_input = input_2d
         else:
             q_input = input_2d
             # Provide a concrete placeholder so apply_block_scaled_mm args are

@@ -41,6 +41,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.models.utils import extract_layer_index
@@ -149,6 +150,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
     def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Inverse-RoPE + wo_a + wo_b output projection (platform-specific)."""
         raise NotImplementedError
+
+    def _prepare_qr_for_wq_b(
+        self, qr: torch.Tensor
+    ) -> torch.Tensor | QuantizedActivation:
+        return qr
 
     def _uses_fp8_ds_mla_layout(self) -> bool:
         """Return whether this instance stores fp8 KV in fp8_ds_mla layout."""
@@ -451,12 +457,13 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         if self.indexer is not None:
             aux_streams = self.aux_stream_list
             indexer = self.indexer
+            qr_for_wq_b = self._prepare_qr_for_wq_b(qr)
             # Local ref so the closure keeps a non-None type for mypy.
             assert self.compressor is not None
             compressor = self.compressor
 
             def wq_b_kv_insert() -> torch.Tensor:
-                q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+                q = self.wq_b(qr_for_wq_b).view(-1, self.n_local_heads, self.head_dim)
                 q = self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
                 return q
 
@@ -469,7 +476,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                 [
                     lambda: indexer(
                         hidden_states,
-                        qr,
+                        qr_for_wq_b,
                         indexer_kv_score,
                         indexer_weights,
                         positions,
@@ -773,7 +780,7 @@ class DeepseekV4Indexer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        qr: torch.Tensor,
+        qr: torch.Tensor | QuantizedActivation,
         compressed_kv_score: torch.Tensor,
         indexer_weights: torch.Tensor | None,
         positions: torch.Tensor,
