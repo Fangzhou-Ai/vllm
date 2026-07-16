@@ -1518,6 +1518,7 @@ def _sparse_attn_decode_partial_kernel(
     IS_FNUZ_MAIN: tl.constexpr,
     IS_FNUZ_EXTRA: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    MAIN_BLOCK_K: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
     PARTITION_SEGMENTS: tl.constexpr,
@@ -1550,10 +1551,10 @@ def _sparse_attn_decode_partial_kernel(
     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
     acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
     acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
-    k_offsets = tl.arange(0, BLOCK_K)
+    main_k_offsets = tl.arange(0, MAIN_BLOCK_K)
 
-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+    main_zero_nope = tl.zeros((MAIN_BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+    main_zero_rope = tl.zeros((MAIN_BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
 
     main_start = tl.load(main_indptr_ptr + query_idx)
     main_end = tl.load(main_indptr_ptr + query_idx + 1)
@@ -1564,14 +1565,14 @@ def _sparse_attn_decode_partial_kernel(
 
     if PARTITION_SEGMENTS:
         # Give each workgroup one physical segment when that strictly lowers
-        # the longest per-workgroup BLOCK_K path.
+        # the longest per-workgroup tile path.
         extra_start = tl.load(extra_indptr_ptr + query_idx)
         extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
         extra_len = extra_end - extra_start
         extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
         extra_lo = split_id * extra_chunk
         extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
-        main_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
+        main_tiles = (main_len + MAIN_BLOCK_K - 1) // MAIN_BLOCK_K
         extra_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
         total_tiles = tl.maximum(main_tiles + extra_tiles, 1)
         main_splits = (NUM_SPLITS * main_tiles + total_tiles - 1) // total_tiles
@@ -1580,9 +1581,9 @@ def _sparse_attn_decode_partial_kernel(
 
         part_main_chunk = (main_len + main_splits - 1) // main_splits
         part_extra_chunk = (extra_len + extra_splits - 1) // extra_splits
-        old_iters = (main_chunk + BLOCK_K - 1) // BLOCK_K
+        old_iters = (main_chunk + MAIN_BLOCK_K - 1) // MAIN_BLOCK_K
         old_iters += (extra_chunk + BLOCK_K - 1) // BLOCK_K
-        part_main_iters = (part_main_chunk + BLOCK_K - 1) // BLOCK_K
+        part_main_iters = (part_main_chunk + MAIN_BLOCK_K - 1) // MAIN_BLOCK_K
         part_extra_iters = (part_extra_chunk + BLOCK_K - 1) // BLOCK_K
         use_partition = tl.maximum(part_main_iters, part_extra_iters) < old_iters
 
@@ -1610,8 +1611,8 @@ def _sparse_attn_decode_partial_kernel(
             extra_hi,
         )
 
-    for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
-        k_pos = k_start + k_offsets
+    for k_start in tl.range(main_lo, main_hi, MAIN_BLOCK_K, num_stages=NUM_STAGES):
+        k_pos = k_start + main_k_offsets
         in_range = k_pos < main_hi
         slot = tl.load(main_indices_ptr + main_start + k_pos, mask=in_range, other=-1)
         valid = in_range & (slot >= 0) & (slot < main_num_rows)
@@ -1639,8 +1640,8 @@ def _sparse_attn_decode_partial_kernel(
         )
         scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
         k_nope = x_fp8.to(tl.bfloat16) * scales.to(tl.bfloat16)
-        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
-        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
+        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, main_zero_nope)
+        k_nope = tl.where(k_nope == k_nope, k_nope, main_zero_nope)
 
         rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
         k_rope = tl.load(
@@ -1648,8 +1649,8 @@ def _sparse_attn_decode_partial_kernel(
             mask=valid[:, None],
             other=0.0,
         )
-        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
-        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+        k_rope = tl.where(valid[:, None], k_rope, main_zero_rope)
+        k_rope = tl.where(k_rope == k_rope, k_rope, main_zero_rope)
 
         scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
         scores *= scale
@@ -1668,6 +1669,10 @@ def _sparse_attn_decode_partial_kernel(
         l_i = l_new
 
     if HAS_EXTRA:
+        k_offsets = tl.arange(0, BLOCK_K)
+        zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+        zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+
         if not PARTITION_SEGMENTS:
             extra_start = tl.load(extra_indptr_ptr + query_idx)
             extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
@@ -2043,7 +2048,7 @@ def _decode_num_splits(
     mu = 0.04
     best_splits = 1
     best_cost = None
-    # Search up to 16 splits; beyond that the reduce/HBM overhead dominates.
+    # Search up to 16 splits. A measured C4A shape may be promoted below.
     for splits in range(1, 17):
         waves = (base * splits + cu - 1) // cu
         cost = waves * (1.0 / splits + mu)
@@ -2063,6 +2068,30 @@ def _decode_num_splits(
                 best_splits = splits
                 break
     return best_splits
+
+
+def _decode_num_splits_for_shape(
+    num_splits: int,
+    num_queries: int,
+    num_heads: int,
+    main_num_indices: int,
+    extra_num_indices: int,
+    has_extra: bool,
+    main_block_size: int,
+    extra_block_size: int,
+) -> int:
+    if (
+        num_splits == 16
+        and num_queries == 4
+        and num_heads == 16
+        and main_num_indices == num_queries * 128
+        and extra_num_indices == num_queries * 1024
+        and has_extra
+        and main_block_size == 64
+        and extra_block_size == 64
+    ):
+        return 32
+    return num_splits
 
 
 def _rocm_sparse_attn_decode_ragged_triton(
@@ -2194,6 +2223,16 @@ def _rocm_sparse_attn_decode_ragged_triton(
     num_splits = _decode_num_splits(
         num_queries, heads_blocks, avg_main_len, avg_extra_len, block_k
     )
+    num_splits = _decode_num_splits_for_shape(
+        num_splits,
+        num_queries,
+        num_heads,
+        main_indices.numel(),
+        extra_indices.numel(),
+        has_extra,
+        main_cache.shape[1],
+        extra_cache.shape[1],
+    )
 
     part_m = torch.empty(
         (num_queries, num_splits, num_heads), dtype=torch.float32, device=q.device
@@ -2242,6 +2281,7 @@ def _rocm_sparse_attn_decode_ragged_triton(
         IS_FNUZ_MAIN=is_fnuz,
         IS_FNUZ_EXTRA=False,
         BLOCK_H=block_h,
+        MAIN_BLOCK_K=16 if num_splits == 32 else block_k,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
         # C128A uses two-token compressed pages. Partition its split IDs only

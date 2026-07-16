@@ -444,8 +444,58 @@ def test_decode_num_splits_heuristic(monkeypatch) -> None:
     assert mod._decode_num_splits(2, 1, avg_main_len=0.0, avg_extra_len=0.0) >= 1
 
 
+@pytest.mark.parametrize(
+    (
+        "num_splits",
+        "num_queries",
+        "num_heads",
+        "main_num_indices",
+        "extra_num_indices",
+        "has_extra",
+        "main_block_size",
+        "extra_block_size",
+        "expected",
+    ),
+    [
+        (16, 4, 16, 4 * 128, 4 * 1024, True, 64, 64, 32),
+        (4, 4, 16, 4 * 128, 4 * 1024, True, 64, 64, 4),
+        (16, 4, 16, 4 * 128, 4 * 64, True, 64, 2, 16),
+        (4, 64, 16, 64 * 128, 64 * 1024, True, 64, 64, 4),
+        (16, 4, 16, 4 * 128 - 1, 4 * 1024, True, 64, 64, 16),
+        (16, 4, 16, 4 * 128, 4 * 1024, False, 64, 64, 16),
+        (16, 4, 16, 4 * 128, 4 * 1024, True, 32, 64, 16),
+    ],
+)
+def test_decode_num_splits_for_shape(
+    num_splits: int,
+    num_queries: int,
+    num_heads: int,
+    main_num_indices: int,
+    extra_num_indices: int,
+    has_extra: bool,
+    main_block_size: int,
+    extra_block_size: int,
+    expected: int,
+) -> None:
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    assert (
+        mod._decode_num_splits_for_shape(
+            num_splits,
+            num_queries,
+            num_heads,
+            main_num_indices,
+            extra_num_indices,
+            has_extra,
+            main_block_size,
+            extra_block_size,
+        )
+        == expected
+    )
+
+
 @requires_gfx950
-@pytest.mark.parametrize("num_splits", [1, 2, 3, 4, 8])
+@pytest.mark.parametrize("num_splits", [1, 2, 3, 4, 8, 32])
 @pytest.mark.parametrize("with_extra", [True, False])
 @pytest.mark.parametrize("with_sink", [True, False])
 @torch.inference_mode()
