@@ -169,6 +169,10 @@ def _ref_sparse_decode_ragged(
                 for slot in extra_rows[query_idx]
             )
 
+        if not row_kv:
+            out[query_idx].zero_()
+            continue
+
         kv = torch.stack(row_kv).to(q.device)
         for head_idx in range(q.shape[1]):
             scores = torch.mv(kv, q_f32[query_idx, head_idx]) * scale
@@ -290,19 +294,21 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
     device = torch.device("cuda")
     torch.manual_seed(1)
     block_size = 4
-    q = torch.randn(2, 3, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    num_heads = 16
+    q = torch.randn(3, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    q *= 0.125
     main_kv = torch.randn(6, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
     extra_kv = torch.randn(5, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
     main_cache = _pack_fp8_ds_mla_cache(main_kv, block_size)
     extra_cache = _pack_fp8_ds_mla_cache(extra_kv, block_size, is_extra=True)
     main_indices = torch.tensor([0, 2, 4, 1], dtype=torch.int32, device=device)
-    main_indptr = torch.tensor([0, 2, 4], dtype=torch.int32, device=device)
+    main_indptr = torch.tensor([0, 2, 4, 4], dtype=torch.int32, device=device)
     extra_indices = torch.tensor([1, 3, 0], dtype=torch.int32, device=device)
-    extra_indptr = torch.tensor([0, 1, 3], dtype=torch.int32, device=device)
-    attn_sink = torch.tensor([-0.1, 0.0, 0.1], dtype=torch.float32, device=device)
+    extra_indptr = torch.tensor([0, 1, 3, 3], dtype=torch.int32, device=device)
+    attn_sink = torch.linspace(-0.2, 0.2, num_heads, dtype=torch.float32, device=device)
     scale = HEAD_DIM**-0.5
 
-    actual = _rocm_sparse_attn_decode_ragged_triton(
+    allocated = _rocm_sparse_attn_decode_ragged_triton(
         q=q,
         main_cache=main_cache,
         main_indices=main_indices,
@@ -315,18 +321,91 @@ def test_sparse_attn_decode_ragged_kernel() -> None:
         extra_indices=extra_indices,
         extra_indptr=extra_indptr,
     )
+    output = torch.empty_like(q)
+    actual = _rocm_sparse_attn_decode_ragged_triton(
+        q=q,
+        main_cache=main_cache,
+        main_indices=main_indices,
+        main_indptr=main_indptr,
+        scale=scale,
+        attn_sink=attn_sink,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+        extra_indptr=extra_indptr,
+        out=output,
+    )
     expected = _ref_sparse_decode_ragged(
         q=q,
         main_cache=main_cache,
-        main_rows=[[0, 2], [4, 1]],
+        main_rows=[[0, 2], [4, 1], []],
         scale=scale,
         attn_sink=attn_sink,
         block_size=block_size,
         extra_cache=extra_cache,
-        extra_rows=[[1], [3, 0]],
+        extra_rows=[[1], [3, 0], []],
     )
 
+    assert actual.data_ptr() == output.data_ptr()
+    assert torch.equal(actual, allocated)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    ("output_dtype", "output_batch", "writes_in_place"),
+    [
+        (torch.bfloat16, 1, True),
+        (torch.float32, 1, False),
+        (torch.bfloat16, 2, False),
+    ],
+)
+@torch.inference_mode()
+def test_sparse_attn_decode_output_routing(
+    monkeypatch,
+    output_dtype: torch.dtype,
+    output_batch: int,
+    writes_in_place: bool,
+) -> None:
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    q = torch.zeros(1, 16, HEAD_DIM, dtype=torch.bfloat16)
+    output = torch.empty(output_batch, 16, HEAD_DIM, dtype=output_dtype)
+    expected = torch.ones_like(q)
+    routed_out = None
+
+    def fake_decode(**kwargs) -> torch.Tensor:
+        nonlocal routed_out
+        routed_out = kwargs["out"]
+        if routed_out is not None:
+            routed_out.copy_(expected)
+            return routed_out
+        return expected
+
+    monkeypatch.setattr(mod, "_rocm_sparse_attn_decode_triton", fake_decode)
+    mod.rocm_sparse_attn_decode(
+        q=q,
+        kv_cache=None,
+        swa_k_cache=torch.empty(1, 1, 584, dtype=torch.uint8),
+        swa_only=True,
+        topk_indices=None,
+        topk_lens=None,
+        swa_indices=torch.zeros(1, 1, dtype=torch.int32),
+        swa_lens=torch.ones(1, dtype=torch.int32),
+        swa_ragged_indices=None,
+        swa_ragged_indptr=None,
+        topk_ragged_indices=None,
+        topk_ragged_indptr=None,
+        attn_sink=None,
+        scale=HEAD_DIM**-0.5,
+        head_dim=HEAD_DIM,
+        nope_head_dim=NOPE_HEAD_DIM,
+        rope_head_dim=ROPE_HEAD_DIM,
+        output=output,
+    )
+
+    assert (routed_out is output) is writes_in_place
+    torch.testing.assert_close(output, expected.to(output_dtype).expand_as(output))
 
 
 @requires_gfx950
