@@ -1520,6 +1520,7 @@ def _sparse_attn_decode_partial_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    PARTITION_SEGMENTS: tl.constexpr,
     NUM_STAGES: tl.constexpr,
 ):
     query_idx = tl.program_id(0)
@@ -1554,15 +1555,60 @@ def _sparse_attn_decode_partial_kernel(
     zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
     zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
 
-    # Each split processes a contiguous slice of this query's main (SWA) and
-    # extra (topk) segments. Slices are handled independently so a block never
-    # straddles the main/extra boundary.
     main_start = tl.load(main_indptr_ptr + query_idx)
     main_end = tl.load(main_indptr_ptr + query_idx + 1)
     main_len = main_end - main_start
     main_chunk = (main_len + NUM_SPLITS - 1) // NUM_SPLITS
     main_lo = split_id * main_chunk
     main_hi = tl.minimum(main_lo + main_chunk, main_len)
+
+    if PARTITION_SEGMENTS:
+        # Give each workgroup one physical segment when that strictly lowers
+        # the longest per-workgroup BLOCK_K path.
+        extra_start = tl.load(extra_indptr_ptr + query_idx)
+        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+        extra_len = extra_end - extra_start
+        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+        extra_lo = split_id * extra_chunk
+        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+        main_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
+        extra_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
+        total_tiles = tl.maximum(main_tiles + extra_tiles, 1)
+        main_splits = (NUM_SPLITS * main_tiles + total_tiles - 1) // total_tiles
+        main_splits = tl.maximum(1, tl.minimum(main_splits, NUM_SPLITS - 1))
+        extra_splits = NUM_SPLITS - main_splits
+
+        part_main_chunk = (main_len + main_splits - 1) // main_splits
+        part_extra_chunk = (extra_len + extra_splits - 1) // extra_splits
+        old_iters = (main_chunk + BLOCK_K - 1) // BLOCK_K
+        old_iters += (extra_chunk + BLOCK_K - 1) // BLOCK_K
+        part_main_iters = (part_main_chunk + BLOCK_K - 1) // BLOCK_K
+        part_extra_iters = (part_extra_chunk + BLOCK_K - 1) // BLOCK_K
+        use_partition = tl.maximum(part_main_iters, part_extra_iters) < old_iters
+
+        handles_main = split_id < main_splits
+        part_main_lo = split_id * part_main_chunk
+        part_main_hi = tl.minimum(part_main_lo + part_main_chunk, main_len)
+        extra_split_id = split_id - main_splits
+        part_extra_lo = extra_split_id * part_extra_chunk
+        part_extra_hi = tl.minimum(part_extra_lo + part_extra_chunk, extra_len)
+
+        main_lo = tl.where(
+            use_partition, tl.where(handles_main, part_main_lo, main_len), main_lo
+        )
+        main_hi = tl.where(
+            use_partition, tl.where(handles_main, part_main_hi, main_len), main_hi
+        )
+        extra_lo = tl.where(
+            use_partition,
+            tl.where(handles_main, extra_len, part_extra_lo),
+            extra_lo,
+        )
+        extra_hi = tl.where(
+            use_partition,
+            tl.where(handles_main, extra_len, part_extra_hi),
+            extra_hi,
+        )
 
     for k_start in tl.range(main_lo, main_hi, BLOCK_K, num_stages=NUM_STAGES):
         k_pos = k_start + k_offsets
@@ -1622,12 +1668,13 @@ def _sparse_attn_decode_partial_kernel(
         l_i = l_new
 
     if HAS_EXTRA:
-        extra_start = tl.load(extra_indptr_ptr + query_idx)
-        extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
-        extra_len = extra_end - extra_start
-        extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
-        extra_lo = split_id * extra_chunk
-        extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
+        if not PARTITION_SEGMENTS:
+            extra_start = tl.load(extra_indptr_ptr + query_idx)
+            extra_end = tl.load(extra_indptr_ptr + query_idx + 1)
+            extra_len = extra_end - extra_start
+            extra_chunk = (extra_len + NUM_SPLITS - 1) // NUM_SPLITS
+            extra_lo = split_id * extra_chunk
+            extra_hi = tl.minimum(extra_lo + extra_chunk, extra_len)
 
         for k_start in tl.range(extra_lo, extra_hi, BLOCK_K, num_stages=NUM_STAGES):
             k_pos = k_start + k_offsets
@@ -2197,6 +2244,12 @@ def _rocm_sparse_attn_decode_ragged_triton(
         BLOCK_H=block_h,
         BLOCK_K=block_k,
         NUM_SPLITS=num_splits,
+        # C128A uses two-token compressed pages. Partition its split IDs only
+        # in the low-batch regime; C4A and high-batch decode keep the existing
+        # schedule.
+        PARTITION_SEGMENTS=(
+            has_extra and extra_cache.shape[1] == 2 and num_splits == 16
+        ),
         NUM_STAGES=1,
         num_warps=4,
     )

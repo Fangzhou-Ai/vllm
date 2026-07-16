@@ -152,6 +152,7 @@ def _ref_sparse_decode_ragged(
     block_size: int,
     extra_cache: torch.Tensor | None = None,
     extra_rows: list[list[int]] | None = None,
+    extra_block_size: int | None = None,
 ) -> torch.Tensor:
     q_f32 = q.float()
     out = torch.empty_like(q_f32)
@@ -162,9 +163,10 @@ def _ref_sparse_decode_ragged(
             for slot in main_rows[query_idx]
         ]
         if extra_cache is not None and extra_rows is not None:
+            extra_block_size = extra_block_size or block_size
             row_kv.extend(
                 _read_fp8_ds_mla_cache(
-                    extra_cache, int(slot), block_size, is_extra=True
+                    extra_cache, int(slot), extra_block_size, is_extra=True
                 )
                 for slot in extra_rows[query_idx]
             )
@@ -199,6 +201,16 @@ def _ragged_from_rows(
         torch.tensor(flat, dtype=torch.int32, device=device),
         torch.tensor(indptr, dtype=torch.int32, device=device),
     )
+
+
+def _write_ragged_rows(
+    rows: list[list[int]], indices: torch.Tensor, indptr: torch.Tensor
+) -> None:
+    flat, next_indptr = _ragged_from_rows(rows, indices.device)
+    assert flat.numel() <= indices.numel()
+    indices.fill_(-1)
+    indices[: flat.numel()].copy_(flat)
+    indptr.copy_(next_indptr)
 
 
 @torch.inference_mode()
@@ -513,6 +525,79 @@ def test_sparse_attn_decode_split_k_kernel(
     )
 
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@requires_gfx950
+@torch.inference_mode()
+def test_sparse_attn_decode_split_k_partitioned_segments(monkeypatch) -> None:
+    """Four C128A-like rows use persistent ragged buffers with 16 splits."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as mod
+
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    num_queries = 4
+    num_heads = 16
+    main_block_size = 64
+    extra_block_size = 2
+    q = (
+        torch.randn(
+            num_queries, num_heads, HEAD_DIM, dtype=torch.bfloat16, device=device
+        )
+        * 0.125
+    )
+    main_kv = torch.randn(130, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+    extra_kv = torch.randn(66, HEAD_DIM, dtype=torch.bfloat16, device=device) * 0.125
+
+    monkeypatch.setattr(current_platform, "fp8_dtype", lambda: torch.float8_e4m3fnuz)
+    monkeypatch.setattr(mod.current_platform, "is_fp8_fnuz", lambda: True)
+    main_cache = _pack_fp8_ds_mla_cache(main_kv, main_block_size)
+    extra_cache = _pack_fp8_ds_mla_cache(extra_kv, extra_block_size, is_extra=True)
+
+    main_indices = torch.empty(num_queries * 160, dtype=torch.int32, device=device)
+    extra_indices = torch.empty(num_queries * 96, dtype=torch.int32, device=device)
+    main_indptr = torch.empty(num_queries + 1, dtype=torch.int32, device=device)
+    extra_indptr = torch.empty(num_queries + 1, dtype=torch.int32, device=device)
+    attn_sink = torch.linspace(-0.3, 0.3, num_heads, dtype=torch.float32, device=device)
+    scale = HEAD_DIM**-0.5
+    monkeypatch.setattr(mod, "_decode_num_splits", lambda *args, **kwargs: 16)
+
+    def run_case(main_rows: list[list[int]], extra_rows: list[list[int]]) -> None:
+        _write_ragged_rows(main_rows, main_indices, main_indptr)
+        _write_ragged_rows(extra_rows, extra_indices, extra_indptr)
+        actual = mod._rocm_sparse_attn_decode_ragged_triton(
+            q=q,
+            main_cache=main_cache,
+            main_indices=main_indices,
+            main_indptr=main_indptr,
+            scale=scale,
+            attn_sink=attn_sink,
+            nope_head_dim=NOPE_HEAD_DIM,
+            rope_head_dim=ROPE_HEAD_DIM,
+            extra_cache=extra_cache,
+            extra_indices=extra_indices,
+            extra_indptr=extra_indptr,
+        )
+        expected = _ref_sparse_decode_ragged(
+            q=q,
+            main_cache=main_cache,
+            main_rows=main_rows,
+            scale=scale,
+            attn_sink=attn_sink,
+            block_size=main_block_size,
+            extra_cache=extra_cache,
+            extra_rows=extra_rows,
+            extra_block_size=extra_block_size,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+    run_case(
+        [list(range(129)), list(range(64, 128)), [], []],
+        [list(range(65)), [], list(range(1, 64)), []],
+    )
+    run_case(
+        [[1, 3, 5], [], list(range(33)), list(range(17))],
+        [[], list(range(2, 66)), [0], list(range(7))],
+    )
 
 
 # ---------------------------------------------------------------------------
