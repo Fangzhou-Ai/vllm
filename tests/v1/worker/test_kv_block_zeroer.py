@@ -18,12 +18,14 @@ def test_block_ids_are_not_overwritten_while_copy_is_in_flight():
     # in-flight copy behavior without constructing model attention groups.
     zeroer = KVBlockZeroer.__new__(KVBlockZeroer)
     zeroer.device = device
-    zeroer._meta = (
-        torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
-        page_size_el,
-        page_size_el,
-        1,
-    )
+    zeroer._meta = [
+        (
+            torch.tensor([storage.data_ptr()], dtype=torch.uint64, device=device),
+            page_size_el,
+            page_size_el,
+            1,
+        )
+    ]
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
