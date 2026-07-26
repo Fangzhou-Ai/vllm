@@ -274,7 +274,7 @@ def _insert_index_cache_kernel(
     )
     mask = (slot >= 0) & (offs_d < HEAD_DIM)
     value = tl.load(src, mask=offs_d < HEAD_DIM, other=0.0)
-    tl.store(dst, value, mask=mask)
+    tl.store(dst, value.to(dst.dtype.element_ty), mask=mask)
 
 
 @torch.no_grad()

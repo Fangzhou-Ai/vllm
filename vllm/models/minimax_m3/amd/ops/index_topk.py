@@ -146,7 +146,7 @@ def _index_block_score_kernel(
             + off_k[None, :] * stride_ik_pos
             + off_d[:, None] * stride_ik_d,
         )
-        qk = tl.dot(q, k)
+        qk = tl.dot(q, k.to(q.dtype), out_dtype=tl.float32)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
             qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
@@ -383,7 +383,7 @@ def _decode_index_score_kernel(
             # are loaded in their stored dtype (bf16 or e4m3) and the MMA
             # accumulates in fp32 so the per-block max score is exact for the
             # fp8 indexer too.
-            kq = tl.dot(k, q, out_dtype=tl.float32)  # [N,HQ]
+            kq = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32)  # [N,HQ]
         kq = tl.where(pos_mask & q_mask[None, :], kq, float("-inf"))
         score = tl.max(kq, axis=0)  # [HQ]
         is_visible_block = blk < num_blocks_q
