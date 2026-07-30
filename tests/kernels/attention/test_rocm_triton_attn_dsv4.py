@@ -60,11 +60,7 @@ def test_dsv4_aiter_tgemm_is_limited_to_full_graph_warmup_and_capture(
 
     attention = object.__new__(rocm.DeepseekV4ROCMAiterMLAAttention)
     torch.nn.Module.__init__(attention)
-    weight = torch.empty(0, dtype=torch.bfloat16)
-    attention.compressor = SimpleNamespace(
-        fused_wkv_wgate=SimpleNamespace(weight=weight)
-    )
-    attention.indexer = None
+    attention._tgemm_static_eligible = True
 
     warmup_context = (
         current_platform.cudagraph_warmup_context(warmup_mode)
@@ -74,7 +70,6 @@ def test_dsv4_aiter_tgemm_is_limited_to_full_graph_warmup_and_capture(
     with warmup_context:
         additional_kwargs = current_platform.set_additional_forward_context()
 
-    monkeypatch.setattr(rocm.rocm_aiter_ops, "is_tgemm_enabled", lambda: True)
     monkeypatch.setattr(
         rocm,
         "get_forward_context",

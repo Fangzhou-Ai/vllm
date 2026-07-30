@@ -541,7 +541,7 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 otype=torch.bfloat16,
             )
 
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        qr_kv = self._fused_wqa_wkv_gemm(hidden_states)
         qr, kv = qr_kv.split([self.q_lora_rank, self.head_dim], dim=-1)
         qr, kv = fused_q_kv_rmsnorm(
             qr,
