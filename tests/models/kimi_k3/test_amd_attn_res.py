@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.models.kimi_k3.amd import linear as kimi_linear
 from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.platforms import current_platform
+from vllm.sequence import IntermediateTensors
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_rocm(),
@@ -191,3 +196,110 @@ def test_amd_attn_res_fused_contract(
         original_blocks[:, block_write_idx].copy_(expected_prefix)
     torch.testing.assert_close(blocks, original_blocks, atol=0, rtol=0)
     assert actual.is_contiguous()
+
+
+@pytest.mark.parametrize("is_block_write_layer", [False, True])
+def test_decoder_defers_mlp_delta_to_next_attn_res(
+    monkeypatch: pytest.MonkeyPatch,
+    is_block_write_layer: bool,
+) -> None:
+    attention_delta = torch.tensor([[5.0, 6.0]])
+    mlp_delta = torch.tensor([[7.0, 8.0]])
+    layer = SimpleNamespace(
+        is_block_write_layer=is_block_write_layer,
+        block_write_idx=0,
+        prev_valid_blocks=1,
+        self_attention_res_proj=None,
+        self_attention_res_norm=None,
+        input_layernorm=None,
+        mlp_res_proj=None,
+        mlp_res_norm=None,
+        post_attention_layernorm=None,
+        _run_self_attn=Mock(return_value=attention_delta),
+        mlp=Mock(return_value=mlp_delta),
+    )
+    apply_attn_res = Mock(side_effect=lambda prefix_sum, *args, **kwargs: prefix_sum)
+    monkeypatch.setattr(kimi_linear, "_apply_attn_res", apply_attn_res)
+
+    prefix_sum = torch.tensor([[1.0, 2.0]])
+    incoming_mlp_delta = torch.tensor([[3.0, 4.0]])
+    block_residual = torch.zeros(1, 2, 2)
+    hidden_states, updated_prefix, returned_blocks = (
+        kimi_linear.KimiDecoderLayer.forward_attn_residual(
+            layer,
+            positions=torch.tensor([0]),
+            hidden_states=incoming_mlp_delta,
+            prefix_sum=prefix_sum,
+            block_residual=block_residual,
+        )
+    )
+
+    first_call, second_call = apply_attn_res.call_args_list
+    assert first_call.kwargs["delta"] is incoming_mlp_delta
+    assert first_call.kwargs["block_write_idx"] == (0 if is_block_write_layer else -1)
+    assert second_call.kwargs["delta"] is (
+        None if is_block_write_layer else attention_delta
+    )
+    assert updated_prefix is (attention_delta if is_block_write_layer else prefix_sum)
+    assert hidden_states is mlp_delta
+    assert returned_blocks is block_residual
+
+
+@pytest.mark.parametrize("is_last_rank", [False, True])
+def test_model_materializes_split_attn_res_state_at_consumers(
+    monkeypatch: pytest.MonkeyPatch,
+    is_last_rank: bool,
+) -> None:
+    first_mlp_delta = torch.tensor([[3.0, 4.0]])
+    second_mlp_delta = torch.tensor([[5.0, 6.0]])
+
+    def split_layer(expected_delta, output_delta, increment):
+        def forward(*, hidden_states, prefix_sum, residual, **kwargs):
+            assert hidden_states is expected_delta
+            prefix_sum.add_(increment)
+            return output_delta, prefix_sum, residual
+
+        return Mock(side_effect=forward)
+
+    model = SimpleNamespace(
+        config=SimpleNamespace(attn_res_block_size=12),
+        start_layer=0,
+        end_layer=2,
+        aux_hidden_state_layers=(0, 1),
+        output_attn_res_proj=None,
+        output_attn_res_norm=None,
+        layers=[
+            split_layer(None, first_mlp_delta, 10),
+            split_layer(first_mlp_delta, second_mlp_delta, 20),
+        ],
+    )
+    monkeypatch.setattr(
+        kimi_linear,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=is_last_rank),
+    )
+    final_attn_res = Mock(
+        side_effect=lambda prefix_sum, *args, delta=None, **kwargs: prefix_sum + delta
+    )
+    monkeypatch.setattr(kimi_linear, "_apply_attn_res", final_attn_res)
+
+    output = kimi_linear.KimiLinearModel.forward(
+        model,
+        input_ids=None,
+        positions=torch.tensor([0]),
+        intermediate_tensors=None,
+        inputs_embeds=torch.tensor([[1.0, 2.0]]),
+    )
+
+    expected_final = torch.tensor([[36.0, 38.0]])
+    if not is_last_rank:
+        assert isinstance(output, IntermediateTensors)
+        torch.testing.assert_close(output["hidden_states"], expected_final)
+        final_attn_res.assert_not_called()
+        return
+
+    hidden_states, aux_hidden_states = output
+    torch.testing.assert_close(hidden_states, expected_final)
+    assert final_attn_res.call_args.kwargs["delta"] is second_mlp_delta
+    torch.testing.assert_close(aux_hidden_states[0], torch.tensor([[1.0, 2.0]]))
+    torch.testing.assert_close(aux_hidden_states[1], torch.tensor([[14.0, 16.0]]))

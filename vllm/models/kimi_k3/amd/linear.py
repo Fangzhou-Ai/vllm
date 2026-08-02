@@ -577,13 +577,19 @@ class KimiDecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
         residual: torch.Tensor | None,
+        prefix_sum: torch.Tensor | None = None,
         **kwargs,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
         if self.use_attn_residuals:
             assert residual is not None
-            return self.forward_attn_residual(positions, hidden_states, residual)
+            assert prefix_sum is not None
+            return self.forward_attn_residual(
+                positions, hidden_states, prefix_sum, residual
+            )
+
+        assert hidden_states is not None
 
         # Self Attention
         if residual is None:
@@ -597,31 +603,29 @@ class KimiDecoderLayer(nn.Module):
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        return hidden_states, residual
+        return hidden_states, prefix_sum, residual
 
     def forward_attn_residual(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | None,
+        prefix_sum: torch.Tensor,
         block_residual: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        prefix_sum = hidden_states
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states = _apply_attn_res(
             prefix_sum,
             block_residual,
             self.self_attention_res_proj,
             self.self_attention_res_norm,
             self.prev_valid_blocks,
+            delta=hidden_states,
             output_norm=self.input_layernorm,
             block_write_idx=(self.block_write_idx if self.is_block_write_layer else -1),
         )
 
-        if self.is_block_write_layer:
-            prefix_sum = None
-
         hidden_states = self._run_self_attn(positions, hidden_states)
 
-        if prefix_sum is None:
+        if self.is_block_write_layer:
             prefix_sum = hidden_states
             prefix_delta = None
         else:
@@ -641,8 +645,7 @@ class KimiDecoderLayer(nn.Module):
         )
 
         hidden_states = self.mlp(hidden_states)
-        prefix_sum = prefix_sum + hidden_states
-        return prefix_sum, block_residual
+        return hidden_states, prefix_sum, block_residual
 
 
 class KimiLinearModel(nn.Module, EagleModelMixin):
@@ -759,16 +762,23 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        aux_hidden_states = self._maybe_add_hidden_state(
-            [], self.start_layer, hidden_states, residual
-        )
+        aux_hidden_states: list[torch.Tensor] = []
+        if self.start_layer in self.aux_hidden_state_layers:
+            if self.config.attn_res_block_size is not None:
+                # AttnRes updates prefix storage in place, so keep an independent
+                # snapshot for auxiliary consumers.
+                aux_hidden_states.append(hidden_states.clone())
+            else:
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, self.start_layer, hidden_states, residual
+                )
 
         if self.config.attn_res_block_size is None:
             for layer_idx, layer in enumerate(
                 self.layers[self.start_layer : self.end_layer],
                 start=self.start_layer,
             ):
-                hidden_states, residual = layer(
+                hidden_states, _, residual = layer(
                     positions=positions,
                     hidden_states=hidden_states,
                     residual=residual,
@@ -797,34 +807,37 @@ class KimiLinearModel(nn.Module, EagleModelMixin):
         if residual is not None:
             block_residual[:, : residual.size(1), :].copy_(residual)
         residual = block_residual
+        prefix_sum = hidden_states
+        hidden_states = None
 
         for layer_idx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer],
             start=self.start_layer,
         ):
-            hidden_states, residual = layer(
+            hidden_states, prefix_sum, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,
+                prefix_sum=prefix_sum,
                 residual=residual,
             )
             if (layer_idx + 1) in self.aux_hidden_state_layers:
-                # AMD attn-res layer already returns prefix_sum + MLP delta as
-                # hidden_states; the override drops the block bank in residual.
-                self._maybe_add_hidden_state(
-                    aux_hidden_states, layer_idx + 1, hidden_states, residual
-                )
+                aux_hidden_states.append(prefix_sum + hidden_states)
 
+        assert hidden_states is not None
+        assert prefix_sum is not None
         if not get_pp_group().is_last_rank:
+            hidden_states = prefix_sum + hidden_states
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
         hidden_states = _apply_attn_res(
-            hidden_states,
+            prefix_sum,
             residual,
             self.output_attn_res_proj,
             self.output_attn_res_norm,
             attn_res_block_num,
+            delta=hidden_states,
         )
         # NOTE: the final norm is applied in compute_logits instead of here, so
         # the MTP draft model receives the pre-norm hidden states.
