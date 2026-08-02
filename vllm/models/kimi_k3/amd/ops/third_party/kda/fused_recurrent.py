@@ -543,6 +543,7 @@ def fused_recurrent_kda_packed_decode(
     initial_state: torch.Tensor,
     state_indices: torch.Tensor,
     scale: float | None = None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one-token KDA decode directly from packed post-conv QKV."""
     if mixed_qkv.ndim != 2 or mixed_qkv.stride(-1) != 1:
@@ -586,12 +587,26 @@ def fused_recurrent_kda_packed_decode(
     if state_indices.shape[0] != B:
         raise ValueError("`state_indices` must contain one entry per token.")
 
+    out_shape = (1, B, H, V)
+    if out is None:
+        out = torch.empty(out_shape, dtype=mixed_qkv.dtype, device=device)
+    else:
+        if out.shape != out_shape:
+            raise ValueError(f"Unexpected packed KDA output shape {tuple(out.shape)}.")
+        if out.dtype != mixed_qkv.dtype or out.device != device:
+            raise ValueError(
+                "`out` must have the same dtype and device as `mixed_qkv`."
+            )
+        if out.stride()[1:] != (H * V, V, 1):
+            raise ValueError(
+                "`out` must have dense token, head, and value dimensions."
+            )
+
     BK = next_power_of_2(K)
     BV = min(next_power_of_2(V), 32)
     if scale is None:
         scale = K**-0.5
 
-    out = torch.empty((1, B, H, V), dtype=mixed_qkv.dtype, device=device)
     grid = (cdiv(V, BV), B * H)
     fused_recurrent_kda_packed_decode_kernel[grid](
         mixed_qkv=mixed_qkv,

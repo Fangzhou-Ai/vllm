@@ -15,6 +15,9 @@ from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_upd
 from vllm.model_executor.layers.mamba.ops.gather_initial_states import (
     gather_initial_states,
 )
+from vllm.models.kimi_k3.amd.ops.third_party.kda import (
+    fused_recurrent_kda_packed_decode as amd_fused_recurrent_kda_packed_decode,
+)
 from vllm.models.kimi_k3.nvidia.kda import (
     is_flashkda_supported,
     is_fused_kda_decode_supported,
@@ -30,6 +33,11 @@ from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
 from vllm.third_party.flash_linear_attention.ops.l2norm import l2norm_fwd
 
 DEVICE = "cuda"
+
+PACKED_DECODE_IMPLS = (
+    amd_fused_recurrent_kda_packed_decode,
+    fused_recurrent_kda_packed_decode,
+)
 
 
 @torch.inference_mode()
@@ -374,6 +382,88 @@ def test_packed_kda_decode_correctness(
 
     assert_close("o", dense_out, packed_out, 1e-3, err_atol=1e-3)
     assert_close("ht", dense_state, packed_state, 1e-3, err_atol=1e-3)
+
+
+def _make_packed_decode_out_case():
+    B, H, D = 3, 2, 32
+    mixed_qkv = torch.randn(B, 3 * H * D, dtype=torch.bfloat16, device=DEVICE)
+    raw_g = torch.randn(1, B, H, D, dtype=torch.bfloat16, device=DEVICE)
+    raw_beta = torch.randn(1, B, H, dtype=torch.bfloat16, device=DEVICE)
+    state = torch.randn(B + 1, H, D, D, dtype=torch.float32, device=DEVICE)
+    args = {
+        "mixed_qkv": mixed_qkv,
+        "raw_g": raw_g,
+        "raw_beta": raw_beta,
+        "A_log": torch.randn(H, dtype=torch.float32, device=DEVICE),
+        "dt_bias": torch.randn(H, D, dtype=torch.float32, device=DEVICE),
+        "lower_bound": -5.0,
+        "state_indices": torch.arange(1, B + 1, dtype=torch.int32, device=DEVICE),
+    }
+    return args, state
+
+
+@pytest.mark.parametrize(
+    "packed_decode",
+    PACKED_DECODE_IMPLS,
+    ids=("amd", "nvidia"),
+)
+@torch.inference_mode()
+def test_packed_kda_decode_writes_caller_output(packed_decode):
+    torch.manual_seed(7)
+    args, state = _make_packed_decode_out_case()
+    expected_state = state.clone()
+    expected, _ = packed_decode(**args, initial_state=expected_state)
+
+    actual_state = state.clone()
+    B, H, V = expected.shape[1:]
+    output_storage = torch.full(
+        (1, B + 2, H, V),
+        17.0,
+        dtype=expected.dtype,
+        device=expected.device,
+    )
+    output = output_storage[:, :B]
+    actual, returned_state = packed_decode(
+        **args,
+        initial_state=actual_state,
+        out=output,
+    )
+
+    assert actual is output
+    assert returned_state is actual_state
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(
+        output_storage[:, B:],
+        torch.full_like(output_storage[:, B:], 17.0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "packed_decode",
+    PACKED_DECODE_IMPLS,
+    ids=("amd", "nvidia"),
+)
+@torch.inference_mode()
+def test_packed_kda_decode_rejects_invalid_caller_output(packed_decode):
+    args, state = _make_packed_decode_out_case()
+    B = args["mixed_qkv"].shape[0]
+    H, V = state.shape[1:3]
+    dtype = args["mixed_qkv"].dtype
+    device = args["mixed_qkv"].device
+    invalid_outputs = (
+        (torch.empty((1, B + 1, H, V), dtype=dtype, device=device), "shape"),
+        (torch.empty((1, B, H, V), dtype=torch.float32, device=device), "dtype"),
+        (
+            torch.empty((1, B, H, V + 1), dtype=dtype, device=device)[..., :V],
+            "dense",
+        ),
+    )
+    for output, error_match in invalid_outputs:
+        with pytest.raises(ValueError, match=error_match):
+            packed_decode(**args, initial_state=state, out=output)
 
 
 @pytest.mark.parametrize(

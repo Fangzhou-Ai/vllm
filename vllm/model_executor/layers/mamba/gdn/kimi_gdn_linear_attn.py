@@ -517,6 +517,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # ---------- non-spec path (prefill or plain decode) ----------
         core_attn_out_non_spec = None
+        non_spec_wrote_core_attn_out = False
         if mixed_qkv_ns is not None:
             assert g1_ns is not None and beta_ns is not None
             if m.num_prefills > 0:
@@ -604,6 +605,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     validate_data=True,
                     out=packed_conv_out,
                 )
+                packed_recurrent_out = None
+                if spec_sequence_masks is None:
+                    packed_recurrent_out = core_attn_out[:, : mixed_qkv_ns.size(0)]
+                    non_spec_wrote_core_attn_out = True
                 core_attn_out_non_spec, _ = fused_recurrent_kda_packed_decode(
                     mixed_qkv=mixed_qkv_ns,
                     raw_g=g1_ns,
@@ -613,6 +618,7 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
                     lower_bound=self.gate_lower_bound,
                     initial_state=recurrent_state,
                     state_indices=decode_conv_indices,
+                    out=packed_recurrent_out,
                 )
 
         # ---------- merge spec and non-spec outputs ----------
@@ -627,9 +633,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             merged.index_copy_(1, non_spec_token_indx, core_attn_out_non_spec)
             core_attn_out[0, :num_actual_tokens] = merged[0, :num_actual_tokens]
         elif core_attn_out_non_spec is not None:
-            core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
-                0, :num_actual_tokens
-            ]
+            if not non_spec_wrote_core_attn_out:
+                core_attn_out[0, :num_actual_tokens] = core_attn_out_non_spec[
+                    0, :num_actual_tokens
+                ]
         else:
             assert core_attn_out_spec is not None
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
