@@ -103,7 +103,7 @@ class KimiK3MultiTokenPredictorLayer(nn.Module):
             )
         )
 
-        hidden_states, residual = self.mtp_block(
+        hidden_states, _, residual = self.mtp_block(
             positions=positions,
             hidden_states=hidden_states,
             residual=None,
