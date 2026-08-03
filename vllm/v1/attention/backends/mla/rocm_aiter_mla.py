@@ -77,6 +77,21 @@ def _fp8_mla_prefill_supported() -> bool:
     return True
 
 
+# (num_heads, head_dim) pairs for which AITER instantiates kn_mla_reduce_v1
+# (aiter/csrc/kernels/mla/reduce.cu, MLA_REDUCE_ROUTER). An unsupported pair
+# aborts the process from C++ instead of raising, so it must be rejected here.
+_MLA_REDUCE_V1_SUPPORTED_HEADS: dict[int, frozenset[int]] = {
+    64: frozenset({64}),
+    128: frozenset({1, 2, 4, 8, 10, 16, 32, 40, 64, 128}),
+    512: frozenset({8, 16, 32, 48, 64, 80, 96, 112, 128}),
+}
+
+
+def _mla_reduce_v1_supports(num_heads: int, head_dim: int) -> bool:
+    """Whether kn_mla_reduce_v1 has a kernel for this (heads, head_dim)."""
+    return num_heads in _MLA_REDUCE_V1_SUPPORTED_HEADS.get(head_dim, frozenset())
+
+
 class AiterMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
@@ -329,9 +344,10 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             device=device,
         )
 
-        # FP8 MLA prefill (kn_mla_reduce_v1) only supports 16-aligned heads.
-        self._fp8_prefill_enabled = (
-            _fp8_mla_prefill_supported() and self.num_heads % 16 == 0
+        # Dispatched on v_head_dim: the output is viewed as
+        # [total_q, nhead, v_head_dim] where the reduce kernel is called.
+        self._fp8_prefill_enabled = _fp8_mla_prefill_supported() and (
+            _mla_reduce_v1_supports(self.num_heads, self.mla_dims.v_head_dim)
         )
         if self._fp8_prefill_enabled:
             max_prefill_qlen = min(
@@ -874,9 +890,10 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         # FP8 MLA prefill kernel imports (lazy, only when enabled).
         # Auto-enabled on gfx950 when AITER ships the kernels.
-        # FP8 MLA prefill (kn_mla_reduce_v1) only supports 16-aligned heads.
-        self._fp8_prefill_enabled = (
-            _fp8_mla_prefill_supported() and self.num_heads % 16 == 0
+        # Dispatched on v_head_dim: the output is viewed as
+        # [total_q, nhead, v_head_dim] where the reduce kernel is called.
+        self._fp8_prefill_enabled = _fp8_mla_prefill_supported() and (
+            _mla_reduce_v1_supports(self.num_heads, self.v_head_dim)
         )
         if self._fp8_prefill_enabled:
             from aiter import mla_prefill_ps_asm_fwd, mla_reduce_v1
