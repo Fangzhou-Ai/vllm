@@ -270,10 +270,16 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         from aiter import dtypes, get_mla_metadata_info_v1
 
-        # For num_attention_heads < 16 (e.g. kimi-k2.5 head=8 with TP8),
-        # make sure get_mla_metadata_info_v1 / get_mla_metadata_v1 are consistent
-        # with the actual tensor shape passed to mla_decode_fwd.
-        self._num_attention_heads = max(16, self.num_heads)
+        # The work-split metadata must describe the padded head count, so that
+        # get_mla_metadata_info_v1 / get_mla_metadata_v1 stay consistent with
+        # the tensor shape forward_mqa passes to mla_decode_fwd.
+        # Under DCP the query heads are all-gathered across the DCP group
+        # before forward_mqa, so each rank runs dcp_world_size times its own
+        # head count over its local KV shard.
+        self._dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+        self._num_attention_heads = AiterMLAHelper.get_actual_mla_num_heads(
+            self.num_heads * self._dcp_world_size
+        )
         kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
         if kv_cache_dtype_str in ("fp8", "fp8_e4m3", "fp8_e5m2"):
             kv_cache_dtype_str = "fp8"
@@ -288,6 +294,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         q_dtype = (
             dtypes.fp8 if kv_cache_dtype_str == "fp8" else self.decode_attn_out_dtype
         )
+        self._kv_cache_is_fp8 = kv_cache_dtype_str == "fp8"
         # Persist for get_mla_metadata_v1 (decode build): omitting these causes
         # wrong split/reduce metadata for the gfx950 fp8 nhead=32 fold path.
         self._mla_q_dtype = q_dtype
@@ -580,7 +587,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             ]
         )
         use_gluon_decode = AiterMLAHelper.use_gluon_decode(
-            self.num_heads, int(max_qo_len)
+            self.num_heads,
+            int(max_qo_len),
+            self._kv_cache_is_fp8 or self._dcp_world_size > 1,
         )
 
         if self.compilation_config.cudagraph_mode.has_full_cudagraphs():
@@ -652,10 +661,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         # Pass persistent metadata for every uniform decode we sized buffers for
         # (normal qlen==1 through MTP verification qlen==K): the fp8 nhead=32 fold
         # path breaks without it. qlen>K falls back to kernel-internal metadata.
-        # Small-head (<16) decode takes the Gluon paths and never consumes it.
+        # Keyed off the path actually taken, not the unpadded head count: the
+        # Gluon kernel never consumes this metadata, while every assembly
+        # decode runs at the padded head count the buffers were sized for.
         has_persistent_metadata = False
         use_persistent_metadata = (
-            self.num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
+            not use_gluon_decode
             and max_qo_len >= 1
             and max_qo_len <= self._mtp_decode_qlen
         )
@@ -783,17 +794,35 @@ class AiterMLAHelper:
     """
     AITER MLA implementation requires num_heads >= 16. If num_heads < 16 and
     16 % num_heads == 0, we can pad q to 16 heads; otherwise AITER has to fail.
+
+    Between 16 and 64 heads the assembly kernels exist only at the granularity
+    listed in ``_AITER_MLA_ASM_HEADS``; a head count in the gaps (e.g. 24, from
+    96 heads over TP4) is padded up to the next entry so the persistent kernel
+    can still be used, and the padded heads are dropped from the output.
     """
 
     _AITER_MIN_MLA_HEADS: Final = 16
     _AITER_UNSUPPORTED_HEADS: ClassVar[tuple[int, ...]] = ()
 
+    # Q-head counts with an MLA decode assembly kernel, from the Gqa column of
+    # AITER's hsa/<arch>/mla/mla_asm.csv (bf16 rows carrying ps=1). Padding is
+    # applied only within this range; counts above it keep whatever the kernel's
+    # own dispatch does with them.
+    #
+    # 128 is listed so 96 heads (PP8/TP1) pad up instead of passing through. An
+    # fp8 KV cache makes the decode fp8 q + fp8 KV, which aiter serves natively
+    # only at 8/16/32/64/128 heads; counts in between fall to the 16-head
+    # folding branch in aiter/mla.py (mla_decode_fwd), which faults on real
+    # serving batches. 12/24/48 heads keep padding to 16/32/64 unchanged.
+    _AITER_MLA_ASM_HEADS: ClassVar[tuple[int, ...]] = (16, 32, 64, 128)
+
     @staticmethod
     def check_num_heads_validity(num_heads: int):
         assert AiterMLAHelper.is_valid_num_heads(num_heads), (
-            "ROCM AITER MLA requires 1-15 heads for Gluon decode or a multiple "
-            f"of 16 heads for persistent decode, but got {num_heads}.\n"
-            f"Try adjusting tensor_parallel_size value."
+            "ROCM AITER MLA requires 1-15 heads for Gluon decode, or a head "
+            "count that can be padded to one of "
+            f"{AiterMLAHelper._AITER_MLA_ASM_HEADS}, or a multiple of 16, but "
+            f"got {num_heads}.\nTry adjusting tensor_parallel_size value."
         )
 
     @staticmethod
@@ -801,32 +830,45 @@ class AiterMLAHelper:
         return num_heads > 0 and (
             num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS
             or num_heads % AiterMLAHelper._AITER_MIN_MLA_HEADS == 0
+            or num_heads < AiterMLAHelper._AITER_MLA_ASM_HEADS[-1]
         )
 
     @staticmethod
     def get_actual_mla_num_heads(num_heads: int) -> int:
-        return max(num_heads, AiterMLAHelper._AITER_MIN_MLA_HEADS)
+        if num_heads <= AiterMLAHelper._AITER_MIN_MLA_HEADS:
+            return AiterMLAHelper._AITER_MIN_MLA_HEADS
+        return next(
+            (h for h in AiterMLAHelper._AITER_MLA_ASM_HEADS if h >= num_heads),
+            num_heads,
+        )
 
     @staticmethod
     def get_mla_padded_q(num_heads: int, q: torch.Tensor) -> torch.Tensor:
-        return (
-            q
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else q.repeat_interleave(
-                AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, dim=1
-            )
-        )
+        """Grow q from ``num_heads`` to a head count the kernel implements.
+
+        ``q`` is [num_tokens, num_heads, head_dim]. The added heads are zeros:
+        they attend uniformly, cannot perturb the real heads, and are dropped
+        again by :meth:`get_mla_unpadded_o`.
+        """
+        padded_num_heads = AiterMLAHelper.get_actual_mla_num_heads(num_heads)
+        if padded_num_heads == num_heads:
+            return q
+        return torch.nn.functional.pad(q, (0, 0, 0, padded_num_heads - num_heads))
 
     @staticmethod
     def get_mla_unpadded_o(num_heads: int, o: torch.Tensor) -> torch.Tensor:
-        return (
-            o
-            if num_heads >= AiterMLAHelper._AITER_MIN_MLA_HEADS
-            else o[:, :: AiterMLAHelper._AITER_MIN_MLA_HEADS // num_heads, :]
-        )
+        return o if o.shape[1] == num_heads else o[:, :num_heads, :]
 
     @staticmethod
-    def use_gluon_decode(num_heads: int, max_qo_len: int) -> bool:
+    def use_gluon_decode(
+        num_heads: int, max_qo_len: int, force_asm_decode: bool = False
+    ) -> bool:
+        # Callers force the assembly path for an fp8 KV cache (aiter's
+        # _use_persistent_mla_decode only de-selects the persistent kernel for
+        # bf16 KV, and the Gluon call site cannot express a KV dequant scale)
+        # and for DCP (the Gluon call returns no softmax LSE to merge with).
+        if force_asm_decode:
+            return False
         return num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS and max_qo_len == 1
 
 
@@ -1192,8 +1234,11 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
 
-        mla_padded_q = AiterMLAHelper.get_mla_padded_q(self.num_heads, q)
-        mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(self.num_heads)
+        # Not self.num_heads: under DCP q arrives all-gathered over the DCP
+        # group, so it carries dcp_world_size times this rank's head count.
+        q_num_heads = q.shape[1]
+        mla_padded_q = AiterMLAHelper.get_mla_padded_q(q_num_heads, q)
+        mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(q_num_heads)
         o = torch.empty(
             B,
             mla_num_heads,
@@ -1238,4 +1283,4 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             **mla_kwargs,
         )
 
-        return AiterMLAHelper.get_mla_unpadded_o(self.num_heads, o), None
+        return AiterMLAHelper.get_mla_unpadded_o(q_num_heads, o), None

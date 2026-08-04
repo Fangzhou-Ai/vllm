@@ -422,9 +422,12 @@ class ROCMAiterMLASparseMetadataBuilder(
         # so the buffers are large enough for any decode shape we might see.
         from aiter import dtypes, get_mla_metadata_info_v1
 
-        # Aiter sparse MLA also requires num_heads >= 16 (will be padded by
-        # AiterMLAHelper.get_mla_padded_q in forward).
-        self._num_attention_heads = max(16, self.num_heads)
+        # Aiter sparse MLA shares the head-count padding of the dense backend
+        # (applied by AiterMLAHelper.get_mla_padded_q in forward), so the
+        # metadata must be sized for the padded count.
+        self._num_attention_heads = AiterMLAHelper.get_actual_mla_num_heads(
+            self.num_heads
+        )
 
         q_dtype = self.model_dtype
         kv_cache_dtype_str = getattr(vllm_config.cache_config, "cache_dtype", "auto")
