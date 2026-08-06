@@ -114,17 +114,20 @@ class DFlashSpeculator(DraftModelSpeculator):
             >= AttentionCGSupport.UNIFORM_BATCH.value
         )
         if wants_full and not supports_full:
-            logger.warning(
+            logger.info(
                 "%s draft attention (%s) does not support full CUDA graphs; "
-                "running the draft eagerly.",
+                "capturing the draft piecewise, with attention outside the graph.",
                 self._speculator_name,
                 self.attn_cg_support.min_cg_attn_backend,
             )
-        # PIECEWISE cudagraphs are not supported for dflash.
-        if wants_full and supports_full:
+        if cudagraph_mode == CUDAGraphMode.NONE:
+            pass
+        elif wants_full and supports_full:
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
-            cudagraph_mode = CUDAGraphMode.NONE
+            # DFlashCudaGraphManager.capture() honours skip_attn for
+            # PIECEWISE, so everything but attention is still captured.
+            cudagraph_mode = CUDAGraphMode.PIECEWISE
 
         self.query_cudagraph_manager = DFlashCudaGraphManager(
             self.vllm_config,

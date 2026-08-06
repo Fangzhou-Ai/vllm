@@ -58,6 +58,34 @@ class AttentionCGSupportInfo:
         return self
 
 
+def cg_support_excluding_layers(
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    excluded_layer_names: set[str],
+) -> AttentionCGSupportInfo:
+    """Cudagraph support of the attention groups outside ``excluded_layer_names``.
+
+    A spec-decode draft builds its own attention groups and drives its own
+    cudagraph manager, so its backend constrains only itself. Groups are keyed
+    by backend, so each one is either entirely draft or entirely target.
+    """
+    min_cg_support = AttentionCGSupport.ALWAYS
+    min_cg_attn_backend = None
+    for groups in attn_groups:
+        for group in groups:
+            if excluded_layer_names.issuperset(group.layer_names):
+                continue
+            cg_support = group.get_metadata_builder(0).get_cudagraph_support(
+                vllm_config, group.kv_cache_spec
+            )
+            if cg_support.value < min_cg_support.value:
+                min_cg_support = cg_support
+                min_cg_attn_backend = group.backend.__name__
+    return AttentionCGSupportInfo(
+        min_cg_support=min_cg_support, min_cg_attn_backend=min_cg_attn_backend
+    )
+
+
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
     kv_cache_spec: dict[str, KVCacheSpec] = {}
     layer_type = cast(type[Any], AttentionLayerBase)

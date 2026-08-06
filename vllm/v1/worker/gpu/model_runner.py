@@ -62,6 +62,7 @@ from vllm.v1.worker.gpu import pcp_manager as pcp
 from vllm.v1.worker.gpu.async_utils import AsyncOutput, AsyncPoolingOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
+    cg_support_excluding_layers,
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
@@ -472,6 +473,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.attn_groups, attn_cg_support, self.kernel_block_sizes = init_attn_backend(
             self.kv_cache_config, self.vllm_config, self.device
         )
+        draft_attn_layer_names = getattr(
+            self.speculator, "draft_attn_layer_names", None
+        )
+        if draft_attn_layer_names:
+            attn_cg_support = cg_support_excluding_layers(
+                self.attn_groups, self.vllm_config, draft_attn_layer_names
+            )
         attn_cg_support = attn_cg_support.narrow(
             *self.model_state.get_additional_cg_support()
         )
