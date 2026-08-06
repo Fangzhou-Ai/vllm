@@ -648,8 +648,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # the attend impl reads them back (no Python value crosses the break).
         self.topk_indices_buffer = topk_indices_buffer
         self.attn_backend = MiniMaxM3SparseBackend
+        self.indexer_kv_dtype = vllm_config.attention_config.indexer_kv_dtype
         # Indexer and main attention are separate impls. On ROCm the SM100 gate
-        # is always False, so both pick Triton and the index cache stays bf16.
+        # is always False, so both pick Triton.
         # impl is AttentionImplBase (broader than AttentionLayerBase's annotation).
         self.impl: MiniMaxM3SparseImpl = select_main_impl_cls(  # type: ignore[assignment]
             topk_blocks=sparse_cfg["sparse_topk_blocks"],
@@ -665,6 +666,12 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             sparse_block_size=sparse_cfg["sparse_block_size"],
         )
         self.use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(self.num_kv_heads)
+        if self.indexer_kv_dtype != "bf16" and not self.use_aiter_sparse_pa:
+            raise ValueError(
+                f"indexer_kv_dtype={self.indexer_kv_dtype!r} on ROCm requires "
+                "the AITER sparse PA path: set "
+                "VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT=1."
+            )
         self.kv_cache_k = torch.tensor([])
         self.kv_cache_v = torch.tensor([])
         self._aiter_sparse_pa_cache_data_ptr = 0
@@ -682,6 +689,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             local_blocks=sparse_cfg.get("sparse_local_block", 0),
             score_type=sparse_cfg.get("sparse_score_type", "max"),
             cache_config=cache_config,
+            indexer_kv_dtype=self.indexer_kv_dtype,
             topk_indices_buffer=topk_indices_buffer,
         )
 
