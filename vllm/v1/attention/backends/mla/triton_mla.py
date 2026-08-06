@@ -290,10 +290,26 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             # Each row attends to the same committed KV prefix (per-row seq_lens)
             # and never to sibling block tokens = non-causal block semantics.
             # Mirrors FlashInferMLA's non-causal path.
-            query_len = attn_metadata.num_decode_tokens // attn_metadata.num_decodes
+            query_len = attn_metadata.max_query_len
             if query_len > 1:
                 block_table = block_table.repeat_interleave(query_len, dim=0)
                 seq_lens = seq_lens.repeat_interleave(query_len)
+            # q is padded to a cudagraph capture size, which need not be a whole
+            # number of blocks, so the flattened tables can come out shorter or
+            # longer than q. The kernel grid is sized from q, so reconcile them
+            # here; trailing rows get seq_len 0 and read no KV.
+            num_rows = seq_lens.shape[0]
+            if num_rows < B:
+                block_table = torch.cat(
+                    (
+                        block_table,
+                        block_table.new_zeros(B - num_rows, block_table.shape[1]),
+                    )
+                )
+                seq_lens = torch.cat((seq_lens, seq_lens.new_zeros(B - num_rows)))
+            elif num_rows > B:
+                block_table = block_table[:B]
+                seq_lens = seq_lens[:B]
 
         # Run MQA — always pass layer scales. When KV cache is
         # BF16 the kernel's `if dtype.is_fp8()` check is a no-op.
