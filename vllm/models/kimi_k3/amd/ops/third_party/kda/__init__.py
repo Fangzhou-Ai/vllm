@@ -16,9 +16,13 @@
 #   - OOB-mask correctness fix: present (all tl.load use mask=..., other=0).
 # Validated on gfx950: no core-dump, gsm8k 94.1%.
 #
-# AMD-specific deltas vs the NVIDIA copy: NONE yet (byte-identical). Keep in sync
-# with the NVIDIA copy on FLA updates; any divergence should be an intentional,
-# documented gfx950-specific change (a #869-style AMD-only fix).
+# AMD-specific deltas vs the NVIDIA copy:
+#   - fused_recurrent.py: fused_recurrent_kda_packed_decode takes the state-index
+#     stride, the way its sibling fused_recurrent_kda already does. Not gfx950
+#     specific -- the NVIDIA copy has the same limitation and should pick this up
+#     on the next sync.
+# Keep in sync with the NVIDIA copy on FLA updates; any further divergence should
+# be an intentional, documented change.
 
 from .chunk import (
     chunk_kda,
