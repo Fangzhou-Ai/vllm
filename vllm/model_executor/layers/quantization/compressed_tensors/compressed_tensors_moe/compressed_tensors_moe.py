@@ -60,6 +60,22 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         format = scheme_dict.get("format")
 
         if quant_config._is_mxfp4(weight_quant):
+            # Kimi-K3's routed experts are weight-only MXFP4 with a SiTU
+            # activation, which this scheme's ROCm path does not implement -- it
+            # falls through to Marlin, and Marlin has no ROCm build. Mxfp4MoEMethod
+            # carries the AITER SiTU kernel selection, so hand the layer to it.
+            # models/config.py reaches the same destination by rewriting
+            # quant_method to "mxfp4", but only for a checkpoint whose top-level
+            # format is mxfp4-pack-quantized; a mixed-precision checkpoint (MXFP8
+            # attention alongside MXFP4 experts) never triggers that rewrite.
+            from vllm.model_executor.layers.quantization.mxfp4 import (
+                Mxfp4MoEMethod,
+                _use_k3_situ_aiter,
+            )
+
+            if _use_k3_situ_aiter(layer.moe_config):
+                return Mxfp4MoEMethod(layer.moe_config)
+
             from .compressed_tensors_moe_w4a4_mxfp4 import (
                 CompressedTensorsW4A4Mxfp4MoEMethod,
             )
