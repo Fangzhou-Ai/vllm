@@ -637,6 +637,47 @@ def _rocm_aiter_hipb_mm_fp8_fake(
     return torch.empty(m, n, dtype=output_dtype, device=A.device)
 
 
+def _rocm_aiter_hipb_mm_mxfp8_impl(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """MXFP8 GEMM: A [m, k] / B [k, n] E4M3, As [m, k//32] / Bs [n, k//32] E8M0.
+
+    aiter picks hipBLASLt's VEC32_UE8M0 scale mode off the scale dtype, so the
+    E8M0 bytes must arrive tagged as float8_e8m0fnu rather than as the uint8
+    that vLLM stores them in.
+    """
+    from aiter import hipb_mm
+
+    _ensure_hipb_mm_extension_initialized()
+    return hipb_mm(
+        A,
+        B,
+        solution_index=-1,
+        bias=bias,
+        out_dtype=output_dtype,
+        scaleA=As.view(torch.float8_e8m0fnu),
+        scaleB=Bs.view(torch.float8_e8m0fnu),
+        scaleOut=None,
+        bpreshuffle=False,
+    )
+
+
+def _rocm_aiter_hipb_mm_mxfp8_fake(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    As: torch.Tensor,
+    Bs: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    output_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    return torch.empty(A.shape[0], B.shape[1], dtype=output_dtype, device=A.device)
+
+
 def _rocm_aiter_triton_gemm_a8w8_blockscale_impl(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -1593,6 +1634,7 @@ class rocm_aiter_ops:
     _FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
     _FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
     _LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+    _MXFP8_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_MXFP8_HIPBMM
     # TODO: Consolidate under _LINEAR_ENABLED
     _FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
     # TODO: Consolidate under VLLM_ROCM_USE_AITER_ROPE
@@ -1624,6 +1666,7 @@ class rocm_aiter_ops:
         cls._FP8BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP8BMM
         cls._FP4BMM_ENABLED = envs.VLLM_ROCM_USE_AITER_FP4BMM
         cls._LINEAR_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_LINEAR_HIPBMM
+        cls._MXFP8_HIPBMM_ENABLED = envs.VLLM_ROCM_USE_AITER_MXFP8_HIPBMM
         cls._FP4_GEMM_DYNAMIC_QUANT_ASM = envs.VLLM_ROCM_USE_AITER_FP4_ASM_GEMM
         cls._TRITON_ROTARY_EMBED = envs.VLLM_ROCM_USE_AITER_TRITON_ROPE
         cls._MOE_SHARED_EXPERTS_ENABLED = envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
@@ -1816,6 +1859,15 @@ class rocm_aiter_ops:
 
     @classmethod
     @if_aiter_supported
+    def is_mxfp8_hipbmm_enabled(cls) -> bool:
+        from vllm.platforms.rocm import on_gfx950
+
+        # Microscaling matrix cores are CDNA4-only, so unlike the rowwise
+        # hipb_mm path this gates on gfx950 rather than on cdna > 2.
+        return cls.is_linear_enabled() and on_gfx950() and cls._MXFP8_HIPBMM_ENABLED
+
+    @classmethod
+    @if_aiter_supported
     def is_asm_fp4_gemm_dynamic_quant_enabled(cls) -> bool:
         from vllm.platforms.rocm import on_gfx950
 
@@ -1976,6 +2028,12 @@ class rocm_aiter_ops:
                 op_name="rocm_aiter_hipb_mm_fp8",
                 op_func=_rocm_aiter_hipb_mm_fp8_impl,
                 fake_impl=_rocm_aiter_hipb_mm_fp8_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_hipb_mm_mxfp8",
+                op_func=_rocm_aiter_hipb_mm_mxfp8_impl,
+                fake_impl=_rocm_aiter_hipb_mm_mxfp8_fake,
             )
 
             direct_register_custom_op(
@@ -2223,6 +2281,17 @@ class rocm_aiter_ops:
         output_dtype: torch.dtype = torch.bfloat16,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_hipb_mm_fp8(A, B, As, Bs, bias, output_dtype)
+
+    @staticmethod
+    def hipb_mm_mxfp8(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        As: torch.Tensor,
+        Bs: torch.Tensor,
+        bias: torch.Tensor | None = None,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_hipb_mm_mxfp8(A, B, As, Bs, bias, output_dtype)
 
     @staticmethod
     def triton_gemm_a8w8_blockscale(
