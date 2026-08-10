@@ -344,8 +344,13 @@ def fused_recurrent_kda_fwd(
     if scale is None:
         scale = K**-0.5
 
-    BV = 32 if use_gate_in_kernel else 8
-    num_warps = 4 if use_gate_in_kernel else 1
+    # gfx950: one warp keeps the K reduction inside the wave. At num_warps=4
+    # Triton splits the 128-wide K axis across two warps (warpsPerCTA=[2,2]),
+    # which turns both tl.sum(axis=1) into cross-warp reductions -- 14
+    # s_barrier and 77 LDS ops per token, plus 50 SGPR spills. BV=8 keeps the
+    # wave count identical, since (128/8)*N*H*1 == (128/32)*N*H*4.
+    BV = 8
+    num_warps = 1
     grid = (cdiv(V, BV) * N * H,)
     fused_recurrent_kda_fwd_kernel[grid](
         q=q,
@@ -459,6 +464,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     stride_g_token: tl.constexpr,
     stride_beta_token: tl.constexpr,
     stride_state_token: tl.constexpr,
+    stride_indices_seq: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
@@ -476,7 +482,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     mask_v = o_v < V
     mask_state = mask_v[:, None] & mask_k[None, :]
 
-    state_idx = tl.load(state_indices + i_n).to(tl.int64)
+    state_idx = tl.load(state_indices + i_n * stride_indices_seq).to(tl.int64)
     p_out = out + (i_n * H + i_h) * V + o_v
     if state_idx <= 0:
         tl.store(p_out, tl.zeros([BV], dtype=tl.float32), mask=mask_v)
@@ -560,8 +566,8 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError("`raw_beta` heads must be contiguous.")
     if initial_state.stride()[1:] != (V * K, K, 1):
         raise ValueError("`initial_state` must be contiguous within each cache slot.")
-    if state_indices.ndim != 1 or state_indices.stride(0) != 1:
-        raise ValueError("`state_indices` must be contiguous and one-dimensional.")
+    if state_indices.ndim != 1:
+        raise ValueError("`state_indices` must be one-dimensional.")
     if A_log.ndim != 1 or not A_log.is_contiguous():
         raise ValueError("`A_log` must be contiguous and one-dimensional.")
     if not dt_bias.is_contiguous():
@@ -608,6 +614,7 @@ def fused_recurrent_kda_packed_decode(
         stride_g_token=raw_g.stride(1),
         stride_beta_token=raw_beta.stride(1),
         stride_state_token=initial_state.stride(0),
+        stride_indices_seq=state_indices.stride(0),
         H=H,
         K=K,
         V=V,
