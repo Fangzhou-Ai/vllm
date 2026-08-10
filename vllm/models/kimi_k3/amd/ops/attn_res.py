@@ -160,10 +160,16 @@ def attn_res(
         return output
 
     # Source tiling helps decode, while one-source tiles scale better for prefill.
-    if num_tokens >= 256 or num_blocks <= 1:
+    if num_tokens >= 256:
         block_l, num_warps = 1, 4
     else:
-        block_l, num_warps = 4, 8
+        # Decode launches one workgroup per token, so a 64-token step covers a
+        # quarter of the CUs and the only lever left is shortening the source
+        # loop. num_blocks is constexpr, so a tile wide enough to hold every
+        # source collapses the loop to one iteration; 16 warps then give four
+        # waves per SIMD on the single CU each workgroup gets. num_warps=32
+        # does not fit -- the cross-warp reduction scratch jumps to 64 KB.
+        block_l, num_warps = triton.next_power_of_2(num_blocks + 1), 16
     _attn_res_kernel[(num_tokens,)](
         prefix,
         delta,
