@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 import torch
+from torch._subclasses.fake_tensor import unset_fake_temporarily
 import torch._inductor.pattern_matcher as pm
 from torch import fx
 from torch._inductor.fx_passes.post_grad import view_to_reshape
@@ -534,13 +535,17 @@ class AiterRMSNormGatedFp8GroupQuantPattern(AiterRMSNormQuantPattern):
             fold_consecutive_reshapes(gm)
             return gm
 
-        pm.register_replacement(
-            pattern,
-            replacement,
-            [x, z, w],
-            trace_fn,
-            pm_pass,
-        )
+        # Pattern registration happens under the compiling FakeTensorMode, but
+        # the gated-RMSNorm kernel this pattern traces reads data_ptr(), which
+        # a FakeTensor cannot supply. The sample inputs above are real.
+        with unset_fake_temporarily():
+            pm.register_replacement(
+                pattern,
+                replacement,
+                [x, z, w],
+                trace_fn,
+                pm_pass,
+            )
 
 
 class RocmAiterRMSNormQuantFusionPass(VllmPatternMatcherPass):
