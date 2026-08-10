@@ -10,6 +10,8 @@
 
 import torch
 
+from vllm.utils.torch_utils import direct_register_custom_op
+
 from vllm.triton_utils import tl, triton
 
 
@@ -136,7 +138,7 @@ def _attn_res_kernel(
     )
 
 
-def attn_res(
+def _attn_res_impl(
     prefix: torch.Tensor,
     delta: torch.Tensor | None,
     blocks: torch.Tensor,
@@ -191,3 +193,31 @@ def attn_res(
         num_stages=2,
     )
     return output
+
+
+def _attn_res_fake(
+    prefix: torch.Tensor,
+    delta: torch.Tensor | None,
+    blocks: torch.Tensor,
+    norm_weight: torch.Tensor,
+    qk_weight: torch.Tensor,
+    output_norm_weight: torch.Tensor | None,
+    num_blocks: int,
+    block_write_idx: int,
+    eps: float,
+    output_norm_eps: float,
+) -> torch.Tensor:
+    return torch.empty_like(prefix)
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_attn_res",
+    op_func=_attn_res_impl,
+    # The kernel appends this token's contribution to `blocks` in place when
+    # block_write_idx >= 0; the buffer is threaded through every layer, so the
+    # mutation has to be visible to the compiler.
+    mutates_args=["blocks"],
+    fake_impl=_attn_res_fake,
+)
+
+attn_res = torch.ops.vllm.kimi_k3_attn_res

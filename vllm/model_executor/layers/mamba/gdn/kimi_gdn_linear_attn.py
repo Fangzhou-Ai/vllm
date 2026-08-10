@@ -11,7 +11,7 @@ from torch.nn.parameter import Parameter
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
 from vllm.distributed import divide, get_tensor_model_parallel_rank
-from vllm.forward_context import get_forward_context
+from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.model_loader.weight_utils import (
@@ -23,6 +23,12 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from ...linear import (
@@ -366,12 +372,13 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
-        self._forward(
-            mixed_qkv=mixed_qkv,
-            g1=g1,
-            g2=g2,
-            beta=beta,
-            core_attn_out=core_attn_out,
+        torch.ops.vllm.kimi_kda_attention_core(
+            mixed_qkv,
+            g1,
+            g2,
+            beta,
+            core_attn_out,
+            layer_name=_encode_layer_name(self.prefix),
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
@@ -633,3 +640,47 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         else:
             assert core_attn_out_spec is not None
         core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+
+
+def kimi_kda_attention_core(
+    mixed_qkv: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    """Opaque wrapper around the conv1d + recurrent KDA kernels.
+
+    The state caches and the attention metadata are reached through the layer
+    and the forward context rather than passed in, so they stay outside the
+    traced graph; ``core_attn_out`` is the only mutated argument.
+    """
+    forward_context: ForwardContext = get_forward_context()
+    self = forward_context.no_compile_layers[_resolve_layer_name(layer_name)]
+    self._forward(
+        mixed_qkv=mixed_qkv,
+        g1=g1,
+        g2=g2,
+        beta=beta,
+        core_attn_out=core_attn_out,
+    )
+
+
+def kimi_kda_attention_core_fake(
+    mixed_qkv: torch.Tensor,
+    g1: torch.Tensor,
+    g2: torch.Tensor,
+    beta: torch.Tensor,
+    core_attn_out: torch.Tensor,
+    layer_name: LayerNameType,
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="kimi_kda_attention_core",
+    op_func=kimi_kda_attention_core,
+    mutates_args=["core_attn_out"],
+    fake_impl=kimi_kda_attention_core_fake,
+)
