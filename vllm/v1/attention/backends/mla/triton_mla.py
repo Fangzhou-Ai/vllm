@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 
@@ -30,6 +30,10 @@ from vllm.v1.worker.workspace import (
     is_workspace_manager_initialized,
 )
 
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
+    from vllm.v1.kv_cache_interface import KVCacheSpec
+
 logger = init_logger(__name__)
 
 # num_kv_splits selection (shared by forward_mqa and the workspace reservation
@@ -38,13 +42,19 @@ _MIN_WORK_PER_SPLIT = 512
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
 
 
-def _compute_num_kv_splits(max_seq_len: int, sm_count: int) -> int:
+def _compute_num_kv_splits(max_seq_len: int, sm_count: int, num_rows: int = 1) -> int:
     # Power of 2 to avoid excessive kernel instantiations, capped by an SM-based
     # maximum (occupancy multiplier allows multiple blocks per SM
     # for latency hiding).
     ideal_splits = triton.next_power_of_2(max(1, max_seq_len // _MIN_WORK_PER_SPLIT))
     max_splits = sm_count * _SPLIT_OCCUPANCY_MULTIPLIER
-    return min(ideal_splits, max_splits)
+    # Splitting past what it takes to fill the device buys no parallelism and
+    # costs a proportionally longer stage-2 reduction. num_rows is the stage-1
+    # grid's batch dimension, so it already counts the rows a non-causal block
+    # is flattened into. Load-bearing under full cudagraphs, where max_seq_len
+    # is the capture-time bound (max_model_len) rather than the live one.
+    occupancy_splits = triton.next_power_of_2(triton.cdiv(max_splits, max(1, num_rows)))
+    return min(ideal_splits, max_splits, occupancy_splits)
 
 
 class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
@@ -54,6 +64,20 @@ class TritonMLAMetadataBuilder(MLACommonMetadataBuilder[MLACommonMetadata]):
     # Non-causal DSpark block is flattened to one decode row per query token in
     # forward_mqa, so no intra-block causal masking is required.
     supports_non_causal_multi_token_decode: ClassVar[bool] = True
+
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: "VllmConfig",
+        kv_cache_spec: "KVCacheSpec",
+    ) -> AttentionCGSupport:
+        # The flatten in forward_mqa turns a uniform query block into decode
+        # rows, so a group serving those blocks is capturable at any block
+        # length. Causal groups keep the single-token declaration: they have no
+        # flatten, and the kernel does no intra-query masking.
+        if getattr(kv_cache_spec, "non_causal_multi_token_decode", False):
+            return AttentionCGSupport.UNIFORM_BATCH
+        return cls._cudagraph_support
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -259,7 +283,7 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             num_kv_splits = 1
         else:
             num_kv_splits = _compute_num_kv_splits(
-                attn_metadata.max_seq_len, self._sm_count
+                attn_metadata.max_seq_len, self._sm_count, B
             )
 
         # NOTE: the +1 stores the LogSumExp (LSE) that the stage2 kernel uses to
