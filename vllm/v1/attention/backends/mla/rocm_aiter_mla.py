@@ -240,17 +240,20 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         self.compilation_config = vllm_config.compilation_config
         self.decode_attn_out_dtype = vllm_config.model_config.dtype
 
-        # MTP/deepseek_mtp verification runs decode with qlen = num_spec + 1;
-        # any other config (including no spec) stays at single-token decode.
-        speculative_config = vllm_config.speculative_config
-        if (
-            speculative_config is not None
-            and speculative_config.method in ("mtp", "deepseek_mtp")
-            and speculative_config.num_speculative_tokens is not None
-        ):
-            self._mtp_decode_qlen = int(speculative_config.num_speculative_tokens) + 1
-        else:
-            self._mtp_decode_qlen = 1
+        # reorder_batch_threshold is the longest query decode can be handed:
+        # anything longer is routed to prefill, MLACommonMetadataBuilder asserts
+        # it during cudagraph capture, and it already folds in the drafting
+        # scheme. Deriving a length per method instead leaves drafters off the
+        # list -- DSpark, the eagle family -- sized for qlen=1 while the router
+        # still admits up to 1 + 2 * num_spec.
+        #
+        # Sizing short is silently wrong, not slow. The persistent gate below
+        # never opens, so aiter's stage-2 reduction runs on a
+        # (num_requests, num_heads) grid against a (total_q, num_heads)
+        # destination and leaves every verify row past the first unwritten; on
+        # an fp8 cache it instead indexes get_block_n_fp8[num_heads * qlen],
+        # which holds only {8, 16, 24, 32, 48, 64, 128, 256, 384, 512}.
+        self._mtp_decode_qlen = self.reorder_batch_threshold or 1
 
         # Store the kernel block size from the spec. When kernel_block_size=1
         # (no spec-dec), behavior is identical to the original. When > 1
