@@ -1258,7 +1258,12 @@ class SpeculativeConfig:
         This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            # The drafter is built only on the last pipeline stage
+            # (gpu/model_runner.py), so the draft model is not split across
+            # stages: it lives whole on that rank. Inheriting the target's
+            # pipeline size would both mis-shard it and require the draft
+            # architecture to implement SupportsPP, which no vLLM drafter does.
+            pipeline_parallel_size=1,
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
