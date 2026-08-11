@@ -96,6 +96,35 @@ def _warmup_ll_bf16_router_gemm(model: torch.nn.Module) -> None:
     )
 
 
+def _warmup_rocm_skinny_gemm_workspace() -> None:
+    """Force wvSplitKrc's reduction workspace to be allocated before capture.
+
+    The kernel keeps that workspace in function-local statics, allocated on the
+    first call. A first call made while a CUDA graph is capturing takes the
+    block from that graph's private pool, while the statics hold the raw
+    pointer for the lifetime of the process -- so every later call, in other
+    graphs and in eager, writes through memory the pool has since reused.
+    Touching the op here puts the allocation in the ordinary allocator.
+    """
+    if not (current_platform.is_rocm() and envs.VLLM_ROCM_USE_SKINNY_GEMM):
+        return
+    from vllm.model_executor.layers.utils import num_compute_units, on_gfx950
+
+    if not on_gfx950():
+        return
+    import vllm._custom_ops as ops
+
+    # Shapes only have to clear the dispatch gate in rocm_unquantized_gemm; the
+    # workspace itself is shape independent.
+    n, k, m = 64, 1024, 1024
+    x = torch.zeros((n, k), dtype=torch.bfloat16, device="cuda")
+    weight = torch.zeros((m, k), dtype=torch.bfloat16, device="cuda")
+    try:
+        ops.wvSplitKrc(x, weight, num_compute_units(), None)
+    except Exception as e:  # pragma: no cover - warmup must never be fatal
+        logger.warning("skinny GEMM workspace warmup skipped: %s", e)
+
+
 def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     from vllm.model_executor.warmup.minimax_m3_msa_warmup import (
         minimax_m3_msa_warmup,
@@ -110,6 +139,8 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         zeroer = getattr(worker.model_runner, "_kv_block_zeroer", None)
         if zeroer is not None:
             zeroer.warmup(worker.model_runner.kv_cache_config.num_blocks)
+
+    _warmup_rocm_skinny_gemm_workspace()
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
