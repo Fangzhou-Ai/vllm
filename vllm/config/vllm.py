@@ -1060,6 +1060,17 @@ class VllmConfig:
             and self.parallel_config.enable_dbo
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
+        # DSpark runs a second DP-synchronised dispatch of its own inside
+        # propose(). Under async scheduling the ranks are already a step apart,
+        # and the combination wedges the GPU part-way through a run: the workers
+        # all return to their busy loop while a kernel on the main stream never
+        # completes. Reproduced on DP2xTP4 + EP with the draft in both PIECEWISE
+        # and full cudagraphs; single-DP DSpark is unaffected.
+        uses_dp_dspark = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+            and self.parallel_config.data_parallel_size > 1
+        )
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
@@ -1070,6 +1081,12 @@ class VllmConfig:
                     "Async scheduling is not compatible with ROCm DeepEP "
                     "high-throughput DBO. Please use --no-async-scheduling or "
                     "select a different all2all backend."
+                )
+            if uses_dp_dspark:
+                raise ValueError(
+                    "Async scheduling is not compatible with DSpark speculative "
+                    "decoding under data parallelism. Please use "
+                    "--no-async-scheduling."
                 )
             if self.speculative_config is not None:
                 if (
@@ -1130,6 +1147,12 @@ class VllmConfig:
                     "Async scheduling will be disabled because it is not supported "
                     "with the `%s` distributed executor backend. ",
                     executor_backend,
+                )
+                self.scheduler_config.async_scheduling = False
+            elif uses_dp_dspark:
+                logger.warning_once(
+                    "Async scheduling is disabled for DSpark speculative decoding "
+                    "under data parallelism because that combination hangs."
                 )
                 self.scheduler_config.async_scheduling = False
             elif uses_rocm_deepep_ht_dbo:
