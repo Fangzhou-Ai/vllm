@@ -30,6 +30,19 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# The hybrid KV-cache grouping splits same-spec MLA layers across several
+# groups (K3: 24 layers -> 5 groups, because group_size is the smallest layer
+# bucket in the model). Each group gets its own metadata builder, and each one
+# recomputes byte-identical decode metadata every step -- the inputs are
+# qo_indptr / paged_kv_indptr / paged_kv_last_page_len, which depend only on
+# sequence lengths and page size, never on the group's block table.
+#
+# Buffers are sized from max_num_reqs / qlen / head count / dtypes, so groups
+# sharing a spec size them identically: hand them one allocation and let the
+# first builder of a step fill it.
+_MLA_WORK_BUFFERS: dict[tuple, tuple] = {}
+_MLA_WORK_LAST_KEY: dict[int, tuple] = {}
+
 
 @functools.lru_cache(maxsize=1)
 def _get_mla_gluon():
@@ -333,26 +346,44 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             is_sparse=False,
             fast_mode=True,
         )
-        self._mla_work_meta_data = torch.empty(
-            work_meta_data_size, dtype=work_meta_data_type, device=device
-        )
-        self._mla_work_indptr = torch.empty(
-            work_indptr_size, dtype=work_indptr_type, device=device
-        )
-        self._mla_work_info_set = torch.empty(
-            work_info_set_size, dtype=work_info_set_type, device=device
-        )
-        self._mla_reduce_indptr = torch.empty(
-            reduce_indptr_size, dtype=reduce_indptr_type, device=device
-        )
-        self._mla_reduce_final_map = torch.empty(
-            reduce_final_map_size, dtype=reduce_final_map_type, device=device
-        )
-        self._mla_reduce_partial_map = torch.empty(
+        _spec = (
+            device,
+            work_meta_data_size,
+            work_meta_data_type,
+            work_indptr_size,
+            work_indptr_type,
+            work_info_set_size,
+            work_info_set_type,
+            reduce_indptr_size,
+            reduce_indptr_type,
+            reduce_final_map_size,
+            reduce_final_map_type,
             reduce_partial_map_size,
-            dtype=reduce_partial_map_type,
-            device=device,
+            reduce_partial_map_type,
         )
+        _buf = _MLA_WORK_BUFFERS.get(_spec)
+        if _buf is None:
+            _buf = tuple(
+                torch.empty(sz, dtype=dt, device=device)
+                for sz, dt in (
+                    (work_meta_data_size, work_meta_data_type),
+                    (work_indptr_size, work_indptr_type),
+                    (work_info_set_size, work_info_set_type),
+                    (reduce_indptr_size, reduce_indptr_type),
+                    (reduce_final_map_size, reduce_final_map_type),
+                    (reduce_partial_map_size, reduce_partial_map_type),
+                )
+            )
+            _MLA_WORK_BUFFERS[_spec] = _buf
+        self._mla_work_spec = _spec
+        (
+            self._mla_work_meta_data,
+            self._mla_work_indptr,
+            self._mla_work_info_set,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+        ) = _buf
 
         # Dispatched on v_head_dim: the output is viewed as
         # [total_q, nhead, v_head_dim] where the reduce kernel is called.
@@ -695,27 +726,40 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             uni_qo_len = (
                 max_qo_len if pad_uniform_mtp or torch.all(qo_len == max_qo_len) else -1
             )
-            get_mla_metadata_v1(
-                qo_indptr,
-                paged_kv_indptr,
-                paged_kv_last_page_len,
+            from vllm.v1.worker.gpu.attn_utils import current_build_epoch
+
+            _key = (
+                current_build_epoch(),
+                num_reqs,
+                int(max_qo_len),
+                int(uni_qo_len),
                 self._num_attention_heads,
-                1,
-                True,
-                self._mla_work_meta_data,
-                self._mla_work_info_set,
-                self._mla_work_indptr,
-                self._mla_reduce_indptr,
-                self._mla_reduce_final_map,
-                self._mla_reduce_partial_map,
-                page_size=1,
-                kv_granularity=16,
-                max_seqlen_qo=max_qo_len,
-                uni_seqlen_qo=uni_qo_len,
-                fast_mode=True,
-                dtype_q=self._mla_q_dtype,
-                dtype_kv=self._mla_kv_dtype,
             )
+            _slot = id(self._mla_work_meta_data)
+            _hit = _MLA_WORK_LAST_KEY.get(_slot) == _key
+            _MLA_WORK_LAST_KEY[_slot] = _key
+            if not _hit:
+                get_mla_metadata_v1(
+                    qo_indptr,
+                    paged_kv_indptr,
+                    paged_kv_last_page_len,
+                    self._num_attention_heads,
+                    1,
+                    True,
+                    self._mla_work_meta_data,
+                    self._mla_work_info_set,
+                    self._mla_work_indptr,
+                    self._mla_reduce_indptr,
+                    self._mla_reduce_final_map,
+                    self._mla_reduce_partial_map,
+                    page_size=1,
+                    kv_granularity=16,
+                    max_seqlen_qo=max_qo_len,
+                    uni_seqlen_qo=uni_qo_len,
+                    fast_mode=True,
+                    dtype_q=self._mla_q_dtype,
+                    dtype_kv=self._mla_kv_dtype,
+                )
             has_persistent_metadata = True
 
         attn_metadata = AiterMLADecodeMetadata(

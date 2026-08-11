@@ -497,6 +497,19 @@ def build_slot_mappings_by_layer(
     return slot_mappings_by_layer
 
 
+_BUILD_EPOCH = 0
+
+
+def current_build_epoch() -> int:
+    """Monotonic id of the current build_attn_metadata call.
+
+    Same-spec attention groups are built inside one call and see identical
+    per-request inputs, so a builder can use this to tell "another group in
+    this step already did the work" from "a new step".
+    """
+    return _BUILD_EPOCH
+
+
 def build_attn_metadata(
     attn_groups: list[list[AttentionGroup]],
     num_reqs: int,
@@ -519,6 +532,8 @@ def build_attn_metadata(
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
 ) -> dict[str, Any]:
+    global _BUILD_EPOCH
+    _BUILD_EPOCH += 1
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
