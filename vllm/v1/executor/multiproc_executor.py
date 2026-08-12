@@ -63,7 +63,6 @@ from vllm.utils.system_utils import (
 from vllm.utils.torch_utils import (
     OMP_NUM_THREADS_SET_BY_VLLM,
     set_torch_threads_for_runtime,
-    startup_omp_num_threads,
 )
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
@@ -1083,12 +1082,10 @@ def set_multiprocessing_worker_envs(local_world_size: int = 1):
     if current_platform.is_cpu() or "OMP_NUM_THREADS" in os.environ:
         return
 
-    # Choose the workers' thread count here, before they start, since a worker
-    # must not set its own: `torch.set_num_threads()` spawns the thread pool
-    # eagerly, and doing that part way through a worker's startup either races
-    # the dlopen of shared objects or, in a forked worker, deadlocks (libgomp
-    # is not fork-safe).
-    num_threads = startup_omp_num_threads(local_world_size)
+    # Set the workers' thread count here, before they start. More than one
+    # intra-op thread per worker can amplify page faults when workers load the
+    # same memory-mapped checkpoint concurrently.
+    num_threads = 1
     os.environ["OMP_NUM_THREADS"] = str(num_threads)
     os.environ[OMP_NUM_THREADS_SET_BY_VLLM] = "1"
 
