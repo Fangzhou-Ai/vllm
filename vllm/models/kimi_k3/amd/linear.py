@@ -65,6 +65,8 @@ from vllm.models.kimi_k3.amd.ops.attn_res import attn_res
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.math_utils import cdiv
+from vllm.utils.multi_stream_utils import maybe_execute_in_parallel
+from vllm.utils.torch_utils import aux_stream, direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -158,6 +160,54 @@ def _apply_attn_res(
         norm.variance_epsilon,
         0.0 if output_norm is None else output_norm.variance_epsilon,
     )
+
+
+_ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD = 256
+
+# Keyed by layer prefix so the custom op below can reach the KimiMoE module.
+# The overlap must sit behind a custom op: Dynamo would otherwise specialise
+# the token-count branch at trace time (compilation sees a prefill-sized batch,
+# so the aux stream would never be selected at decode) and torch has no fake
+# impl for the streams::* ops it would capture.
+_MOE_LAYERS: dict[str, "KimiMoE"] = {}
+
+
+def _gate_down_overlap(
+    hidden_states: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = _MOE_LAYERS[layer_name]
+    num_tokens = hidden_states.shape[0]
+    (router_logits, _), (routed_hidden_states, _) = maybe_execute_in_parallel(
+        lambda: layer.gate(hidden_states),
+        lambda: layer.routed_expert_down_proj(hidden_states),
+        layer._down_proj_events[0],
+        layer._down_proj_events[1],
+        layer._down_proj_stream
+        if num_tokens <= _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD
+        else None,
+    )
+    return router_logits, routed_hidden_states
+
+
+def _gate_down_overlap_fake(
+    hidden_states: torch.Tensor, layer_name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = _MOE_LAYERS[layer_name]
+    num_tokens = hidden_states.shape[0]
+    return (
+        hidden_states.new_empty(
+            (num_tokens, layer.gate.output_size), dtype=layer.gate.out_dtype
+        ),
+        hidden_states.new_empty((num_tokens, layer.moe_hidden_size)),
+    )
+
+
+direct_register_custom_op(
+    op_name="kimi_k3_gate_down_overlap",
+    op_func=_gate_down_overlap,
+    mutates_args=[],
+    fake_impl=_gate_down_overlap_fake,
+)
 
 
 class KimiMoE(nn.Module):
@@ -262,6 +312,12 @@ class KimiMoE(nn.Module):
             self.routed_output_transform = KimiRoutedOutputTransform(
                 self.routed_expert_norm, self.routed_expert_up_proj
             )
+            # Auxiliary stream used to overlap the router gate with the routed
+            # down projection on decode-sized batches.
+            self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
+            self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
+            self.layer_name = prefix
+            _MOE_LAYERS[prefix] = self
         else:
             self.routed_expert_down_proj = None
             self.routed_expert_norm = None
@@ -305,9 +361,28 @@ class KimiMoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_size)
-        router_logits, _ = self.gate(hidden_states)
+
+        down_proj = self.routed_expert_down_proj
+        if down_proj is None:
+            router_logits, _ = self.gate(hidden_states)
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+            return final_hidden_states.view(num_tokens, hidden_size)
+
+        # The gate and the routed down projection read the same input and do
+        # not depend on each other, so a decode-sized batch runs them on two
+        # streams. Above the threshold one stream already saturates the device
+        # and the second only adds synchronisation.
+        router_logits, routed_hidden_states = (
+            torch.ops.vllm.kimi_k3_gate_down_overlap(hidden_states, self.layer_name)
+        )
+        # Passing shared_experts_input tells the runner the routed input
+        # transform has already been applied.
         final_hidden_states = self.experts(
-            hidden_states=hidden_states, router_logits=router_logits
+            hidden_states=routed_hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=hidden_states,
         )
         return final_hidden_states.view(num_tokens, hidden_size)
 
