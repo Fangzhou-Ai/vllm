@@ -133,10 +133,14 @@ struct kargs
     float output_scale;
 };
 
-struct traits
+// Two row-tile widths.  Cost is set by the padded tile and the single KV pass,
+// not by the real row count, so a shape that only fills half a 128-row tile
+// pays for the empty half; the 64-row tile is 1.21x whenever nhead*qlen fits.
+template <int QSUB>
+struct traits_t
 {
     static constexpr int Q_TILE = 16;
-    static constexpr int Q_SUB = VLLM_K3_H40_Q_SUB;
+    static constexpr int Q_SUB = QSUB;
     static constexpr int NUM_WARPS = 4;
     static constexpr int WARP_SIZE = 64;
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -172,12 +176,23 @@ struct traits
         <= SMEM_BYTES);
 };
 
+using traits = traits_t<VLLM_K3_H40_Q_SUB>;
+using traits_wide = traits_t<2>;
+using traits_narrow = traits_t<1>;
+
 __host__ __device__ inline int ceil_div(int a, int b)
 {
     return (a + b - 1) / b;
 }
 
-__global__ void partial_kernel(kargs args);
+template <int QSUB> __global__ void partial_kernel(kargs args);
+
+// The real body is compiled only for gfx950 device code.  A template needs a
+// visible definition in the HOST pass too, or hipcc emits no launch stub for
+// the instantiation (a non-template gets one from the declaration alone).
+#if !defined(__HIP_DEVICE_COMPILE__)
+template <int QSUB> __global__ void partial_kernel(kargs) {}
+#endif
 __global__ void reduce_kernel(kargs args);
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
@@ -251,12 +266,13 @@ __device__ inline void lds_barrier()
 
 } // namespace device
 
-__global__ __launch_bounds__(traits::BLOCK_SIZE, 1)
+template <int QSUB>
+__global__ __launch_bounds__(traits_t<QSUB>::BLOCK_SIZE, 1)
 void partial_kernel(kargs args)
 {
     using namespace opus;
     using namespace device;
-    using T = traits;
+    using T = traits_t<QSUB>;
 
     const int req = (int)__builtin_amdgcn_workgroup_id_x();
     const int h_block = (int)__builtin_amdgcn_workgroup_id_y();
@@ -734,6 +750,12 @@ void partial_kernel(kargs args)
     }
 }
 
+// The launch sites live in host code, so the device pass never implicitly
+// instantiates these; without an explicit instantiation the device binary has
+// no symbol and the launch fails at run time.
+template __global__ void partial_kernel<1>(kargs);
+template __global__ void partial_kernel<2>(kargs);
+
 __global__ __launch_bounds__(VLLM_K3_H40_REDUCE_THREADS, 1)
 void reduce_kernel(kargs args)
 {
@@ -907,11 +929,18 @@ void kimi_k3_h40_draft_mla_decode(
       static_cast<torch::stable::accelerator::DeviceIndex>(q.get_device()));
   hipStream_t const stream = vllm_current_hip_stream(q.get_device());
 
+  // The narrow tile halves the MFMA when the rows fit; above it a second KV
+  // pass would cost far more than the padding it saves.
+  bool const narrow = args.valid_rows <= traits_narrow::HEADS_PER_BLOCK;
+  int const hpb = narrow ? traits_narrow::HEADS_PER_BLOCK
+                         : traits_wide::HEADS_PER_BLOCK;
   dim3 const grid(static_cast<unsigned>(num_reqs),
-                  static_cast<unsigned>(ceil_div(args.valid_rows,
-                                                 T::HEADS_PER_BLOCK)),
+                  static_cast<unsigned>(ceil_div(args.valid_rows, hpb)),
                   static_cast<unsigned>(num_splits));
-  partial_kernel<<<grid, dim3(T::BLOCK_SIZE), 0, stream>>>(args);
+  if (narrow)
+    partial_kernel<1><<<grid, dim3(T::BLOCK_SIZE), 0, stream>>>(args);
+  else
+    partial_kernel<2><<<grid, dim3(T::BLOCK_SIZE), 0, stream>>>(args);
   reduce_kernel<<<dim3(static_cast<unsigned>(num_reqs * rows)),
                   dim3(VLLM_K3_H40_REDUCE_THREADS), 0, stream>>>(args);
 }

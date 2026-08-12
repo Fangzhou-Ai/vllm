@@ -62,7 +62,11 @@ def h40_draft_mla_decode(
 
     num_heads = q.size(1)
     rows = num_heads * query_len
-    blocks = -(-rows // KV_TILE)
+    # Mirror the kernel's row-tile choice: it drops to a 64-row tile when the
+    # rows fit, which halves the MFMA. The split count and the workspace are
+    # sized from the resulting block count, so the two must agree.
+    row_tile = 64 if rows <= 64 else 128
+    blocks = -(-rows // row_tile)
     # One workgroup per CU for exactly one round. Derived from shapes only, so
     # it stays correct under CUDA graph capture.
     num_splits = max(1, _NUM_CU // (num_reqs * blocks))
