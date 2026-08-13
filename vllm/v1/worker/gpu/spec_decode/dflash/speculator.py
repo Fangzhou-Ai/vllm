@@ -300,6 +300,34 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     @torch.inference_mode()
+    def _draft_tokens_across_dp(
+        self,
+        target_tokens_across_dp: torch.Tensor | None,
+        num_query_tokens: int,
+    ) -> torch.Tensor | None:
+        """Per-rank draft token counts, without a collective.
+
+        The forward context asserts that our own entry matches the local batch
+        and all-reduces the tensor itself when it is None, so it has to be
+        supplied. Every request contributes num_query_per_req draft tokens
+        against query_len target tokens, so the target's counts rescale
+        exactly for a uniform decode batch; the local entry is written
+        directly and is the only one the draft reads.
+        """
+        if self.dp_size == 1:
+            return None
+        if target_tokens_across_dp is None:
+            out = torch.full(
+                (self.dp_size,), num_query_tokens, dtype=torch.int32, device='cpu'
+            )
+        else:
+            query_len = self.num_speculative_steps + 1
+            out = (
+                target_tokens_across_dp.to(torch.int32) * self.num_query_per_req
+            ) // query_len
+        out[self.dp_rank] = num_query_tokens
+        return out
+
     def propose(
         self,
         input_batch: InputBatch,
@@ -420,15 +448,22 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
-        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs.
+        # The draft is dense: nothing in its forward crosses the DP boundary, so each
+        # replica may pick its own graph and no DP barrier is needed here. A barrier at
+        # this point deadlocks against async scheduling, which runs the ranks a step
+        # apart. dp_size=1 selects the local dispatch inside dispatch_cg_and_sync_dp.
+        batch_desc, _ = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
             num_query_tokens,
             uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
+            dp_size=1,
+            dp_rank=0,
             need_eager=is_profile,
+        )
+        num_tokens_across_dp = self._draft_tokens_across_dp(
+            num_tokens_across_dp, num_query_tokens
         )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
