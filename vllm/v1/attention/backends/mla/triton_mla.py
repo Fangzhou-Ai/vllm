@@ -309,6 +309,28 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         folded_rows = 0
         if not attn_metadata.causal and query_len > 1:
             folded_rows = attn_metadata.num_decodes * query_len
+            # gfx950 can serve the folded block with a single KV pass instead of
+            # one per head tile. No flag: the call screens its own shapes and
+            # returns False on anything it cannot serve, so control falls
+            # through to the Triton path below unchanged.
+            from vllm.v1.attention.ops.rocm_aiter_dspark_draft_mla import (
+                dspark_draft_mla_decode,
+            )
+
+            if dspark_draft_mla_decode(
+                q,
+                kv_c_and_k_pe_cache,
+                o,
+                attn_metadata.decode.block_table[: attn_metadata.num_decodes],
+                attn_metadata.decode.seq_lens[: attn_metadata.num_decodes],
+                query_len,
+                self.scale,
+                layer._q_scale,
+                layer._k_scale,
+            ):
+                # The folded kernel produces no LSE; the DSpark draft path does
+                # not consume one.
+                return o, None
 
         # For batch invariance, use only 1 split to ensure deterministic reduction
         if envs.VLLM_BATCH_INVARIANT:
