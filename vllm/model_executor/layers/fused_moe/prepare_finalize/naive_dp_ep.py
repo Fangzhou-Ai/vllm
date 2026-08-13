@@ -204,9 +204,13 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             apply_router_weight_on_input=apply_router_weight_on_input,
         )
 
-        output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+        combined = get_ep_group().combine(
+            out, is_sequence_parallel=self.is_sequence_parallel, out=output
         )
+        # combine() writes into `output` when the backend honours `out=`;
+        # any backend that ignores it still returns a fresh tensor.
+        if combined.data_ptr() != output.data_ptr():
+            output.copy_(combined)
 
 
 class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolithic):

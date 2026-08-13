@@ -136,7 +136,10 @@ class AgRsAll2AllManager(All2AllManagerBase):
         return hidden_states, topk_weights, topk_ids, gathered_tensors[3:]
 
     def combine(
-        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Reduce-scatter hidden_states across all dp ranks.
@@ -146,7 +149,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
             hidden_states.shape[0] // dist_group.world_size,
             dist_group,
         )
-        hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+        hidden_states = dist_group.reduce_scatterv(
+            hidden_states, dim=0, sizes=sizes, out=out
+        )
         return hidden_states
 
     def destroy(self):
