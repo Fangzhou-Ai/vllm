@@ -80,7 +80,7 @@ class GDNAttentionMetadata:
     token_chunk_offset_ptr: torch.Tensor | None = None
 
 
-_REQ_LEVEL_CACHE: dict[int, tuple] = {}
+_REQ_LEVEL_CACHE: dict[tuple, tuple] = {}
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):
@@ -194,7 +194,8 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # call and see identical per-request inputs; only the block-table
         # slices below differ. Compute the request-level part once per step.
         _epoch = current_build_epoch()
-        _rl = _REQ_LEVEL_CACHE.get(id(self.__class__))
+        _ck = (id(type(self)), self.num_spec, self.use_spec_decode)
+        _rl = _REQ_LEVEL_CACHE.get(_ck)
         if _rl is not None and _rl[0] == _epoch:
             (
                 spec_sequence_masks,
@@ -353,7 +354,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
                 assert num_accepted_tokens is not None
                 num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
-            _REQ_LEVEL_CACHE[id(self.__class__)] = (
+            _REQ_LEVEL_CACHE[_ck] = (
                 _epoch,
                 (
                     spec_sequence_masks,

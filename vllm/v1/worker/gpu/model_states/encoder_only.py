@@ -185,6 +185,9 @@ class EncoderOnlyModelState(DefaultModelState):
         cudagraph_mode: CUDAGraphMode,
         for_capture: bool,
     ) -> dict[str, Any]:
+        from vllm.v1.worker.gpu.attn_utils import advance_build_epoch
+
+        advance_build_epoch()
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding

@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 # sharing a spec size them identically: hand them one allocation and let the
 # first builder of a step fill it.
 _MLA_WORK_BUFFERS: dict[tuple, tuple] = {}
-_MLA_WORK_LAST_KEY: dict[int, tuple] = {}
+_MLA_WORK_LAST_KEY: dict[tuple, tuple] = {}
 
 
 @functools.lru_cache(maxsize=1)
@@ -735,7 +735,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
                 int(uni_qo_len),
                 self._num_attention_heads,
             )
-            _slot = id(self._mla_work_meta_data)
+            _slot = self._mla_work_spec
             _hit = _MLA_WORK_LAST_KEY.get(_slot) == _key
             _MLA_WORK_LAST_KEY[_slot] = _key
             if not _hit:

@@ -2300,6 +2300,9 @@ class GPUModelRunner(
         Returns:
             tuple[attn_metadata, spec_decode_common_attn_metadata]
         """
+        from vllm.v1.worker.gpu.attn_utils import advance_build_epoch
+
+        advance_build_epoch()
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, None

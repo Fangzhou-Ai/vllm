@@ -501,13 +501,20 @@ _BUILD_EPOCH = 0
 
 
 def current_build_epoch() -> int:
-    """Monotonic id of the current build_attn_metadata call.
+    """Monotonic id of the current round of attention-metadata builds.
 
-    Same-spec attention groups are built inside one call and see identical
+    Same-spec attention groups are built inside one round and see identical
     per-request inputs, so a builder can use this to tell "another group in
-    this step already did the work" from "a new step".
+    this round already did the work" from "a new round". Every entry point
+    that starts a round must call `advance_build_epoch()` first, or a builder
+    keyed on this keeps returning the first round's answer forever.
     """
     return _BUILD_EPOCH
+
+
+def advance_build_epoch() -> None:
+    global _BUILD_EPOCH
+    _BUILD_EPOCH += 1
 
 
 def build_attn_metadata(
@@ -532,8 +539,7 @@ def build_attn_metadata(
     causal: bool | torch.Tensor | Mapping[int, bool] = True,
     rswa_prefix_lens: torch.Tensor | None = None,
 ) -> dict[str, Any]:
-    global _BUILD_EPOCH
-    _BUILD_EPOCH += 1
+    advance_build_epoch()
     seq_lens = seq_lens[:num_reqs]
     if dcp_local_seq_lens is not None:
         dcp_local_seq_lens = dcp_local_seq_lens[:num_reqs]
