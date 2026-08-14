@@ -1061,6 +1061,17 @@ class VllmConfig:
             and self.parallel_config.all2all_backend == "deepep_high_throughput"
         )
 
+        # A DSpark draft with experts keeps its DP barrier (the all2all sizes
+        # itself from the synced token counts), and that barrier deadlocks against
+        # async scheduling, which runs the replicas a step apart. A dense draft
+        # dispatches locally and is unaffected.
+        uses_dp_dspark_moe = (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+            and self.parallel_config.data_parallel_size > 1
+            and draft_config_has_experts(self.speculative_config)
+        )
+
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
             # Currently, async scheduling only support eagle speculative
@@ -1070,6 +1081,11 @@ class VllmConfig:
                     "Async scheduling is not compatible with ROCm DeepEP "
                     "high-throughput DBO. Please use --no-async-scheduling or "
                     "select a different all2all backend."
+                )
+            if uses_dp_dspark_moe:
+                raise ValueError(
+                    "Async scheduling is not compatible with a DSpark draft that has "
+                    "experts under data parallelism. Please use --no-async-scheduling."
                 )
             if self.speculative_config is not None:
                 if (
@@ -1130,6 +1146,12 @@ class VllmConfig:
                     "Async scheduling will be disabled because it is not supported "
                     "with the `%s` distributed executor backend. ",
                     executor_backend,
+                )
+                self.scheduler_config.async_scheduling = False
+            elif uses_dp_dspark_moe:
+                logger.warning_once(
+                    "Async scheduling is disabled for a DSpark draft with experts "
+                    "under data parallelism because that combination hangs."
                 )
                 self.scheduler_config.async_scheduling = False
             elif uses_rocm_deepep_ht_dbo:
@@ -2474,3 +2496,20 @@ def get_layers_from_vllm_config(
         for layer_name in layer_names
         if isinstance(layer := forward_context.get(layer_name), layer_type)
     }
+
+
+def draft_config_has_experts(speculative_config) -> bool:
+    """Best-effort check for experts in the draft, from its config alone.
+
+    Runs before the draft is built, so it can only read the checkpoint config;
+    the speculator re-derives this from the loaded modules for its own use.
+    """
+    draft = getattr(speculative_config, "draft_model_config", None)
+    hf_config = getattr(draft, "hf_config", None)
+    if hf_config is None:
+        return False
+    for attr in ("n_routed_experts", "num_experts", "num_local_experts"):
+        value = getattr(hf_config, attr, None)
+        if isinstance(value, int) and value > 0:
+            return True
+    return False
