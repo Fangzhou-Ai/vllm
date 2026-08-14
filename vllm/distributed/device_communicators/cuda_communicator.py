@@ -459,6 +459,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and out.dtype == input_tensor.dtype
                 and out.device == input_tensor.device
                 and out.is_contiguous()
+                # NCCL cannot reduce-scatter in place across overlapping buffers.
+                and out.data_ptr() != input_tensor.data_ptr()
             ):
                 output = out
             else:
