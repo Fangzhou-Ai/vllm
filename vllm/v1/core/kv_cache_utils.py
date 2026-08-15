@@ -1254,6 +1254,19 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    # The uniform group size is the smallest bucket, so one small bucket (a
+    # 5-layer speculative drafter next to 24 full-attention and 69 linear
+    # layers) splits the large ones into many groups, and every group rebuilds
+    # its own attention metadata each step. Override when that trade is wrong.
+    override = os.environ.get("VLLM_KV_GROUP_SIZE")
+    if override:
+        group_size = int(override)
+    logger.info(
+        "KV cache layer buckets %s, group_size %d",
+        [len(layers) for layers in layer_buckets],
+        group_size,
+    )
+
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
