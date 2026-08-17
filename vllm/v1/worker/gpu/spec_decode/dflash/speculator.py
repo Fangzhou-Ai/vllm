@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
+import functools
+
 import torch
 import torch.nn as nn
 
@@ -299,6 +301,24 @@ class DFlashSpeculator(DraftModelSpeculator):
             query_start_loc_np=query_start_loc_np,
         )
 
+    @functools.cached_property
+    def draft_needs_dp_sync(self) -> bool:
+        """Whether the draft issues a collective that spans the DP replicas.
+
+        Experts are the only thing in a draft that does: the all2all sizes its
+        exchange from num_tokens_across_dp, so every replica has to arrive with
+        the same padded count. A dense draft has no such constraint and can
+        dispatch its cudagraph locally.
+
+        Read from the draft config, not the built modules, so that this agrees
+        with the async-scheduling gate in `VllmConfig.__post_init__`, which has
+        to decide before the draft exists. The two disagreeing would either
+        deadlock the barrier or size the all2all from counts nobody synced.
+        """
+        from vllm.config.vllm import draft_config_has_experts
+
+        return draft_config_has_experts(self.vllm_config.speculative_config)
+
     @torch.inference_mode()
     def propose(
         self,
@@ -420,16 +440,35 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
-        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
+        # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs.
+        #
+        # A dense draft issues no collective across the DP boundary, so each replica may
+        # pick its own graph and the barrier inside dispatch_cg_and_sync_dp is pure cost
+        # -- and it deadlocks against async scheduling, which runs the ranks a step
+        # apart. A draft with experts must keep it: its all2all sizes the exchange from
+        # num_tokens_across_dp, so the replicas have to agree on one padded count.
+        skip_dp_barrier = self.dp_size == 1 or not self.draft_needs_dp_sync
         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
             num_query_tokens,
             uniform_token_count=self.num_query_per_req,
-            dp_size=self.dp_size,
-            dp_rank=self.dp_rank,
+            dp_size=1 if skip_dp_barrier else self.dp_size,
+            dp_rank=0 if skip_dp_barrier else self.dp_rank,
             need_eager=is_profile,
         )
+        if skip_dp_barrier and self.dp_size > 1:
+            # set_forward_context asserts our own entry equals the batch we are about
+            # to run, and all-reduces the tensor itself when it is None. The synced
+            # path fills every entry with the padded count (gpu/dp_utils.py); match
+            # that, because the padded count is what _generate_draft passes as the
+            # batch size and an unpadded entry trips the assert under PIECEWISE.
+            num_tokens_across_dp = torch.full(
+                (self.dp_size,),
+                batch_desc.num_tokens,
+                dtype=torch.int32,
+                device="cpu",
+            )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens

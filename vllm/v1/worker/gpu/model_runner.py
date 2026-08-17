@@ -200,6 +200,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Speculative decoding.
         self.speculator = None
+        # Set per step by execute_model; the drafter reuses it instead of
+        # synchronising across DP a second time.
+        self._num_tokens_across_dp: torch.Tensor | None = None
         self.use_aux_hidden_state_outputs = False
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
@@ -1257,6 +1260,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             need_eager=is_profile or skip_compiled,
             num_active_loras=num_active_loras,
         )
+        # The draft reuses this instead of synchronising a second time.
+        self._num_tokens_across_dp = num_tokens_across_dp
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
@@ -1581,6 +1586,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.req_states.next_prefill_tokens,
                 self.sampler.sampling_states.temperature.gpu,
                 self.sampler.sampling_states.seeds.gpu,
+                num_tokens_across_dp=self._num_tokens_across_dp,
                 mm_inputs=mm_inputs,
             )
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
