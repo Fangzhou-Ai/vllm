@@ -62,9 +62,18 @@ class GateLinear(ReplicatedLinear):
             current_platform.is_cuda() and (is_hopper or is_blackwell) and not bias
         )
 
+        # hipBLASLt takes bf16 in and fp32 out, so ROCm can fold the logit cast
+        # into the GEMM epilogue the way tier 5 does. It has none of the other
+        # specialized kernels below, hence a separate predicate.
+        can_use_bf16_fp32_mm = (
+            current_platform.is_rocm() and not bias and out_dtype == torch.float32
+        )
+
         # If fp32 compute is required and no specialized kernel is available,
         # store weights in fp32 so the fallback linear path computes in fp32.
-        if force_fp32_compute and not can_use_specialized_kernels:
+        if force_fp32_compute and not (
+            can_use_specialized_kernels or can_use_bf16_fp32_mm
+        ):
             params_dtype = torch.float32
 
         super().__init__(
@@ -114,9 +123,9 @@ class GateLinear(ReplicatedLinear):
         if self.allow_bf16x3_router_gemm:
             logger.info_once("Enabled experimental SM100 BF16x3 router GEMM.")
 
-        # cuBLAS bf16→fp32 eligibility
+        # cuBLAS / hipBLASLt bf16 -> fp32 eligibility
         self.allow_cublas_router_gemm = (
-            self.allow_specialized_router_gemm
+            (self.allow_specialized_router_gemm or can_use_bf16_fp32_mm)
             and self.weight.dtype == torch.bfloat16
             and self.out_dtype == torch.float32
         )
