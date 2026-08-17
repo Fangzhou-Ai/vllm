@@ -36,7 +36,10 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_dcp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import (
@@ -59,6 +62,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
@@ -305,10 +309,15 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
 
         vllm_config = get_current_vllm_config()
         parallel_config = vllm_config.parallel_config
-        assert (
-            parallel_config.decode_context_parallel_size <= 1
-            and parallel_config.prefill_context_parallel_size <= 1
-        ), "Kimi-K3 MultiHeadLatentAttention does not support context parallelism."
+        # Decode context parallelism is served below by all-gathering the query
+        # heads and merging the per-rank partials by lse. Prefill context
+        # parallelism is not: _forward_prefill_fused reads the context straight
+        # out of this rank's cache shard, with no cross-rank gather.
+        assert parallel_config.prefill_context_parallel_size <= 1, (
+            "Kimi-K3 MultiHeadLatentAttention does not support prefill context "
+            "parallelism."
+        )
+        self.dcp_world_size = parallel_config.decode_context_parallel_size
         self.prefill_backend = get_mla_prefill_backend(vllm_config)(
             num_heads=self.num_local_heads,
             scale=self.scale,
@@ -579,9 +588,26 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 cos_sin_cache,
                 slot_mapping[:num_mqa_tokens],
             )
-            latent_out, _lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
+            if self.dcp_world_size > 1:
+                # Each rank holds a token shard of the KV, so every rank has to
+                # see every head to produce a partial for all of them.
+                mqa_q = get_dcp_group().all_gather(mqa_q, dim=1)
+            latent_out, lse = self.impl.forward_mqa(  # type: ignore[attr-defined]
                 mqa_q, self._attn_read_kv_cache(), attn_metadata, self
             )
+            if self.dcp_world_size > 1:
+                assert lse is not None, (
+                    "decode context parallelism needs the softmax lse to merge "
+                    "the per-rank shards; this MLA backend returned none"
+                )
+                # Merges the shards and reduce-scatters the heads back, so
+                # latent_out returns to this rank's own head slice.
+                latent_out = cp_lse_ag_out_rs(
+                    latent_out,
+                    lse,
+                    get_dcp_group(),
+                    is_lse_base_on_e=self.impl.lse_base_on_e,
+                )
             self._v_up_proj(latent_out, out=attn_out[:num_mqa_tokens])
 
     def _decode_concat_cache(

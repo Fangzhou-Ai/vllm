@@ -468,13 +468,16 @@ def _rocm_aiter_mla_decode_fwd_impl(
     reduce_indptr: torch.Tensor | None = None,
     reduce_final_map: torch.Tensor | None = None,
     reduce_partial_map: torch.Tensor | None = None,
+    attn_lse: torch.Tensor | None = None,
 ) -> None:
     from aiter.mla import mla_decode_fwd
 
-    kwargs: dict[str, float | torch.Tensor | None] = {
+    kwargs: dict[str, float | torch.Tensor | bool | None] = {
         "sm_scale": sm_scale,
         "logit_cap": logit_cap,
     }
+    if attn_lse is not None:
+        kwargs["return_lse"] = True
 
     # Only pass q_scale and kv_scale if the aiter library supports them
     if _check_aiter_mla_fp8_support():
@@ -504,7 +507,7 @@ def _rocm_aiter_mla_decode_fwd_impl(
         kwargs["reduce_final_map"] = reduce_final_map
         kwargs["reduce_partial_map"] = reduce_partial_map
 
-    mla_decode_fwd(
+    _, final_lse = mla_decode_fwd(
         q,
         kv_buffer.view(-1, 1, 1, q.shape[-1]),
         o,
@@ -515,6 +518,13 @@ def _rocm_aiter_mla_decode_fwd_impl(
         max_seqlen_qo,
         **kwargs,
     )
+    if attn_lse is not None:
+        # aiter allocates its own [total_q, num_heads] fp32 lse. Copy it into
+        # the caller's buffer so the address survives cudagraph replay.
+        assert final_lse is not None, (
+            "the installed aiter returned no lse despite return_lse=True"
+        )
+        attn_lse.copy_(final_lse.view_as(attn_lse))
 
 
 def _rocm_aiter_mla_decode_fwd_fake(
@@ -536,6 +546,7 @@ def _rocm_aiter_mla_decode_fwd_fake(
     reduce_indptr: torch.Tensor | None = None,
     reduce_final_map: torch.Tensor | None = None,
     reduce_partial_map: torch.Tensor | None = None,
+    attn_lse: torch.Tensor | None = None,
 ) -> None:
     pass
 
@@ -1956,7 +1967,7 @@ class rocm_aiter_ops:
             direct_register_custom_op(
                 op_name="rocm_aiter_mla_decode_fwd",
                 op_func=_rocm_aiter_mla_decode_fwd_impl,
-                mutates_args=["o"],
+                mutates_args=["o", "attn_lse"],
                 fake_impl=_rocm_aiter_mla_decode_fwd_fake,
             )
 
@@ -2457,6 +2468,7 @@ class rocm_aiter_ops:
         reduce_indptr: torch.Tensor | None = None,
         reduce_final_map: torch.Tensor | None = None,
         reduce_partial_map: torch.Tensor | None = None,
+        attn_lse: torch.Tensor | None = None,
     ):
         torch.ops.vllm.rocm_aiter_mla_decode_fwd(
             q,
@@ -2477,6 +2489,7 @@ class rocm_aiter_ops:
             reduce_indptr=reduce_indptr,
             reduce_final_map=reduce_final_map,
             reduce_partial_map=reduce_partial_map,
+            attn_lse=attn_lse,
         )
 
     @staticmethod
