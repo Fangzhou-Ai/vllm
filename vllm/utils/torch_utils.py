@@ -717,7 +717,13 @@ def aux_stream() -> torch.cuda.Stream | None:
     from vllm.platforms import current_platform
 
     if _aux_stream is None and current_platform.is_cuda_alike():
-        _aux_stream = torch.cuda.Stream()
+        # ROCm binds a stream to one of GPU_MAX_HW_QUEUES (4) hardware queues
+        # per priority, on first use. A decode worker opens far more streams
+        # than that, so at normal priority this one shares a queue with the
+        # main stream and the hardware runs the two in sequence. Its own
+        # priority pool gives it its own queue.
+        priority = -1 if current_platform.is_rocm() else 0
+        _aux_stream = torch.cuda.Stream(priority=priority)
 
     return _aux_stream
 
