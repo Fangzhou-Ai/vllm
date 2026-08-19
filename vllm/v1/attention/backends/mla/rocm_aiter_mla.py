@@ -23,6 +23,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonMetadataBuilder,
     QueryLenSupport,
 )
+from vllm.platforms.rocm import on_gfx950
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
@@ -131,6 +132,13 @@ class AiterMLABackend(MLACommonBackend):
     def get_builder_cls() -> type["AiterMLAMetadataBuilder"]:
         return AiterMLAMetadataBuilder
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # The DSpark draft block is non-causal: every query position attends to
+        # the same committed prefix and never to a sibling. forward_mqa serves
+        # it with the folded gfx950 kernel, which applies no intra-block mask.
+        return True
+
 
 @dataclass
 class AiterMLADecodeMetadata(MLACommonDecodeMetadata):
@@ -193,6 +201,9 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
     #  https://github.com/vllm-project/vllm/issues/22945
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.UNIFORM
+    # forward_mqa serves a non-causal DSpark block with the folded gfx950
+    # kernel, which reads the KV span once for the whole block.
+    supports_non_causal_multi_token_decode: ClassVar[bool] = True
 
     @staticmethod
     def _uniform_padded_mtp_qo_len(
@@ -246,6 +257,12 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         )
 
         self.compilation_config = vllm_config.compilation_config
+
+        if getattr(self, "non_causal_multi_token_decode", False):
+            # Only the non-causal DSpark draft group serves multi-token blocks
+            # through the decode path; admit the whole block as one decode.
+            self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
+            self._check_non_causal_decode_supported()
         self.decode_attn_out_dtype = vllm_config.model_config.dtype
         self.k3_verify_mla_enabled = self._k3_verify_mla_supported()
 
@@ -440,6 +457,38 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             return False
         logger.info("K3 verify MLA: serving the MTP verify block")
         return True
+
+    def _check_non_causal_decode_supported(self) -> None:
+        """Reject an unserveable non-causal group at startup, not mid-request.
+
+        A non-causal block has no fallback in this backend, and both candidates
+        fail silently rather than declining: the Gluon call site cannot pass a
+        KV dequant scale, and the assembly qlen>1 path masks causally. Either
+        would answer with wrong attention, so the folded kernel's preconditions
+        are checked once, here.
+        """
+        from vllm.v1.attention.ops.rocm_aiter_dspark_draft_mla import KV_TILE
+
+        spec = self.kv_cache_spec
+        # Not spec.dtype: an fp8 cache is allocated as uint8 and only viewed as
+        # fp8 at the call site, so the configured dtype is the one to test.
+        cache_dtype = getattr(self.vllm_config.cache_config, "cache_dtype", "auto")
+        reasons = []
+        if not on_gfx950():
+            reasons.append("the folded kernel is gfx950-only")
+        if cache_dtype not in ("fp8", "fp8_e4m3"):
+            reasons.append(f"it needs an fp8-e4m3 KV cache, got {cache_dtype!r}")
+        if spec.block_size % KV_TILE:
+            reasons.append(
+                f"it needs a block size that is a multiple of {KV_TILE}, "
+                f"got {spec.block_size}"
+            )
+        if reasons:
+            raise ValueError(
+                "ROCM_AITER_MLA cannot serve a non-causal multi-token decode "
+                "block here: " + "; ".join(reasons) + ". Set the draft "
+                'attention_backend to "TRITON_MLA" instead.'
+            )
 
     def _init_fp8_prefill_ps_buffers(
         self,
@@ -1195,6 +1244,47 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         decode = attn_metadata.decode
         assert decode.max_qo_len is not None
+        # Non-causal DSpark draft block. Keep it folded into a single workgroup
+        # tile so the KV span is read once, rather than once per query token as
+        # the per-row forms below would. The builder has already checked the
+        # preconditions, so a decline here is a bug, not a fallback.
+        if not attn_metadata.causal and int(decode.max_qo_len) > 1:
+            from vllm.v1.attention.ops.rocm_aiter_dspark_draft_mla import (
+                dspark_draft_mla_decode,
+            )
+
+            if type(q) is tuple:
+                q = torch.cat(q, dim=-1)
+            assert isinstance(q, torch.Tensor)
+            o = torch.zeros(
+                q.shape[0],
+                q.shape[1],
+                self.kv_lora_rank,
+                dtype=decode.attn_out_dtype,
+                device=q.device,
+            )
+            served = dspark_draft_mla_decode(
+                q,
+                kv_c_and_k_pe_cache,
+                o,
+                decode.block_table[: attn_metadata.num_decodes],
+                decode.seq_lens[: attn_metadata.num_decodes],
+                int(decode.max_qo_len),
+                attn_metadata.max_seq_len,
+                self.scale,
+                layer._q_scale,
+                layer._k_scale,
+            )
+            if not served:
+                raise RuntimeError(
+                    "The folded gfx950 MLA kernel declined a non-causal block "
+                    "that passed the builder's checks; refusing to fall back "
+                    "to a causal path."
+                )
+            # The folded kernel produces no LSE; the DSpark draft path does not
+            # consume one.
+            return o, None
+
         assert decode.paged_kv_indptr is not None
         assert decode.paged_kv_indices is not None
 
