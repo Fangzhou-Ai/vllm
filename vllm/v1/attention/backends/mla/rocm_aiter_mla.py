@@ -11,6 +11,10 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
+from vllm.v1.attention.ops.rocm_aiter_k3_verify_mla import (
+    can_serve as k3_verify_can_serve,
+    k3_verify_mla_decode,
+)
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonBackend,
     MLACommonDecodeMetadata,
@@ -164,6 +168,10 @@ class AiterMLAMetadata(MLACommonMetadata[AiterMLADecodeMetadata]):
     # AiterMLAMetadataBuilder._build_fp8_prefill_ps_metadata when prefill
     # tokens are present and FP8 MLA prefill is supported on the device.
     # Left as None on hosts/configs that fall back to flash_attn_varlen_func.
+    # Decided once by the builder (see _k3_verify_mla_supported) and carried
+    # here because forward_mqa runs on the Impl, not on the builder.
+    k3_verify_mla_enabled: bool = False
+
     fp8_prefill_qo_indptr: torch.Tensor | None = None
     fp8_prefill_kv_indptr: torch.Tensor | None = None
     fp8_prefill_kv_indices: torch.Tensor | None = None
@@ -239,6 +247,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
         self.compilation_config = vllm_config.compilation_config
         self.decode_attn_out_dtype = vllm_config.model_config.dtype
+        self.k3_verify_mla_enabled = self._k3_verify_mla_supported()
 
         # reorder_batch_threshold is the longest query decode can be handed:
         # anything longer is routed to prefill, MLACommonMetadataBuilder asserts
@@ -379,6 +388,58 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
             self.qo_indptr = torch.zeros(
                 max_num_reqs + 1, dtype=torch.int32, device=device
             )
+
+    def _k3_verify_mla_supported(self) -> bool:
+        """Decide once whether the folded verify kernel can serve this group.
+
+        Everything here is fixed for the life of the server, so re-deriving it
+        per call buys nothing and costs an output buffer that gets thrown away
+        on the calls it would decline. Unlike the non-causal draft group this
+        one has a fallback -- the padded assembly path -- so an unserveable
+        configuration is logged and skipped rather than raised.
+
+        Logging matters more than usual here: a per-call decline is silent, so
+        without this line there is no way to tell a deployment that is using
+        the kernel from one that is quietly falling back.
+        """
+        from vllm.platforms.rocm import on_gfx950
+        from vllm.v1.attention.ops.rocm_aiter_k3_verify_mla import (
+            KV_TILE,
+            enabled as _op_enabled,
+        )
+
+        spec = self.kv_cache_spec
+        # Not spec.dtype: an fp8 cache is allocated as uint8 and only viewed as
+        # fp8 at the call site, so the configured dtype is the one to test.
+        cache_dtype = getattr(self.vllm_config.cache_config, "cache_dtype", "auto")
+        reasons = []
+        if not _op_enabled():
+            reasons.append("VLLM_AITER_USE_K3_VERIFY_MLA is not set")
+        if not on_gfx950():
+            reasons.append("the folded kernel is gfx950-only")
+        if cache_dtype not in ("fp8", "fp8_e4m3"):
+            reasons.append(f"it needs an fp8-e4m3 KV cache, got {cache_dtype!r}")
+        if spec.block_size % KV_TILE:
+            reasons.append(
+                f"it needs a block size that is a multiple of {KV_TILE}, "
+                f"got {spec.block_size}"
+            )
+        # The output buffer is allocated at the call site with this dtype, and
+        # the kernel writes bf16. Checking it here is what lets the call site
+        # treat a served shape as served, with nothing left to test.
+        if self.decode_attn_out_dtype is not torch.bfloat16:
+            reasons.append(
+                f"it writes bf16 output, but the model dtype is "
+                f"{self.decode_attn_out_dtype}"
+            )
+        if reasons:
+            logger.info(
+                "K3 verify MLA: falling back to the padded assembly path (%s)",
+                "; ".join(reasons),
+            )
+            return False
+        logger.info("K3 verify MLA: serving the MTP verify block")
+        return True
 
     def _init_fp8_prefill_ps_buffers(
         self,
@@ -743,6 +804,7 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
         )
+        attn_metadata.k3_verify_mla_enabled = self.k3_verify_mla_enabled
         if (
             attn_metadata.decode is not None
             and attn_metadata.decode.has_persistent_metadata
@@ -1135,6 +1197,81 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         assert decode.max_qo_len is not None
         assert decode.paged_kv_indptr is not None
         assert decode.paged_kv_indices is not None
+
+        # The MTP verify block folds all query_len*nhead rows of a request into
+        # one workgroup tile and reads the KV span once, where the assembly
+        # kernel tiles by head and re-reads it. It also derives its work from
+        # the real row count, so it takes q at the rank's true head width --
+        # `get_mla_padded_q` further down widens 24 heads to the 32 the assembly
+        # kernel implements, which at query_len 6 is 192 rows against 144 real
+        # ones.
+        #
+        # Ahead of the narrow-head and Gluon branches on purpose: both return,
+        # so screening after them leaves a <16-head rank on the
+        # flatten-to-Gluon path with no way to reach this kernel at all. The
+        # causal test is what keeps it off the non-causal draft block -- that is
+        # a different kernel, and serving it here would mask it causally and
+        # answer with wrong attention rather than decline.
+        #
+        # Whether this can serve the group at all was decided once, in the
+        # builder; what is left per call is the shape. `k3_verify_mla_decode`
+        # fills the output and returns True, or touches nothing and returns
+        # False, in which case control falls through unchanged.
+        if (
+            attn_metadata.k3_verify_mla_enabled
+            and attn_metadata.causal
+            and int(decode.max_qo_len) > 1
+        ):
+            if type(q) is tuple:
+                # Safe ahead of the branches below: each of them splits a
+                # concatenated q rather than requiring the tuple.
+                q = torch.cat(q, dim=-1)
+            # Ask before allocating. The shape checks are the same either way,
+            # but the output buffer is only worth its zero_() once the answer
+            # is yes -- and a qlen that came back to 1, or a scale first seen
+            # mid-capture, makes the answer no often enough to matter.
+            if k3_verify_can_serve(
+                q,
+                kv_c_and_k_pe_cache.unsqueeze(2),
+                decode.block_table,
+                decode.seq_lens,
+                int(decode.max_qo_len),
+                layer._q_scale,
+                layer._k_scale,
+            ):
+                unpadded_o = torch.empty(
+                    q.shape[0],
+                    q.shape[1],
+                    self.kv_lora_rank,
+                    dtype=decode.attn_out_dtype,
+                    device=q.device,
+                )
+                if not decode.has_persistent_metadata:
+                    # Same contract as the padded path: without persistent
+                    # metadata the kernel may leave lanes unwritten, and they
+                    # must not reach the logits.
+                    unpadded_o.zero_()
+                # can_serve settled the inputs and the builder settled the
+                # output dtype, so a decline here means those two disagree with
+                # the kernel about what it accepts. Falling through would
+                # return this buffer unwritten, so say so instead.
+                if not k3_verify_mla_decode(
+                    q,
+                    kv_c_and_k_pe_cache.unsqueeze(2),
+                    unpadded_o,
+                    decode.block_table,
+                    decode.seq_lens,
+                    int(decode.max_qo_len),
+                    self.scale,
+                    layer._q_scale,
+                    layer._k_scale,
+                ):
+                    raise RuntimeError(
+                        "the folded verify kernel declined a shape that "
+                        "can_serve admitted"
+                    )
+                return unpadded_o, None
+
         if decode.use_gluon_decode:
             if type(q) is tuple:
                 q_nope, q_pe = q
@@ -1257,6 +1394,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         # Not self.num_heads: under DCP q arrives all-gathered over the DCP
         # group, so it carries dcp_world_size times this rank's head count.
         q_num_heads = q.shape[1]
+
         mla_padded_q = AiterMLAHelper.get_mla_padded_q(q_num_heads, q)
         mla_num_heads = AiterMLAHelper.get_actual_mla_num_heads(q_num_heads)
         o = torch.empty(
