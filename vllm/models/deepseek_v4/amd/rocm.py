@@ -12,7 +12,11 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.attention import DeepseekV4Attention
-from vllm.models.deepseek_v4.common.ops import dequantize_and_gather_k_cache
+from vllm.models.deepseek_v4.common.ops import (
+    compute_global_topk_indices_and_lens,
+    dequantize_and_gather_k_cache,
+)
+from vllm.v1.attention.ops import dsv4_opus_paged_prefill
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -763,6 +767,29 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.PREFILL_CHUNK_SIZE
         )
 
+        # The opus paged kernel reads the fp8 pool by slot id, so it needs the
+        # compressed top-k in global coordinates.  Mapped once for the whole
+        # prefill rather than per chunk; the SWA side is already paged.
+        opus_paged = dsv4_opus_paged_prefill.enabled()
+        opus_prefix_indices = None
+        opus_prefix_lens = None
+        if opus_paged and not swa_only:
+            assert attn_metadata is not None
+            assert swa_metadata.token_to_req_indices is not None
+            assert swa_metadata.is_valid_token is not None
+            prefill_slice = slice(
+                num_decode_tokens, num_decode_tokens + num_prefill_tokens
+            )
+            opus_prefix_indices, opus_prefix_lens = (
+                compute_global_topk_indices_and_lens(
+                    topk_indices,
+                    swa_metadata.token_to_req_indices[prefill_slice],
+                    attn_metadata.block_table,
+                    attn_metadata.block_size // self.compress_ratio,
+                    swa_metadata.is_valid_token[prefill_slice],
+                )
+            )
+
         workspace_manager = current_workspace_manager()
         kv = workspace_manager.get_simultaneous(
             ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
@@ -771,6 +798,49 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+
+            if opus_paged and swa_metadata.prefill_swa_indices is not None:
+                # Attention straight off the pool, skipping the gather below.
+                # Declining is safe at any point: nothing has been mutated.
+                opus_qs = (
+                    query_start_loc_cpu[num_decodes + chunk_start]
+                    - prefill_token_base
+                )
+                opus_qe = (
+                    query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+                )
+                assert swa_metadata.prefill_swa_lens is not None
+                if dsv4_opus_paged_prefill.try_opus_paged(
+                    q=q[opus_qs:opus_qe],
+                    output=output[opus_qs:opus_qe],
+                    compressed_k_cache=compressed_k_cache,
+                    swa_k_cache=swa_k_cache,
+                    compressed_indices=(
+                        None
+                        if opus_prefix_indices is None
+                        else opus_prefix_indices[opus_qs:opus_qe]
+                    ),
+                    compressed_lens=(
+                        None
+                        if opus_prefix_lens is None
+                        else opus_prefix_lens[opus_qs:opus_qe]
+                    ),
+                    swa_indices=swa_metadata.prefill_swa_indices[opus_qs:opus_qe],
+                    swa_lens=swa_metadata.prefill_swa_lens[opus_qs:opus_qe],
+                    compressed_page_size=(
+                        None
+                        if attn_metadata is None
+                        else attn_metadata.block_size // self.compress_ratio
+                    ),
+                    swa_page_size=swa_metadata.block_size,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    attn_sink=self.attn_sink,
+                    softmax_scale=self.scale,
+                    head_dim=self.head_dim,
+                    nope_head_dim=self.nope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                ):
+                    continue
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
