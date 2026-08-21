@@ -942,8 +942,10 @@ def _inverse_rope_gptj_kernel(
     os_t,
     os_h,  # output row strides
     cs_stride,  # cos_sin_cache row stride
+    NUM_HEADS: tl.constexpr,
     NOPE: tl.constexpr,  # non-rope head dims (passed through)
     HALF: tl.constexpr,  # rope_dim // 2
+    HEADS: tl.constexpr,  # heads handled per program
     BLOCK_NOPE: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
 ):
@@ -953,31 +955,41 @@ def _inverse_rope_gptj_kernel(
     for the GPT-J (non-neox) layout, writing bf16 directly. Replaces the
     clone + index_select + repeat_interleave + neg + stack + cat + cast chain
     (~10 small kernels) with a single launch.
+
+    Each program covers HEADS consecutive heads of one token, which are
+    contiguous in memory, so the pass-through lanes stream as one tile. Heads
+    are the fast-varying grid dimension so that concurrently resident programs
+    read neighbouring addresses.
     """
-    t = tl.program_id(0)
-    h = tl.program_id(1)
-    in_base = t * s_t + h * s_h
-    out_base = t * os_t + h * os_h
+    t = tl.program_id(1)
+    hs = tl.program_id(0) * HEADS + tl.arange(0, HEADS)
+    hmask = hs < NUM_HEADS
+
+    pos = tl.load(pos_ptr + t).to(tl.int64)
+    k = tl.arange(0, BLOCK_HALF)
+    kmask = k < HALF
+    cos = tl.load(cos_sin_ptr + pos * cs_stride + k, mask=kmask)
+    sin = tl.load(cos_sin_ptr + pos * cs_stride + HALF + k, mask=kmask)
 
     # NoPE lanes pass through unchanged (only cast to bf16).
     n = tl.arange(0, BLOCK_NOPE)
     nmask = n < NOPE
-    vals = tl.load(o_ptr + in_base + n, mask=nmask)
-    tl.store(out_ptr + out_base + n, vals.to(tl.bfloat16), mask=nmask)
+    in_n = t * s_t + hs[:, None] * s_h + n[None, :]
+    out_n = t * os_t + hs[:, None] * os_h + n[None, :]
+    nm = hmask[:, None] & nmask[None, :]
+    tl.store(out_ptr + out_n, tl.load(o_ptr + in_n, mask=nm).to(tl.bfloat16), mask=nm)
 
     # RoPE lanes: out_even = a*cos + b*sin, out_odd = b*cos - a*sin
     # (a = even lane, b = odd lane; sin negated for the inverse rotation).
-    pos = tl.load(pos_ptr + t).to(tl.int64)
-    k = tl.arange(0, BLOCK_HALF)
-    kmask = k < HALF
-    a = tl.load(o_ptr + in_base + NOPE + 2 * k, mask=kmask).to(tl.float32)
-    b = tl.load(o_ptr + in_base + NOPE + 2 * k + 1, mask=kmask).to(tl.float32)
-    cos = tl.load(cos_sin_ptr + pos * cs_stride + k, mask=kmask)
-    sin = tl.load(cos_sin_ptr + pos * cs_stride + HALF + k, mask=kmask)
-    out_even = a * cos + b * sin
-    out_odd = b * cos - a * sin
-    tl.store(out_ptr + out_base + NOPE + 2 * k, out_even.to(tl.bfloat16), mask=kmask)
-    tl.store(out_ptr + out_base + NOPE + 2 * k + 1, out_odd.to(tl.bfloat16), mask=kmask)
+    in_r = t * s_t + hs[:, None] * s_h + NOPE + 2 * k[None, :]
+    out_r = t * os_t + hs[:, None] * os_h + NOPE + 2 * k[None, :]
+    rm = hmask[:, None] & kmask[None, :]
+    a = tl.load(o_ptr + in_r, mask=rm).to(tl.float32)
+    b = tl.load(o_ptr + in_r + 1, mask=rm).to(tl.float32)
+    out_even = a * cos[None, :] + b * sin[None, :]
+    out_odd = b * cos[None, :] - a * sin[None, :]
+    tl.store(out_ptr + out_r, out_even.to(tl.bfloat16), mask=rm)
+    tl.store(out_ptr + out_r + 1, out_odd.to(tl.bfloat16), mask=rm)
 
 
 def _fused_inverse_rope_gptj(
@@ -1003,7 +1015,16 @@ def _fused_inverse_rope_gptj(
     )
     if num_tokens == 0:
         return out
-    _inverse_rope_gptj_kernel[(num_tokens, num_heads)](
+    # One program per (token, head) spreads a 512-element row over a full warp
+    # set, which is a quarter of the per-lane vector width this streaming op can
+    # use. Grouping heads restores it. Raising the group further is a
+    # bit-exactness tradeoff, not a correctness one: once
+    # HEADS * BLOCK_HALF >= 512 the backend contracts the rope math into an FMA
+    # and the result moves by an ulp.
+    heads_per_prog = 4 if num_heads >= 4 else 1
+    _inverse_rope_gptj_kernel[
+        (triton.cdiv(num_heads, heads_per_prog), num_tokens)
+    ](
         o,
         out,
         positions,
@@ -1013,10 +1034,14 @@ def _fused_inverse_rope_gptj(
         out.stride(0),
         out.stride(1),
         cos_sin_cache.stride(0),
+        NUM_HEADS=num_heads,
         NOPE=head_dim - rope_head_dim,
         HALF=rope_head_dim // 2,
+        HEADS=heads_per_prog,
         BLOCK_NOPE=triton.next_power_of_2(head_dim - rope_head_dim),
         BLOCK_HALF=triton.next_power_of_2(rope_head_dim // 2),
+        # pinned: the default of 4 halves the per-lane vector width here
+        num_warps=2,
     )
     return out
 
