@@ -92,12 +92,10 @@ def _is_gfx950(device: torch.device) -> bool:
 
 
 def _load_aiter_op() -> tuple[Callable[..., torch.Tensor], int]:
-    from aiter.ops.dsv4_mla_prefill_opus import (
-        DSV4_MLA_PREFILL_OPUS_MIN_H,
-        dsv4_mla_prefill_opus,
-    )
+    from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus_paged
 
-    return dsv4_mla_prefill_opus, int(DSV4_MLA_PREFILL_OPUS_MIN_H)
+    # The op compiles only the T_M=8 pipeline, so H <= 32 has no paged variant.
+    return pa_sparse_prefill_fp8_opus_paged, 33
 
 
 def _paged_cache_views(cache: torch.Tensor, page_size: int) -> _PagedCache:
