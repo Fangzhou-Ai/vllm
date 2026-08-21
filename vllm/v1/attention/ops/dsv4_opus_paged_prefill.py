@@ -297,7 +297,13 @@ def try_opus_paged(
     empty_indptr = _scratch("empty_indptr", (0,), torch.int32, q.device)
     prefill(
         q_nope=q[..., :_D_NOPE],
-        q_rope=q[..., _D_NOPE:],
+        # q_nope may stay a view -- the kernel takes its row stride as an
+        # argument -- but q_rope may not: that layout has 64 baked in at compile
+        # time, so a [..., 448:] slice of a [T, H, 512] Q addresses wrongly.
+        # The copy is ~50 us per layer at T=8192 H=128 against ~1.8 ms of
+        # attention.  Teaching the RoPE layout to take a runtime stride, the way
+        # q_nope already does, would remove it.
+        q_rope=q[..., _D_NOPE:].contiguous(),
         unified_kv_nope=prefix.nope,
         unified_kv_rope=prefix.rope,
         kv_indices_prefix=prefix_dense.reshape(-1),
