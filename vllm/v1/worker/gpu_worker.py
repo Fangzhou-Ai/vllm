@@ -185,6 +185,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_ptrs: tuple[int, ...] | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -1053,12 +1054,6 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
-
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1131,12 +1126,41 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        # Drain the previous send only now, so this step's compute overlapped
+        # it. Safe only while the buffer is private -- see below.
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+
+        # Deferring is only safe while the buffer is private to this send.
+        # A full cuda graph owns its output and rewrites it on the next replay,
+        # so a send from such a step has to complete before returning. The
+        # address check covers any other persistent buffer: a pending send
+        # holds a reference, so an allocator managed output cannot come back
+        # on the next step and its address necessarily differs.
+        send_ptrs = tuple(t.data_ptr() for t in output.tensors.values())
+        graph_owned = (
+            getattr(self.model_runner, "last_cudagraph_mode", None)
+            is CUDAGraphMode.FULL
+        )
+        can_defer = (
+            not graph_owned
+            and self._pp_send_ptrs is not None
+            and send_ptrs != self._pp_send_ptrs
+        )
+        self._pp_send_ptrs = send_ptrs
+
         # launch non-blocking send of intermediate tensors
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
+        if not can_defer:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
 
         return None
 
