@@ -1135,19 +1135,22 @@ class Worker(WorkerBase):
 
         # Deferring is only safe while the buffer is private to this send.
         # A full cuda graph owns its output and rewrites it on the next replay,
-        # so a send from such a step has to complete before returning. The
-        # address check covers any other persistent buffer: a pending send
-        # holds a reference, so an allocator managed output cannot come back
-        # on the next step and its address necessarily differs.
+        # so a send from such a step has to complete before returning. Runners
+        # that do not report a mode are treated as owning it. The address check
+        # covers any other persistent buffer: a pending send holds a reference,
+        # so an allocator managed output cannot come back on the next step and
+        # its address necessarily differs. Every tensor has to move, not just
+        # one of them, or a persistent buffer alongside a fresh one is deferred.
         send_ptrs = tuple(t.data_ptr() for t in output.tensors.values())
         graph_owned = (
-            getattr(self.model_runner, "last_cudagraph_mode", None)
+            getattr(self.model_runner, "last_cudagraph_mode", CUDAGraphMode.FULL)
             is CUDAGraphMode.FULL
         )
         can_defer = (
             not graph_owned
             and self._pp_send_ptrs is not None
-            and send_ptrs != self._pp_send_ptrs
+            and len(send_ptrs) == len(self._pp_send_ptrs)
+            and all(a != b for a, b in zip(send_ptrs, self._pp_send_ptrs))
         )
         self._pp_send_ptrs = send_ptrs
 
