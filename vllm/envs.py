@@ -149,6 +149,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
     VLLM_DSV4_FP8_BMM: bool = False
+    VLLM_DSV4_AITER_FUSED_MHC: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -1340,6 +1341,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with the activation quant folded into the inverse-RoPE kernel.
     "VLLM_DSV4_FP8_BMM": lambda: (
         os.getenv("VLLM_DSV4_FP8_BMM", "False").lower() in ("true", "1")
+    ),
+    # Use AITER's fused MHC post+pre instead of its separate post and pre.
+    "VLLM_DSV4_AITER_FUSED_MHC": lambda: (
+        os.getenv("VLLM_DSV4_AITER_FUSED_MHC", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
