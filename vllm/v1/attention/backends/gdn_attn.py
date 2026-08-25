@@ -38,6 +38,21 @@ class GDNAttentionBackend(AttentionBackend):
         return True
 
 
+def packed_state_indices(column: torch.Tensor) -> torch.Tensor:
+    """Return ``column`` with stride 1, copying only when it is not already.
+
+    Column 0 of a ``[batch, num_spec + 1]`` block table is a strided view, and
+    the KDA kernels test ``stride(0) != 1`` rather than asking the tensor. That
+    distinction bites at batch size 1: torch calls any one-element tensor
+    contiguous, so ``.contiguous()`` and ``.clone()`` both hand back the
+    parent's stride and the kernel still rejects it.
+    """
+    if column.stride(0) == 1:
+        return column
+    packed = torch.empty_like(column, memory_format=torch.contiguous_format)
+    return packed.copy_(column)
+
+
 @dataclass
 class GDNAttentionMetadata:
     num_prefills: int
@@ -216,7 +231,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx = None
             non_spec_token_indx = None
             spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            # The persistent cudagraph buffers below repack this anyway, but
+            # they are only filled on the full-cudagraph path.
+            non_spec_state_indices_tensor = packed_state_indices(
+                block_table_tensor[:, 0]
+            )
             spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu

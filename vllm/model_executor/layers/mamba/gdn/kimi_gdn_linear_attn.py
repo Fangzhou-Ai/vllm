@@ -23,7 +23,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    packed_state_indices,
+)
 
 from ...linear import (
     ColumnParallelLinear,
@@ -465,7 +468,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             assert spec_state_indices_tensor is not None
             assert spec_query_start_loc is not None
-            spec_conv_indices = spec_state_indices_tensor[:, 0][: m.num_spec_decodes]
+            spec_conv_indices = packed_state_indices(
+                spec_state_indices_tensor[: m.num_spec_decodes, 0]
+            )
             spec_max_query_len = spec_state_indices_tensor.size(-1)
 
             # Sibling beta and, for full-rank gates, output-gate views remain
@@ -584,9 +589,9 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
             else:
                 # pure-decode non-spec batch
                 assert non_spec_state_indices_tensor is not None
-                decode_conv_indices = non_spec_state_indices_tensor[
-                    : mixed_qkv_ns.size(0)
-                ]
+                decode_conv_indices = packed_state_indices(
+                    non_spec_state_indices_tensor[: mixed_qkv_ns.size(0)]
+                )
                 # Sibling beta and, for full-rank gates, output-gate views
                 # remain live, so write the conv output separately.
                 packed_conv_out = torch.empty(

@@ -954,6 +954,10 @@ class AiterMLAHelper:
 
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
+    # The assembly decode path fills a natural-log lse via mla_reduce_v1, which
+    # is what decode context parallelism merges the per-rank shards with.
+    can_return_lse_for_decode: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -1315,6 +1319,10 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         if (
             self.num_heads < AiterMLAHelper._AITER_MIN_MLA_HEADS
             and int(decode.max_qo_len) > 1
+            # Gluon returns no lse, so under DCP the assembly path has to serve
+            # this shape instead; the head all-gather has already widened q
+            # past the 16-head floor that motivates this branch.
+            and not self.need_to_return_lse_for_decode
         ):
             qlen = int(decode.max_qo_len)
             if type(q) is tuple:
@@ -1404,6 +1412,11 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             dtype=attn_metadata.decode.attn_out_dtype,
             device=q.device,
         )
+        lse = (
+            torch.empty(B, mla_num_heads, dtype=torch.float32, device=q.device)
+            if self.need_to_return_lse_for_decode
+            else None
+        )
         if decode.max_qo_len > 1 and not decode.has_persistent_metadata:
             # MTP verification can call the AITER MLA decode kernel with
             # qlen > 1. If that path is running without persistent metadata,
@@ -1438,7 +1451,11 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
             decode.paged_kv_indptr,
             decode.paged_kv_indices,
             decode.paged_kv_last_page_len,
+            attn_lse=lse,
             **mla_kwargs,
         )
 
-        return AiterMLAHelper.get_mla_unpadded_o(q_num_heads, o), None
+        return (
+            AiterMLAHelper.get_mla_unpadded_o(q_num_heads, o),
+            None if lse is None else lse[:, :q_num_heads],
+        )
