@@ -9,6 +9,7 @@ from vllm._aiter_ops import (
     rocm_aiter_ops,
 )
 from vllm.logger import init_logger
+import vllm.envs as envs
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     _upcast_e8m0_to_fp32,
 )
@@ -393,6 +394,21 @@ class AiterFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         else:
             ws, attr = params.weight_scale, params.WEIGHT_SCALE
         if ws is not None and ws.dtype == torch.float8_e8m0fnu:
+            # The bmm takes the exponent byte and the grouping; the scale
+            # is about to be replaced by its upcast.
+            if (
+                envs.VLLM_DSV4_FP8_BMM
+                and getattr(layer, "is_bmm", False)
+                and getattr(layer, "prefix", "").endswith("wo_a")
+            ):
+                g = layer.bmm_batch_size
+                w = layer.weight
+                layer.weight_bmm = w.data.view(g, w.shape[0] // g, w.shape[1])
+                layer.weight_scale_e8m0_bmm = (
+                    ws.data.view(torch.uint8)
+                    .view(g, ws.shape[0] // g, ws.shape[1])
+                    .contiguous()
+                )
             replace_parameter(layer, attr, _upcast_e8m0_to_fp32(ws).contiguous())
 
     @classmethod
