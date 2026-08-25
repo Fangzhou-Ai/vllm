@@ -395,8 +395,15 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.mhc_pre = MHCPreOp()
         self.mhc_post = MHCPostOp()
         self.mhc_fused_post_pre = MHCFusedPostPreOp()
-        self.use_fused_mhc = HAS_TILELANG_MHC and not (
-            HAS_AITER_MHC and self.hidden_size % 256 == 0
+        # aiter has a fused post+pre of its own, so the aiter path no longer
+        # has to fall back to the two-launch form.
+        self.use_fused_mhc = (
+            HAS_AITER_MHC
+            and self.hidden_size % 256 == 0
+            and envs.VLLM_DSV4_AITER_FUSED_MHC
+        ) or (
+            HAS_TILELANG_MHC
+            and not (HAS_AITER_MHC and self.hidden_size % 256 == 0)
         )
 
     def hc_pre(
