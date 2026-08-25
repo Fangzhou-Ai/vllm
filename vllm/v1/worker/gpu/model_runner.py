@@ -1622,9 +1622,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Update the EPLB meta.
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
-        # The full graph owns its output buffer and rewrites it on every
-        # replay; consumers that hold on to the output past this step need to
-        # know that.
+        # Consumers holding the output past this step need to know whether
+        # the graph owns the buffer.
         self.last_cudagraph_mode = batch_desc.cg_mode
 
         self.step_timing.record_batch(

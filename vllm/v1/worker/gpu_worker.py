@@ -1054,6 +1054,14 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        # Draining the previous send here, before this step's compute, is always
+        # safe. VLLM_PP_DEFER_SEND_WAIT moves the drain past the compute so the
+        # two overlap, which needs the buffer to stay private to the send.
+        if self._pp_send_work and not envs.VLLM_PP_DEFER_SEND_WAIT:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
@@ -1126,28 +1134,24 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
-        # Drain the previous send only now, so this step's compute overlapped
-        # it. Safe only while the buffer is private -- see below.
+        # Deferred drain: this step's compute has overlapped the send.
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
 
-        # Deferring is only safe while the buffer is private to this send.
-        # A full cuda graph owns its output and rewrites it on the next replay,
-        # so a send from such a step has to complete before returning. Runners
-        # that do not report a mode are treated as owning it. The address check
-        # covers any other persistent buffer: a pending send holds a reference,
-        # so an allocator managed output cannot come back on the next step and
-        # its address necessarily differs. Every tensor has to move, not just
-        # one of them, or a persistent buffer alongside a fresh one is deferred.
+        # A full cuda graph rewrites its output on the next replay, so a send from
+        # such a step cannot be deferred; a runner reporting no mode is assumed to
+        # own its output. Any other persistent buffer keeps its address, which an
+        # allocator managed one cannot while a pending send references it.
         send_ptrs = tuple(t.data_ptr() for t in output.tensors.values())
         graph_owned = (
             getattr(self.model_runner, "last_cudagraph_mode", CUDAGraphMode.FULL)
             is CUDAGraphMode.FULL
         )
         can_defer = (
-            not graph_owned
+            envs.VLLM_PP_DEFER_SEND_WAIT
+            and not graph_owned
             and self._pp_send_ptrs is not None
             and len(send_ptrs) == len(self._pp_send_ptrs)
             and all(a != b for a, b in zip(send_ptrs, self._pp_send_ptrs))
@@ -1160,7 +1164,7 @@ class Worker(WorkerBase):
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
-        if not can_defer:
+        if envs.VLLM_PP_DEFER_SEND_WAIT and not can_defer:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
