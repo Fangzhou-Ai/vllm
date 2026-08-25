@@ -236,6 +236,8 @@ if TYPE_CHECKING:
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
+    VLLM_RPC_RING_CHUNKS: int = 10
+    VLLM_MAX_CONCURRENT_BATCHES: int | None = None
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
@@ -1759,6 +1761,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # processes via zmq.
     "VLLM_MQ_MAX_CHUNK_BYTES_MB": lambda: int(
         os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")
+    ),
+    # Number of slots in the rpc message queue ring. A slot is only reusable
+    # once every worker has read it, and each engine step enqueues two rpcs,
+    # so the ring caps how far the engine can dispatch ahead of the slowest
+    # worker. Costs VLLM_MQ_MAX_CHUNK_BYTES_MB of shared memory per slot.
+    "VLLM_RPC_RING_CHUNKS": lambda: int(os.getenv("VLLM_RPC_RING_CHUNKS", "10")),
+    # Number of batches the engine keeps in flight. Unset derives it from
+    # the parallel config. Raising it past half of VLLM_RPC_RING_CHUNKS
+    # makes the engine block on the rpc ring on every step.
+    "VLLM_MAX_CONCURRENT_BATCHES": lambda: (
+        int(os.getenv("VLLM_MAX_CONCURRENT_BATCHES"))
+        if os.getenv("VLLM_MAX_CONCURRENT_BATCHES")
+        else None
     ),
     # Timeout in seconds for execute_model RPC calls in multiprocessing
     # executor (only applies when TP > 1).
