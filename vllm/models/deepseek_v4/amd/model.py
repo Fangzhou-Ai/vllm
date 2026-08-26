@@ -15,6 +15,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import (
@@ -105,39 +106,59 @@ class DeepseekV4MLP(nn.Module):
         else:
             self.act_fn = SiluAndMul()
 
-        # gate_up_proj B-preshuffle (ColumnParallel -> no all-reduce); set at load.
+        # B-preshuffle both projections; set at load.
         self._gateup = rocm_aiter_ops.is_enabled()
-        # Block scale for the preshuffled gate_up weight; None = not preshuffled.
+        # Block scale for the preshuffled weight; None = not preshuffled.
         self._gateup_scale: torch.Tensor | None = None
+        self._down_scale: torch.Tensor | None = None
+        # FlyDSL mxfp8 dispatchers; None = that path is off.
+        self._gateup_mxfp8 = None
+        self._down_mxfp8 = None
+        # down_proj is RowParallel, so a preshuffled path has to all-reduce itself.
+        self._down_reduce = reduce_results and not is_sequence_parallel
 
     def prepare_gateup_preshuffle(self) -> None:
-        # B-preshuffle the gate_up_proj weight in place (single weight).
+        # B-preshuffle the MLP weights in place (single weight each).
+        from vllm.models.deepseek_v4.amd import mxfp8_preshuffle
+
+        if mxfp8_preshuffle.enabled():
+            # Separate path: it preshuffles these weights itself, so the CK
+            # bpreshuffle setup below must not also run on them.
+            self._gateup_mxfp8 = mxfp8_preshuffle.make_gemm(self.gate_up_proj)
+            self._down_mxfp8 = mxfp8_preshuffle.make_gemm(self.down_proj)
+            return
+
         if not self._gateup:
             return
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
         from vllm.model_executor.utils import replace_parameter
 
-        w = getattr(self.gate_up_proj, "weight", None)
-        ws = getattr(self.gate_up_proj, "weight_scale_inv", None)  # per-block scale
-        if w is None or ws is None or w.dim() != 2:
-            return
-        # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
-        if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
-            return
-        if ws.dtype == torch.float8_e8m0fnu:
-            from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-                _upcast_e8m0_to_fp32,
+        def _prep(linear) -> torch.Tensor | None:
+            w = getattr(linear, "weight", None)
+            ws = getattr(linear, "weight_scale_inv", None)  # per-block scale
+            if w is None or ws is None or w.dim() != 2:
+                return None
+            # K % 128 (group-128 quant) and N % 16 (shuffle_weight) must hold.
+            if w.shape[-1] % 128 != 0 or w.shape[0] % 16 != 0:
+                return None
+            if ws.dtype == torch.float8_e8m0fnu:
+                ws = _upcast_e8m0_to_fp32(ws).contiguous()
+            replace_parameter(
+                linear,
+                "weight",
+                rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
             )
+            return ws
 
-            ws = _upcast_e8m0_to_fp32(ws).contiguous()
-        replace_parameter(
-            self.gate_up_proj,
-            "weight",
-            rocm_aiter_ops.shuffle_weight(w.data, layout=(16, 16)),
-        )
-        self._gateup_scale = ws
+        self._gateup_scale = _prep(self.gate_up_proj)
+        self._down_scale = _prep(self.down_proj)
 
     def forward(self, x):
-        if self._gateup_scale is not None and x.dim() == 2:
+        if self._gateup_mxfp8 is not None:
+            gate_up = self._gateup_mxfp8(x)
+        elif self._gateup_scale is not None and x.dim() == 2:
             # gate_up via fp8 group-quant (col-major) + B-preshuffle GEMM.
             x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
             gate_up = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
@@ -150,6 +171,21 @@ class DeepseekV4MLP(nn.Module):
         else:
             gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
+        if self._down_mxfp8 is not None:
+            return self._down_mxfp8(x, reduce_tp=self._down_reduce)
+        if self._down_scale is not None and x.dim() == 2:
+            x_fp8, x_scale = rocm_aiter_ops.group_fp8_quant(x, transpose_scale=True)
+            out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                x_fp8,
+                self.down_proj.weight,
+                x_scale,
+                self._down_scale,
+                output_dtype=x.dtype,
+            )
+            # Bypassing RowParallelLinear means doing its all-reduce here.
+            if self._down_reduce and get_tensor_model_parallel_world_size() > 1:
+                out = tensor_model_parallel_all_reduce(out)
+            return out
         x, _ = self.down_proj(x)
         return x
 
@@ -1021,6 +1057,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         # After per-layer quant finalize, so we preshuffle the final fp8 weights.
         for module in self.modules():
             if isinstance(module, DeepseekV4ROCMAiterMLAAttention):
+                # Also covers its indexer's wq_b.
                 module.prepare_attn_preshuffle()
             elif isinstance(module, DeepseekV4MLP):
                 module.prepare_gateup_preshuffle()

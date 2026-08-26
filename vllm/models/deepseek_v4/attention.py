@@ -451,7 +451,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
         aux_streams = self.aux_stream_list
 
         def project_query_and_cache_kv() -> torch.Tensor:
-            q = self.wq_b(qr).view(-1, self.n_local_heads, self.head_dim)
+            q = self._wq_b_gemm(qr).view(-1, self.n_local_heads, self.head_dim)
             return self._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
 
         index_q: torch.Tensor | None = None
@@ -504,6 +504,11 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             positions,
             o_padded,
         )
+
+    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+        # Override point, same reason as _fused_wqa_wkv_gemm below.
+        # ColumnParallelLinear with return_bias=False returns the tensor.
+        return self.wq_b(qr)
 
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Override point: the ROCm layer preshuffles this weight in place, so
@@ -832,6 +837,9 @@ class DeepseekV4Indexer(nn.Module):
         self.scale_fmt = "ue8m0"
         self.quant_block_size = 128  # TODO: get from config
         self.topk_indices_buffer = topk_indices_buffer
+        # wq_b preshuffle state, set at load on ROCm; both None = plain linear.
+        self._wq_b_scale: torch.Tensor | None = None  # CK bpreshuffle
+        self._wq_b_mxfp8 = None  # FlyDSL mxfp8
 
         self.max_model_len = (
             vllm_config.model_config.max_model_len // self.compress_ratio
@@ -892,6 +900,24 @@ class DeepseekV4Indexer(nn.Module):
             torch.cuda.Event(),
         ]
 
+    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+        if self._wq_b_mxfp8 is not None:
+            return self._wq_b_mxfp8(qr)
+        if self._wq_b_scale is not None and qr.dim() == 2:
+            from vllm._aiter_ops import rocm_aiter_ops
+
+            qr_fp8, qr_scale = rocm_aiter_ops.group_fp8_quant(qr, transpose_scale=True)
+            return rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                qr_fp8,
+                self.wq_b.weight,
+                qr_scale,
+                self._wq_b_scale,
+                output_dtype=qr.dtype,
+            )
+        # ReplicatedLinear returns (output, bias); bias is None.
+        q, _ = self.wq_b(qr)
+        return q
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -930,9 +956,7 @@ class DeepseekV4Indexer(nn.Module):
                 return None, None, None
 
         def wq_b_and_q_quant():
-            # ReplicatedLinear returns (output, bias); bias is None.
-            q, _ = self.wq_b(qr)
-            q = q.view(-1, self.n_head, self.head_dim)
+            q = self._wq_b_gemm(qr).view(-1, self.n_head, self.head_dim)
             outputs = None
             if self.eager_scratch_pool is not None and self.use_fp4_kv:
                 outputs = self.eager_scratch_pool.indexer_q_outputs(q.shape[0])

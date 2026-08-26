@@ -490,6 +490,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        self._wq_b_scale: torch.Tensor | None = None
+        # FlyDSL mxfp8 dispatchers; None = that path is off.
+        self._wqa_wkv_mxfp8 = None
+        self._wo_b_mxfp8 = None
+        self._wq_b_mxfp8 = None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -497,6 +502,19 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def prepare_attn_preshuffle(self) -> None:
         from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.models.deepseek_v4.amd import mxfp8_preshuffle
+
+        if mxfp8_preshuffle.enabled():
+            # Separate path: it preshuffles these weights itself, so the CK
+            # bpreshuffle setup below must not also run on them.
+            self._wqa_wkv_mxfp8 = mxfp8_preshuffle.make_gemm(self.fused_wqa_wkv)
+            self._wo_b_mxfp8 = mxfp8_preshuffle.make_gemm(self.wo_b)
+            self._wq_b_mxfp8 = mxfp8_preshuffle.make_gemm(self.wq_b)
+            if self.indexer is not None:
+                self.indexer._wq_b_mxfp8 = mxfp8_preshuffle.make_gemm(
+                    self.indexer.wq_b
+                )
+            return
 
         if not rocm_aiter_ops.is_enabled():
             return
@@ -527,6 +545,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
         self._wo_b_scale = _prep(self.wo_b)
+        self._wq_b_scale = _prep(self.wq_b)
+        if self.indexer is not None:
+            self.indexer._wq_b_scale = _prep(self.indexer.wq_b)
 
     def _bpre_attn_gemm(
         self,
@@ -545,7 +566,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             out = tensor_model_parallel_all_reduce(out)
         return out
 
+    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+        # ColumnParallel -> the sharded output needs no all-reduce.
+        if self._wq_b_mxfp8 is not None:
+            return self._wq_b_mxfp8(qr)
+        if self._wq_b_scale is not None and qr.dim() == 2:
+            return self._bpre_attn_gemm(self.wq_b.weight, self._wq_b_scale, qr, False)
+        return super()._wq_b_gemm(qr)
+
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._wqa_wkv_mxfp8 is not None:
+            return self._wqa_wkv_mxfp8(hidden_states)
         if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:
             return self._bpre_attn_gemm(
                 self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
@@ -564,6 +595,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.wo_a,
         )
         zf = z.flatten(1)
+        if self._wo_b_mxfp8 is not None:
+            return self._wo_b_mxfp8(zf, reduce_tp=True)
         if self._wo_b_scale is not None and zf.dim() == 2:
             return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
         return self.wo_b(zf)
