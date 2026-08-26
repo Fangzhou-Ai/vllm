@@ -31,7 +31,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
-from vllm.v1.attention.ops import dsv4_prefill
+from vllm.v1.attention.ops import dsv4_decode, dsv4_prefill
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
@@ -689,6 +689,34 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_lens = attn_metadata.c128a_decode_topk_lens
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
+
+        # Attention straight off the pool, in the same shape the Triton path
+        # below would take.  Declining is safe at any point: nothing has been
+        # mutated, and the decision is made before capture, so whichever path
+        # runs is the one the CUDA graph records.
+        if dsv4_decode.try_dsv4_decode(
+            q=q,
+            output=output,
+            compressed_k_cache=kv_cache,
+            swa_k_cache=self.swa_cache_layer.kv_cache,
+            compressed_ragged_indices=topk_ragged_indices,
+            compressed_ragged_indptr=topk_ragged_indptr,
+            swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
+            swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
+            compressed_page_size=(
+                None
+                if attn_metadata is None
+                else attn_metadata.block_size // self.compress_ratio
+            ),
+            swa_page_size=swa_metadata.block_size,
+            kv_cache_dtype=self.kv_cache_dtype,
+            attn_sink=self.attn_sink,
+            softmax_scale=self.scale,
+            head_dim=self.head_dim,
+            nope_head_dim=self.nope_head_dim,
+            rope_head_dim=self.rope_head_dim,
+        ):
+            return
 
         rocm_sparse_attn_decode(
             q=q,
