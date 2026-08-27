@@ -226,7 +226,9 @@ class SiluAndMulWithClamp(CustomOp):
         self.swiglu_limit = float(swiglu_limit)
         self.alpha = float(alpha)
         self.beta = float(beta)
-        if current_platform.is_rocm() or current_platform.is_xpu():
+        if current_platform.is_rocm():
+            self._forward_method = self.forward_hip
+        elif current_platform.is_xpu():
             self._forward_method = self.forward_native
         elif current_platform.is_cuda_alike():
             self.op = torch.ops._C.silu_and_mul_with_clamp
@@ -245,6 +247,25 @@ class SiluAndMulWithClamp(CustomOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x, self.swiglu_limit, self.alpha, self.beta)
         return out
+
+    def _aiter_applies(self, x: torch.Tensor) -> bool:
+        """Whether aiter's fused kernel matches this configuration exactly."""
+        if self.alpha != 1.0 or self.beta != 0.0:
+            return False
+        n = x.shape[-1] // 2
+        # the fused kernel tiles a whole row per program
+        return n >= 128 and n % 128 == 0
+
+    def forward_hip(self, x: torch.Tensor) -> torch.Tensor:
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        if not rocm_aiter_ops.is_enabled() or not self._aiter_applies(x):
+            return self.forward_native(x)
+        x2d = x.reshape(-1, x.shape[-1])
+        if not x2d.is_contiguous():
+            x2d = x2d.contiguous()
+        out = rocm_aiter_ops.clamp_act_mul(x2d, self.swiglu_limit)
+        return out.view(*x.shape[:-1], out.shape[-1])
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_native(x)
