@@ -134,6 +134,8 @@ MoEBackend = Literal[
     "humming",
     "triton_unfused",
     "aiter",
+    "aiter_mxfp4_mxfp4",
+    "aiter_mxfp4_fp8",
     "flydsl",
     "hpc",
     "emulation",
