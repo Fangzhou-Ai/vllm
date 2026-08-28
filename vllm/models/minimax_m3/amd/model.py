@@ -805,8 +805,8 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             else "auto"
         )
         reshape_and_cache(
-            k.contiguous(),
-            v.contiguous(),
+            k,
+            v,
             key_cache,
             value_cache,
             slot_mapping,
