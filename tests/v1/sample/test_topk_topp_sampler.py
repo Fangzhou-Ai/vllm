@@ -137,6 +137,69 @@ def test_random_sample_uses_fp64_exponential_race_when_requested():
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize(
+    ("use_gfx950_threshold", "batch_size", "expected_path"),
+    [
+        (True, 3, "pytorch"),
+        (True, 4, "triton"),
+        (True, 5, "triton"),
+        (True, 6, "pytorch"),
+        (True, 7, "pytorch"),
+        (True, 8, "triton"),
+        (False, 4, "pytorch"),
+        (False, 8, "triton"),
+    ],
+)
+def test_topk_topp_triton_batch_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    use_gfx950_threshold: bool,
+    batch_size: int,
+    expected_path: str,
+):
+    from vllm.v1.sample.ops import topk_topp_sampler
+
+    class MockPlatform:
+        @staticmethod
+        def is_cpu() -> bool:
+            return False
+
+    called: list[str] = []
+
+    def mock_pytorch(logits, _k, _p):
+        called.append("pytorch")
+        return logits
+
+    def mock_triton(logits, _k, _p):
+        called.append("triton")
+        return logits
+
+    monkeypatch.setattr(topk_topp_sampler, "current_platform", MockPlatform())
+    monkeypatch.setattr(topk_topp_sampler, "HAS_TRITON", True)
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "_USE_GFX950_SMALL_BATCH_TRITON",
+        use_gfx950_threshold,
+    )
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "apply_top_k_top_p_pytorch",
+        mock_pytorch,
+    )
+    monkeypatch.setattr(
+        topk_topp_sampler,
+        "apply_top_k_top_p_triton",
+        mock_triton,
+        raising=False,
+    )
+
+    logits = torch.empty(batch_size, 8)
+    k = torch.ones(batch_size, dtype=torch.int32)
+    result = topk_topp_sampler.apply_top_k_top_p(logits, k, None)
+
+    assert result is logits
+    assert called == [expected_path]
+
+
 def test_topk_impl_equivalence():
     torch.set_default_device(DEVICE_TYPE)
     generator = Generator(device=DEVICE_TYPE).manual_seed(33)
@@ -298,7 +361,7 @@ class TestTritonTopkTopp:
                     f"(max diff {max_diff} values out of {max_kept})"
                 )
 
-    @pytest.mark.parametrize("batch_size", [1, 8, 32, 128, 512, 1024])
+    @pytest.mark.parametrize("batch_size", [1, 4, 5, 6, 7, 8, 32, 128, 512, 1024])
     @pytest.mark.parametrize("vocab_size", [1024, 32000, 128256])
     def test_topk_only(self, batch_size: int, vocab_size: int):
         """Test top-k only (p=None)."""
@@ -314,7 +377,7 @@ class TestTritonTopkTopp:
 
         self._compare_results(logits, k, p=None)
 
-    @pytest.mark.parametrize("batch_size", [1, 8, 32, 128, 512, 1024])
+    @pytest.mark.parametrize("batch_size", [1, 4, 5, 6, 7, 8, 32, 128, 512, 1024])
     @pytest.mark.parametrize("vocab_size", [1024, 32000, 128256])
     def test_topp_only(self, batch_size: int, vocab_size: int):
         """Test top-p only (k=None)."""
@@ -328,7 +391,7 @@ class TestTritonTopkTopp:
 
         self._compare_results(logits, k=None, p=p)
 
-    @pytest.mark.parametrize("batch_size", [1, 8, 32, 128, 512, 1024])
+    @pytest.mark.parametrize("batch_size", [1, 4, 5, 6, 7, 8, 32, 128, 512, 1024])
     @pytest.mark.parametrize("vocab_size", [1024, 32000, 128256])
     def test_topk_and_topp(self, batch_size: int, vocab_size: int):
         """Test combined top-k and top-p."""
