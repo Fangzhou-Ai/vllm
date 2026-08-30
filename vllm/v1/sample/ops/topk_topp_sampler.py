@@ -17,6 +17,10 @@ if HAS_TRITON:
 
 logger = init_logger(__name__)
 
+_USE_GFX950_SMALL_BATCH_TRITON = current_platform.is_rocm() and (
+    current_platform.is_device_capability(95)
+)
+
 
 def _skip_aiter_sampler_on_gfx1250() -> bool:
     # Lazy ROCm-only import; keeps arch detection out of import time on CUDA/CPU.
@@ -357,7 +361,11 @@ def apply_top_k_top_p(
             return apply_top_k_top_p_triton(logits, k, p)
         return apply_top_k_top_p_pytorch(logits, k, p, allow_cpu_sync=True)
 
-    if HAS_TRITON and logits.shape[0] >= 8:
+    batch_size = logits.shape[0]
+    use_triton = batch_size >= 8 or (
+        _USE_GFX950_SMALL_BATCH_TRITON and batch_size in (4, 5)
+    )
+    if HAS_TRITON and use_triton:
         return apply_top_k_top_p_triton(logits, k, p)
 
     # Use pytorch sort implementation for small batch sizes.
