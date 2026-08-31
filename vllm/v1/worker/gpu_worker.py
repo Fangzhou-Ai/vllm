@@ -185,6 +185,7 @@ class Worker(WorkerBase):
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
         # pending non-blocking PP send work from the previous iteration
         self._pp_send_work: list[Handle] = []
+        self._pp_send_ptrs: tuple[int, ...] | None = None
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -1053,8 +1054,10 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        # ensure any previous non-blocking PP sends are complete
-        if self._pp_send_work:
+        # Draining the previous send here, before this step's compute, is always
+        # safe. VLLM_PP_DEFER_SEND_WAIT moves the drain past the compute so the
+        # two overlap, which needs the buffer to stay private to the send.
+        if self._pp_send_work and not envs.VLLM_PP_DEFER_SEND_WAIT:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
@@ -1131,12 +1134,40 @@ class Worker(WorkerBase):
             and not get_pp_group().is_last_rank
         )
 
+        # Deferred drain: this step's compute has overlapped the send.
+        if self._pp_send_work:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
+
+        # A full cuda graph rewrites its output on the next replay, so a send from
+        # such a step cannot be deferred; a runner reporting no mode is assumed to
+        # own its output. Any other persistent buffer keeps its address, which an
+        # allocator managed one cannot while a pending send references it.
+        send_ptrs = tuple(t.data_ptr() for t in output.tensors.values())
+        graph_owned = (
+            getattr(self.model_runner, "last_cudagraph_mode", CUDAGraphMode.FULL)
+            is CUDAGraphMode.FULL
+        )
+        can_defer = (
+            envs.VLLM_PP_DEFER_SEND_WAIT
+            and not graph_owned
+            and self._pp_send_ptrs is not None
+            and len(send_ptrs) == len(self._pp_send_ptrs)
+            and all(a != b for a, b in zip(send_ptrs, self._pp_send_ptrs))
+        )
+        self._pp_send_ptrs = send_ptrs
+
         # launch non-blocking send of intermediate tensors
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
+        if envs.VLLM_PP_DEFER_SEND_WAIT and not can_defer:
+            for handle in self._pp_send_work:
+                handle.wait()
+            self._pp_send_work = []
 
         return None
 

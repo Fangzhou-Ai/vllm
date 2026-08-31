@@ -4154,6 +4154,10 @@ class GPUModelRunner(
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
 
+        # Consumers holding the output past this step need to know whether
+        # the graph owns the buffer.
+        self.last_cudagraph_mode = cudagraph_mode
+
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(

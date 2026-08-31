@@ -16,7 +16,6 @@ from vllm.models.deepseek_v4.common.ops import (
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
 )
-from vllm.v1.attention.ops import dsv4_opus_paged_prefill
 from vllm.models.deepseek_v4.sparse_mla import (
     DeepseekV4FlashMLAMetadata,
     DeepseekV4SparseMLABackend,
@@ -32,6 +31,7 @@ from vllm.v1.attention.backends.mla.sparse_swa import (
     DeepseekSparseSWAMetadata,
     DeepseekSparseSWAMetadataBuilder,
 )
+from vllm.v1.attention.ops import dsv4_decode, dsv4_prefill
 from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     build_ragged_indices_from_dense,
     rocm_inv_rope_einsum,
@@ -490,6 +490,11 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
         # Block scale for the preshuffled weight; None = not preshuffled.
         self._wqa_wkv_scale: torch.Tensor | None = None
         self._wo_b_scale: torch.Tensor | None = None
+        self._wq_b_scale: torch.Tensor | None = None
+        # FlyDSL mxfp8 dispatchers; None = that path is off.
+        self._wqa_wkv_mxfp8 = None
+        self._wo_b_mxfp8 = None
+        self._wq_b_mxfp8 = None
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -497,6 +502,19 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
     def prepare_attn_preshuffle(self) -> None:
         from vllm._aiter_ops import rocm_aiter_ops
+        from vllm.models.deepseek_v4.amd import mxfp8_preshuffle
+
+        if mxfp8_preshuffle.enabled():
+            # Separate path: it preshuffles these weights itself, so the CK
+            # bpreshuffle setup below must not also run on them.
+            self._wqa_wkv_mxfp8 = mxfp8_preshuffle.make_gemm(self.fused_wqa_wkv)
+            self._wo_b_mxfp8 = mxfp8_preshuffle.make_gemm(self.wo_b)
+            self._wq_b_mxfp8 = mxfp8_preshuffle.make_gemm(self.wq_b)
+            if self.indexer is not None:
+                self.indexer._wq_b_mxfp8 = mxfp8_preshuffle.make_gemm(
+                    self.indexer.wq_b
+                )
+            return
 
         if not rocm_aiter_ops.is_enabled():
             return
@@ -527,6 +545,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
 
         self._wqa_wkv_scale = _prep(self.fused_wqa_wkv)
         self._wo_b_scale = _prep(self.wo_b)
+        self._wq_b_scale = _prep(self.wq_b)
+        if self.indexer is not None:
+            self.indexer._wq_b_scale = _prep(self.indexer.wq_b)
 
     def _bpre_attn_gemm(
         self,
@@ -545,7 +566,17 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             out = tensor_model_parallel_all_reduce(out)
         return out
 
+    def _wq_b_gemm(self, qr: torch.Tensor) -> torch.Tensor:
+        # ColumnParallel -> the sharded output needs no all-reduce.
+        if self._wq_b_mxfp8 is not None:
+            return self._wq_b_mxfp8(qr)
+        if self._wq_b_scale is not None and qr.dim() == 2:
+            return self._bpre_attn_gemm(self.wq_b.weight, self._wq_b_scale, qr, False)
+        return super()._wq_b_gemm(qr)
+
     def _fused_wqa_wkv_gemm(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self._wqa_wkv_mxfp8 is not None:
+            return self._wqa_wkv_mxfp8(hidden_states)
         if self._wqa_wkv_scale is not None and hidden_states.dim() == 2:
             return self._bpre_attn_gemm(
                 self.fused_wqa_wkv.weight, self._wqa_wkv_scale, hidden_states, False
@@ -564,6 +595,8 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.wo_a,
         )
         zf = z.flatten(1)
+        if self._wo_b_mxfp8 is not None:
+            return self._wo_b_mxfp8(zf, reduce_tp=True)
         if self._wo_b_scale is not None and zf.dim() == 2:
             return self._bpre_attn_gemm(self.wo_b.weight, self._wo_b_scale, zf, True)
         return self.wo_b(zf)
@@ -690,6 +723,34 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                 topk_ragged_indices = attn_metadata.c128a_decode_topk_ragged_indices
                 topk_ragged_indptr = attn_metadata.c128a_decode_topk_ragged_indptr
 
+        # Attention straight off the pool, in the same shape the Triton path
+        # below would take.  Declining is safe at any point: nothing has been
+        # mutated, and the decision is made before capture, so whichever path
+        # runs is the one the CUDA graph records.
+        if dsv4_decode.try_dsv4_decode(
+            q=q,
+            output=output,
+            compressed_k_cache=kv_cache,
+            swa_k_cache=self.swa_cache_layer.kv_cache,
+            compressed_ragged_indices=topk_ragged_indices,
+            compressed_ragged_indptr=topk_ragged_indptr,
+            swa_ragged_indices=swa_metadata.decode_swa_ragged_indices,
+            swa_ragged_indptr=swa_metadata.decode_swa_ragged_indptr,
+            compressed_page_size=(
+                None
+                if attn_metadata is None
+                else attn_metadata.block_size // self.compress_ratio
+            ),
+            swa_page_size=swa_metadata.block_size,
+            kv_cache_dtype=self.kv_cache_dtype,
+            attn_sink=self.attn_sink,
+            softmax_scale=self.scale,
+            head_dim=self.head_dim,
+            nope_head_dim=self.nope_head_dim,
+            rope_head_dim=self.rope_head_dim,
+        ):
+            return
+
         rocm_sparse_attn_decode(
             q=q,
             kv_cache=kv_cache,
@@ -767,70 +828,71 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             self.PREFILL_CHUNK_SIZE
         )
 
-        # The opus paged kernel reads the fp8 pool by slot id, so it needs the
-        # compressed top-k in global coordinates.  Mapped once for the whole
-        # prefill rather than per chunk; the SWA side is already paged.
-        opus_paged = dsv4_opus_paged_prefill.enabled()
-        opus_prefix_indices = None
-        opus_prefix_lens = None
-        if opus_paged and not swa_only:
+        # The prefill code object reads the fp8 pool by slot id, so it needs
+        # the compressed top-k in global coordinates.  Mapped once for the
+        # whole prefill rather than per chunk; the SWA side is already paged.
+        raw_prefill_enabled = dsv4_prefill.enabled()
+        raw_extra_indices: torch.Tensor | None = None
+        raw_extra_lens: torch.Tensor | None = None
+        if raw_prefill_enabled and not swa_only:
             assert attn_metadata is not None
             assert swa_metadata.token_to_req_indices is not None
             assert swa_metadata.is_valid_token is not None
-            prefill_slice = slice(
+            prefill_token_slice = slice(
                 num_decode_tokens, num_decode_tokens + num_prefill_tokens
             )
-            opus_prefix_indices, opus_prefix_lens = (
-                compute_global_topk_indices_and_lens(
-                    topk_indices,
-                    swa_metadata.token_to_req_indices[prefill_slice],
-                    attn_metadata.block_table,
-                    attn_metadata.block_size // self.compress_ratio,
-                    swa_metadata.is_valid_token[prefill_slice],
-                )
+            raw_extra_indices, raw_extra_lens = compute_global_topk_indices_and_lens(
+                topk_indices,
+                swa_metadata.token_to_req_indices[prefill_token_slice],
+                attn_metadata.block_table,
+                attn_metadata.block_size // self.compress_ratio,
+                swa_metadata.is_valid_token[prefill_token_slice],
             )
 
-        workspace_manager = current_workspace_manager()
-        kv = workspace_manager.get_simultaneous(
-            ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
-        )[0]
+        # Deferred: neither paged route touches kv, so a chunk that takes one
+        # of them never needs the workspace slab.
+        kv: torch.Tensor | None = None
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * self.PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + self.PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
 
-            if opus_paged and swa_metadata.prefill_swa_indices is not None:
-                # Attention straight off the pool, skipping the gather below.
-                # Declining is safe at any point: nothing has been mutated.
-                opus_qs = (
+
+            if (
+                raw_prefill_enabled
+                and swa_metadata.prefill_swa_indices is not None
+                and swa_metadata.prefill_swa_lens is not None
+            ):
+                query_start = (
                     query_start_loc_cpu[num_decodes + chunk_start]
                     - prefill_token_base
                 )
-                opus_qe = (
+                query_end = (
                     query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
                 )
-                assert swa_metadata.prefill_swa_lens is not None
-                if dsv4_opus_paged_prefill.try_opus_paged(
-                    q=q[opus_qs:opus_qe],
-                    output=output[opus_qs:opus_qe],
+                extra_indices_chunk = (
+                    raw_extra_indices[query_start:query_end]
+                    if raw_extra_indices is not None
+                    else None
+                )
+                extra_lens_chunk = (
+                    raw_extra_lens[query_start:query_end]
+                    if raw_extra_lens is not None
+                    else None
+                )
+                if dsv4_prefill.try_dsv4_prefill(
+                    q=q[query_start:query_end],
+                    output=output[query_start:query_end],
                     compressed_k_cache=compressed_k_cache,
                     swa_k_cache=swa_k_cache,
-                    compressed_indices=(
-                        None
-                        if opus_prefix_indices is None
-                        else opus_prefix_indices[opus_qs:opus_qe]
-                    ),
-                    compressed_lens=(
-                        None
-                        if opus_prefix_lens is None
-                        else opus_prefix_lens[opus_qs:opus_qe]
-                    ),
-                    swa_indices=swa_metadata.prefill_swa_indices[opus_qs:opus_qe],
-                    swa_lens=swa_metadata.prefill_swa_lens[opus_qs:opus_qe],
+                    compressed_indices=extra_indices_chunk,
+                    compressed_lens=extra_lens_chunk,
+                    swa_indices=swa_metadata.prefill_swa_indices[query_start:query_end],
+                    swa_lens=swa_metadata.prefill_swa_lens[query_start:query_end],
                     compressed_page_size=(
-                        None
-                        if attn_metadata is None
-                        else attn_metadata.block_size // self.compress_ratio
+                        attn_metadata.block_size // self.compress_ratio
+                        if attn_metadata is not None
+                        else None
                     ),
                     swa_page_size=swa_metadata.block_size,
                     kv_cache_dtype=self.kv_cache_dtype,
@@ -841,6 +903,12 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
                     rope_head_dim=self.rope_head_dim,
                 ):
                     continue
+
+            if kv is None:
+                workspace_manager = current_workspace_manager()
+                kv = workspace_manager.get_simultaneous(
+                    ((self.PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
+                )[0]
             if not swa_only:
                 assert attn_metadata is not None
                 assert compressed_k_cache is not None
@@ -891,7 +959,9 @@ class DeepseekV4ROCMAiterMLAAttention(DeepseekV4Attention):
             )
             rocm_sparse_attn_prefill(
                 q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
+                # Only chunk_size slabs were populated.  Keep the unused tail
+                # out of fallback pool-wide preprocessing.
+                kv=kv[:chunk_size].view(-1, 1, q.shape[-1]),
                 indices=combined_indices,
                 topk_length=combined_lens,
                 scale=self.scale,

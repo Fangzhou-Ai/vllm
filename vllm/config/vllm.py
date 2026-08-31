@@ -548,6 +548,8 @@ class VllmConfig:
 
     @property
     def max_concurrent_batches(self) -> int:
+        if envs.VLLM_MAX_CONCURRENT_BATCHES is not None:
+            return envs.VLLM_MAX_CONCURRENT_BATCHES
         # PP requires PP-size concurrent batches to fill the pipeline.
         # Async scheduling requires 2 concurrent batches to overlap.
         pp_size = self.parallel_config.pipeline_parallel_size

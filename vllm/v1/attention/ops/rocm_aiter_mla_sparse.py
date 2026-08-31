@@ -5,6 +5,7 @@ import importlib
 import math
 from importlib.util import find_spec
 
+
 import torch
 import torch.nn.functional as F
 
@@ -934,20 +935,25 @@ def _expand_2d_block_scales(
 @triton.jit
 def _inverse_rope_gptj_kernel(
     o_ptr,  # [T, H, D] input
-    out_ptr,  # [T, H, D] bf16 output
+    out_ptr,  # [T, H, D] bf16 output, or fp8 when QUANT
     pos_ptr,  # [T] positions
     cos_sin_ptr,  # [P, rope_dim] fp32 (cos[:half] | sin[half:])
+    s_ptr,  # [T, H * NBLK] uint8 e8m0 scales, only read when QUANT
     s_t,
     s_h,  # input row strides (last dim contiguous)
     os_t,
     os_h,  # output row strides
     cs_stride,  # cos_sin_cache row stride
+    ss_t,  # scale row stride per token
     NUM_HEADS: tl.constexpr,
     NOPE: tl.constexpr,  # non-rope head dims (passed through)
     HALF: tl.constexpr,  # rope_dim // 2
     HEADS: tl.constexpr,  # heads handled per program
     BLOCK_NOPE: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
+    NBLK: tl.constexpr,  # 128-wide quant groups per head
+    WIDE: tl.constexpr,  # BLOCK_NOPE // NBLK, as a host-side constant
+    QUANT: tl.constexpr,
 ):
     """Fused inverse GPT-J RoPE on the trailing rope_dim of each (token, head).
 
@@ -971,13 +977,13 @@ def _inverse_rope_gptj_kernel(
     cos = tl.load(cos_sin_ptr + pos * cs_stride + k, mask=kmask)
     sin = tl.load(cos_sin_ptr + pos * cs_stride + HALF + k, mask=kmask)
 
-    # NoPE lanes pass through unchanged (only cast to bf16).
+    # NoPE lanes pass through unchanged.
     n = tl.arange(0, BLOCK_NOPE)
     nmask = n < NOPE
     in_n = t * s_t + hs[:, None] * s_h + n[None, :]
     out_n = t * os_t + hs[:, None] * os_h + n[None, :]
     nm = hmask[:, None] & nmask[None, :]
-    tl.store(out_ptr + out_n, tl.load(o_ptr + in_n, mask=nm).to(tl.bfloat16), mask=nm)
+    nope = tl.load(o_ptr + in_n, mask=nm, other=0.0)
 
     # RoPE lanes: out_even = a*cos + b*sin, out_odd = b*cos - a*sin
     # (a = even lane, b = odd lane; sin negated for the inverse rotation).
@@ -988,8 +994,39 @@ def _inverse_rope_gptj_kernel(
     b = tl.load(o_ptr + in_r + 1, mask=rm).to(tl.float32)
     out_even = a * cos[None, :] + b * sin[None, :]
     out_odd = b * cos[None, :] - a * sin[None, :]
-    tl.store(out_ptr + out_r, out_even.to(tl.bfloat16), mask=rm)
-    tl.store(out_ptr + out_r + 1, out_odd.to(tl.bfloat16), mask=rm)
+
+    if QUANT:
+        # A group's amax is the pass-through slice, plus the rope results
+        # for the last group, the only one they land in.
+        nope_f = nope.to(tl.float32)
+        grouped = tl.reshape(nope_f, (HEADS, NBLK, WIDE))
+        amax = tl.max(tl.abs(grouped), axis=2)
+        rope_amax = tl.maximum(
+            tl.max(tl.abs(out_even), axis=1), tl.max(tl.abs(out_odd), axis=1)
+        )
+        is_last = tl.arange(0, NBLK)[None, :] == (NBLK - 1)
+        amax = tl.where(is_last, tl.maximum(amax, rope_amax[:, None]), amax)
+
+        raw = tl.maximum(amax / 448.0, 1e-8)
+        e = tl.minimum(tl.maximum(tl.ceil(tl.log2(raw)).to(tl.int32) + 127, 0), 255)
+        scale = tl.exp2((e - 127).to(tl.float32))
+
+        qn = tl.reshape(grouped / scale[:, :, None], (HEADS, BLOCK_NOPE))
+        qn = tl.minimum(tl.maximum(qn, -448.0), 448.0)
+        tl.store(out_ptr + out_n, qn.to(out_ptr.dtype.element_ty), mask=nm)
+
+        last_scale = tl.sum(tl.where(is_last, scale, 0.0), axis=1)
+        qe = tl.minimum(tl.maximum(out_even / last_scale[:, None], -448.0), 448.0)
+        qo = tl.minimum(tl.maximum(out_odd / last_scale[:, None], -448.0), 448.0)
+        tl.store(out_ptr + out_r, qe.to(out_ptr.dtype.element_ty), mask=rm)
+        tl.store(out_ptr + out_r + 1, qo.to(out_ptr.dtype.element_ty), mask=rm)
+
+        s_off = t * ss_t + hs[:, None] * NBLK + tl.arange(0, NBLK)[None, :]
+        tl.store(s_ptr + s_off, e.to(tl.uint8), mask=hmask[:, None] & (is_last | ~is_last))
+    else:
+        tl.store(out_ptr + out_n, nope.to(tl.bfloat16), mask=nm)
+        tl.store(out_ptr + out_r, out_even.to(tl.bfloat16), mask=rm)
+        tl.store(out_ptr + out_r + 1, out_odd.to(tl.bfloat16), mask=rm)
 
 
 def _fused_inverse_rope_gptj(
@@ -997,8 +1034,14 @@ def _fused_inverse_rope_gptj(
     positions: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     rope_head_dim: int,
-) -> torch.Tensor:
-    """bf16 inverse GPT-J RoPE via a single fused Triton kernel."""
+    quant: bool = False,
+):
+    """Inverse GPT-J RoPE via a single fused Triton kernel.
+
+    ``quant`` makes it emit fp8 e4m3 plus 128-wide e8m0 scales instead of
+    bf16, which is what the fp8 wo_a BMM takes; the caller gets
+    ``(values, scales)`` instead of a single tensor.
+    """
     assert o.dim() == 3 and o.stride(-1) == 1, (
         "_fused_inverse_rope_gptj expects a [T, H, D] input with a contiguous last dim"
     )
@@ -1010,11 +1053,29 @@ def _fused_inverse_rope_gptj(
         f"[P, {rope_head_dim}] = cos | sin, got {tuple(cos_sin_cache.shape)}"
     )
     num_tokens, num_heads, head_dim = o.shape
+    nope = head_dim - rope_head_dim
+    nblk = head_dim // 128
+    if quant:
+        # The rope lanes have to sit inside the final quant group.
+        assert (
+            head_dim % 128 == 0
+            and triton.next_power_of_2(nope) == head_dim
+            and nope // 128 == (head_dim - 1) // 128
+        ), f"cannot fold the quant into the rope for head_dim={head_dim}"
     out = torch.empty(
-        (num_tokens, num_heads, head_dim), dtype=torch.bfloat16, device=o.device
+        (num_tokens, num_heads, head_dim),
+        dtype=torch.float8_e4m3fn if quant else torch.bfloat16,
+        device=o.device,
+    )
+    scales = (
+        torch.empty(
+            (num_tokens, num_heads * nblk), dtype=torch.uint8, device=o.device
+        )
+        if quant
+        else None
     )
     if num_tokens == 0:
-        return out
+        return (out, scales) if quant else out
     # One program per (token, head) spreads a 512-element row over a full warp
     # set, which is a quarter of the per-lane vector width this streaming op can
     # use. Grouping heads restores it. Raising the group further is a
@@ -1022,6 +1083,8 @@ def _fused_inverse_rope_gptj(
     # HEADS * BLOCK_HALF >= 512 the backend contracts the rope math into an FMA
     # and the result moves by an ulp.
     heads_per_prog = 4 if num_heads >= 4 else 1
+    if quant and num_heads >= 8:
+        heads_per_prog = 8
     _inverse_rope_gptj_kernel[
         (triton.cdiv(num_heads, heads_per_prog), num_tokens)
     ](
@@ -1029,21 +1092,26 @@ def _fused_inverse_rope_gptj(
         out,
         positions,
         cos_sin_cache,
+        scales,
         o.stride(0),
         o.stride(1),
         out.stride(0),
         out.stride(1),
         cos_sin_cache.stride(0),
+        num_heads * nblk,
         NUM_HEADS=num_heads,
-        NOPE=head_dim - rope_head_dim,
+        NOPE=nope,
         HALF=rope_head_dim // 2,
         HEADS=heads_per_prog,
-        BLOCK_NOPE=triton.next_power_of_2(head_dim - rope_head_dim),
+        BLOCK_NOPE=triton.next_power_of_2(nope),
         BLOCK_HALF=triton.next_power_of_2(rope_head_dim // 2),
-        # pinned: the default of 4 halves the per-lane vector width here
-        num_warps=2,
+        NBLK=nblk,
+        WIDE=triton.next_power_of_2(nope) // nblk,
+        QUANT=quant,
+        # The group maximum wants a wider tile than the streaming bf16 form.
+        num_warps=1 if quant else 2,
     )
-    return out
+    return (out, scales) if quant else out
 
 
 def _get_cached_wo_a_bf16(
@@ -1083,6 +1151,7 @@ def _get_cached_wo_a_bf16(
     return cached
 
 
+
 def rocm_inv_rope_einsum(
     rotary_emb: torch.nn.Module,
     o: torch.Tensor,
@@ -1097,10 +1166,22 @@ def rocm_inv_rope_einsum(
     Fuses the inverse GPT-J RoPE into one Triton kernel and caches the bf16
     wo_a weight so the per-step dequant disappears.
     """
+    if envs.VLLM_DSV4_FP8_BMM:
+        from aiter.ops.opus.bmm_op import bmm_a8w8_mxscale_opus
+
+        fused_q, fused_s = _fused_inverse_rope_gptj(
+            o, positions, rotary_emb.cos_sin_cache, rope_head_dim, quant=True
+        )
+        return bmm_a8w8_mxscale_opus(
+            fused_q.view(o.shape[0], n_local_groups, -1),
+            wo_a.weight_bmm,
+            fused_s.view(o.shape[0], n_local_groups, -1),
+            wo_a.weight_scale_e8m0_bmm,
+        )
+
     o_ref = _fused_inverse_rope_gptj(
         o, positions, rotary_emb.cos_sin_cache, rope_head_dim
-    )
-    o_ref = o_ref.view(o.shape[0], n_local_groups, -1)
+    ).view(o.shape[0], n_local_groups, -1)
 
     wo_a_weight = _get_cached_wo_a_bf16(
         wo_a, n_local_groups, o_lora_rank, o_ref.shape[-1]

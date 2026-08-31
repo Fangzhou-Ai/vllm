@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_PP_DEFER_SEND_WAIT: bool = False
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -148,6 +149,8 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_FP4BMM: bool = True
     VLLM_ROCM_USE_AITER_UNIFIED_ATTENTION: bool = False
     VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: bool = False
+    VLLM_DSV4_FP8_BMM: bool = False
+    VLLM_DSV4_AITER_FUSED_MHC: bool = False
     VLLM_ROCM_USE_AITER_TRITON_GEMM: bool = True
     VLLM_ROCM_USE_SKINNY_GEMM: bool = True
     VLLM_ROCM_FP8_PADDING: bool = True
@@ -236,6 +239,8 @@ if TYPE_CHECKING:
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_ENFORCE_STRICT_TOOL_CALLING: bool = True
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
+    VLLM_RPC_RING_CHUNKS: int = 10
+    VLLM_MAX_CONCURRENT_BATCHES: int | None = None
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS: int = 5
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
@@ -864,6 +869,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Wait on a pipeline-parallel send at the next step instead of before
+    # returning, so the next step's compute overlaps it. Only applies on
+    # steps whose output buffer is private to the send.
+    "VLLM_PP_DEFER_SEND_WAIT": lambda: bool(
+        int(os.getenv("VLLM_PP_DEFER_SEND_WAIT", "0"))
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (
@@ -1333,6 +1344,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS", "False").lower()
         in ("true", "1")
     ),
+    # Run the DeepSeek-V4 wo_a bmm in fp8 off the checkpoint's e8m0 scales,
+    # with the activation quant folded into the inverse-RoPE kernel.
+    "VLLM_DSV4_FP8_BMM": lambda: (
+        os.getenv("VLLM_DSV4_FP8_BMM", "False").lower() in ("true", "1")
+    ),
+    # Use AITER's fused MHC post+pre instead of its separate post and pre.
+    "VLLM_DSV4_AITER_FUSED_MHC": lambda: (
+        os.getenv("VLLM_DSV4_AITER_FUSED_MHC", "False").lower() in ("true", "1")
+    ),
     # Whether to use aiter triton kernels for gemm ops.
     # By default is enabled.
     "VLLM_ROCM_USE_AITER_TRITON_GEMM": lambda: (
@@ -1759,6 +1779,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # processes via zmq.
     "VLLM_MQ_MAX_CHUNK_BYTES_MB": lambda: int(
         os.getenv("VLLM_MQ_MAX_CHUNK_BYTES_MB", "16")
+    ),
+    # Number of slots in the rpc message queue ring. A slot is only reusable
+    # once every worker has read it, and each engine step enqueues two rpcs,
+    # so the ring caps how far the engine can dispatch ahead of the slowest
+    # worker. Costs VLLM_MQ_MAX_CHUNK_BYTES_MB of shared memory per slot.
+    "VLLM_RPC_RING_CHUNKS": lambda: int(os.getenv("VLLM_RPC_RING_CHUNKS", "10")),
+    # Number of batches the engine keeps in flight. Unset derives it from
+    # the parallel config. Raising it past half of VLLM_RPC_RING_CHUNKS
+    # makes the engine block on the rpc ring on every step.
+    "VLLM_MAX_CONCURRENT_BATCHES": lambda: (
+        int(os.getenv("VLLM_MAX_CONCURRENT_BATCHES"))
+        if os.getenv("VLLM_MAX_CONCURRENT_BATCHES")
+        else None
     ),
     # Timeout in seconds for execute_model RPC calls in multiprocessing
     # executor (only applies when TP > 1).

@@ -10,6 +10,7 @@ __all__ = [
     "mhc_post_cuda",
     "mhc_fused_post_pre_cuda",
     "hc_head_fused_kernel_cuda",
+    "mhc_fused_post_pre_aiter",
     "mhc_pre_aiter",
     "mhc_post_aiter",
     "mhc_fused_post_pre_aiter",

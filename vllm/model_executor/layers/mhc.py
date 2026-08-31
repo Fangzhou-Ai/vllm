@@ -7,6 +7,7 @@ import torch
 import vllm.model_executor.kernels.mhc as mhc_kernels
 from vllm._aiter_ops import is_aiter_found_and_supported
 from vllm.model_executor.custom_op import CustomOp
+import vllm.envs as envs
 from vllm.platforms import current_platform
 from vllm.utils.import_utils import has_tilelang
 
@@ -444,6 +445,25 @@ class MHCFusedPostPreOp(CustomOp):
         norm_weight: torch.Tensor | None = None,
         norm_eps: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if (
+            HAS_AITER_MHC
+            and envs.VLLM_DSV4_AITER_FUSED_MHC
+            and residual.shape[-1] % 256 == 0
+        ):
+            return torch.ops.vllm.mhc_fused_post_pre_aiter(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
         if HAS_TILELANG_MHC:
             return torch.ops.vllm.mhc_fused_post_pre_tilelang(
                 x,
