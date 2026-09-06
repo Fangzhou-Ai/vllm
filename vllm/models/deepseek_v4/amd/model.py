@@ -206,9 +206,7 @@ def _heterogeneous_shared_expert_enabled(vllm_config: VllmConfig) -> bool:
     parallel_config = vllm_config.parallel_config
     reasons: list[str] = []
 
-    if not (
-        current_platform.is_rocm() and envs.VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS
-    ):
+    if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
         return False
     if not on_gfx950():
         reasons.append("the device is not gfx950")
@@ -226,8 +224,6 @@ def _heterogeneous_shared_expert_enabled(vllm_config: VllmConfig) -> bool:
         reasons.append("the MoE backend is not AITER")
     if vllm_config.model_config.dtype != torch.bfloat16:
         reasons.append("the model dtype is not BF16")
-    if not rocm_aiter_ops.is_fusion_moe_shared_experts_enabled():
-        reasons.append("AITER shared-expert fusion is not enabled")
     if not rocm_aiter_ops.fused_moe_supports_heterogeneous_shared_expert(1):
         reasons.append(
             "AITER lacks CSV-backed DSV4 I384 heterogeneous shared-expert support"
