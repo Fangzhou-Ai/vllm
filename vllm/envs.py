@@ -129,6 +129,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_USE_AITER_CUSTOM_AR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR: bool = True
     VLLM_ROCM_USE_AITER_LINEAR_HIPBMM: bool = False
+    VLLM_ROCM_USE_AITER_MXFP8_HIPBMM: bool = False
     VLLM_ROCM_USE_AITER_MOE: bool = True
     VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: int = 0
     AITER_SITUV2_A8W4: bool = False
@@ -1205,6 +1206,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_ROCM_USE_AITER_LINEAR_HIPBMM": lambda: (
         os.getenv("VLLM_ROCM_USE_AITER_LINEAR_HIPBMM", "False").lower() in ("true", "1")
+    ),
+    # Route MXFP8 linear layers through aiter hipb_mm (hipBLASLt VEC32_UE8M0
+    # block scaling) instead of the Triton tl.dot_scaled kernel. Off by default:
+    # on ROCm 7.2.4 the hipBLASLt MX solutions are untuned and lose to both the
+    # Triton path and plain BF16 on every shape measured.
+    "VLLM_ROCM_USE_AITER_MXFP8_HIPBMM": lambda: (
+        os.getenv("VLLM_ROCM_USE_AITER_MXFP8_HIPBMM", "False").lower() in ("true", "1")
     ),
     # Whether to use aiter moe ops.
     # By default is enabled.

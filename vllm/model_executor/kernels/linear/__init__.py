@@ -103,6 +103,9 @@ from vllm.model_executor.kernels.linear.mxfp8 import (
     Mxfp8LinearKernel,
     Mxfp8LinearLayerConfig,
 )
+from vllm.model_executor.kernels.linear.mxfp8.aiter import (
+    AiterHipbMMMxfp8LinearKernel,
+)
 from vllm.model_executor.kernels.linear.mxfp8.emulation import (
     EmulationMxfp8LinearKernel,
 )
@@ -448,6 +451,10 @@ _POSSIBLE_MXFP8_KERNELS: dict[PlatformEnum, list[type[Mxfp8LinearKernel]]] = {
         HummingMxfp8LinearKernel,
     ],
     PlatformEnum.ROCM: [
+        # hipBLASLt's own MX scale mode, opt-in only
+        # (VLLM_ROCM_USE_AITER_MXFP8_HIPBMM); its solutions are untuned and lose
+        # to the Triton path below on every shape measured on ROCm 7.2.4.
+        AiterHipbMMMxfp8LinearKernel,
         # Native CDNA4 (gfx950) MX linear; is_supported() gates to gfx95x and
         # falls through to BF16 emulation (hipBLASLt) elsewhere / on regression.
         RocmDotScaledMxfp8LinearKernel,
@@ -1194,6 +1201,7 @@ __all__ = [
     "FlashInferCutlassMxfp8LinearKernel",
     "MarlinMxfp8LinearKernel",
     "XPUMxFp8LinearKernel",
+    "AiterHipbMMMxfp8LinearKernel",
     "EmulationMxfp8LinearKernel",
     "CutlassNvFp4LinearKernel",
     "EmulationNvFp4LinearKernel",
