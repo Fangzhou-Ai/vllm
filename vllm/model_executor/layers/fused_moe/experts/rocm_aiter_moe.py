@@ -41,7 +41,7 @@ class QuantMethod(IntEnum):
     NO = 0  # a16w16
     PER_TENSOR = 1  # w8a8 (pre_Tensor)
     PER_TOKEN = 2  # w8a8/w8a4 (per_Token)
-    BLOCK_1X32 = 3  # fp4x2
+    BLOCK_1X32 = 3  # MXFP4/MXFP8 activations
     BLOCK_1X128 = 4  # block quantized w8a8 (per_1x128)
     BLOCK_128x128 = 5  # block quantized w8a8 (per_128x128)
 
@@ -54,6 +54,23 @@ class ActivationMethod(IntEnum):
 
 
 aiter_topK_meta_data: tuple[torch.Tensor, torch.Tensor] | None = None
+
+
+def _has_fake_expert_slot(
+    topk_ids: torch.Tensor,
+    expert_mask: torch.Tensor | None,
+    global_num_experts: int,
+    experts_per_token: int,
+) -> bool:
+    """Whether AITER's top-k inputs contain its trailing fake expert slot."""
+    if expert_mask is None:
+        return False
+
+    extra_expert_mask_entries = expert_mask.numel() - global_num_experts
+    extra_topk_slots = topk_ids.shape[-1] - experts_per_token
+    return bool(
+        extra_expert_mask_entries > 0 and extra_expert_mask_entries == extra_topk_slots
+    )
 
 
 @lru_cache(maxsize=1)
@@ -308,9 +325,13 @@ def rocm_aiter_fused_experts(
 
     else:
         quant_method = QuantMethod.NO.value
-        # mxfp4 i.e. w4a4, w4a16 uses BLOCK_1X32
+        # MXFP4 weights with BF16, MXFP8, or MXFP4 activations use BLOCK_1X32.
         # mxfp6 and mxfp8 are unsupported in AITER currently and use emulation instead
-        if quant_config.use_mxfp4_w4a4 or quant_config.use_mxfp4_w4a16:
+        if (
+            quant_config.use_mxfp4_w4a4
+            or quant_config.use_mxfp4_w4a8
+            or quant_config.use_mxfp4_w4a16
+        ):
             quant_method = QuantMethod.BLOCK_1X32.value
         # w8a8 block-scaled
         if quant_config.block_shape is not None and quant_config.use_fp8_w8a8:
@@ -340,7 +361,12 @@ def rocm_aiter_fused_experts(
         intermediate_pad = 0
         assert moe_config.hidden_dim_unpadded is not None
         assert moe_config.intermediate_size_per_partition_unpadded is not None
-        hidden_pad = hidden_states.shape[1] - moe_config.hidden_dim_unpadded
+        from aiter import dtypes
+
+        hidden_dim = hidden_states.shape[1]
+        if hidden_states.dtype == dtypes.fp4x2:
+            hidden_dim *= 2
+        hidden_pad = hidden_dim - moe_config.hidden_dim_unpadded
         intermediate_pad = (
             (
                 moe_config.intermediate_size_per_partition
@@ -365,14 +391,16 @@ def rocm_aiter_fused_experts(
 
         # https://github.com/ROCm/aiter/pull/3123 specialized the AITER stage1 GEMMs
         # for interleaved vs separated gate and up weights.
-        # For gpt-oss i.e. use_mxfp4_w4a16=True, the weights are shuffled by
-        # `rocm_aiter_ops.shuffle_weight_a16w4` in `oracle/mxfp4.py`,
-        # which always sets `is_guinterleave=True`.
-        # Hence, we pass in GateMode.INTERLEAVE to match the weight shuffling.
+        # AITER's A8W4 and W4A16 paths use gate/up-interleaved weights, while
+        # A4W4 uses the separated layout.
         from aiter.ops.flydsl.moe_common import GateMode
 
         gate_mode = ""
-        if activation == MoEActivation.SITU:
+        if quant_config.use_mxfp4_w4a8:
+            gate_mode = GateMode.INTERLEAVE.value
+        elif quant_config.use_mxfp4_w4a4 and a1q_scale is not None:
+            gate_mode = GateMode.SEPARATED.value
+        elif activation == MoEActivation.SITU:
             # a8w4 (VLLM_ROCM_USE_AITER_MOE_SITUV2_A8W4=1) uses the gate/up-
             # interleaved (_gui_) fp8 flydsl kernels; default a16w4 SiTU stays
             # separated.
@@ -389,6 +417,10 @@ def rocm_aiter_fused_experts(
                 if activation_interleave
                 else GateMode.SEPARATED.value
             )
+
+        swiglu_limit = quant_config.gemm1_clamp_limit
+        if swiglu_limit is None:
+            swiglu_limit = moe_config.swiglu_limit
 
         return rocm_aiter_ops.fused_moe(
             hidden_states,
@@ -412,8 +444,15 @@ def rocm_aiter_fused_experts(
             bias1=quant_config.w1_bias if quant_config.use_mxfp4_w4a16 else None,
             bias2=quant_config.w2_bias if quant_config.use_mxfp4_w4a16 else None,
             moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            swiglu_limit=0.0 if swiglu_limit is None else swiglu_limit,
             beta=moe_config.activation_situ_beta,
             linear_beta=moe_config.activation_situ_linear_beta,
+            has_fake_expert_slot=_has_fake_expert_slot(
+                topk_ids,
+                expert_mask,
+                global_num_experts=moe_config.num_experts,
+                experts_per_token=moe_config.experts_per_token,
+            ),
         )
 
 
@@ -422,11 +461,11 @@ class AiterExperts(mk.FusedMoEExpertsModular):
 
     @property
     def expects_unquantized_inputs(self) -> bool:
-        # When paired with MoRI, the prepare/finalize handles FP8
-        # quantization during dispatch to reduce network traffic,
-        # so we should not defer input quantization.
-        # Otherwise, AITER fused MoE kernels handle input quantization
-        # internally via a single fused kernel.
+        # MX prequantization is negotiated with prepare/finalize by the modular
+        # kernel. If prepare/finalize cannot transport both payload and scales,
+        # AITER quantizes the received activations internally.
+        if self.quant_config.use_mxfp4_w4a8 or self.quant_config.use_mxfp4_w4a4:
+            return True
         return not self.moe_config.use_mori_kernels
 
     @staticmethod
@@ -468,6 +507,7 @@ class AiterExperts(mk.FusedMoEExpertsModular):
             (kFp8StaticTensorSym, kFp8DynamicTensorSym),
             (kFp8StaticChannelSym, kFp8DynamicTokenSym),
             (kMxfp4Static, None),
+            (kMxfp4Static, kFp8StaticTensorSym),
             (kMxfp4Static, kMxfp4Dynamic),
         ]
         if (weight_key, activation_key) not in SUPPORTED_W_A:
@@ -498,6 +538,18 @@ class AiterExperts(mk.FusedMoEExpertsModular):
 
     def finalize_weight_and_reduce_impl(self) -> mk.TopKWeightAndReduce:
         return TopKWeightAndReduceNoOP()
+
+    def moe_problem_size(
+        self,
+        a1: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> tuple[int, int, int, int, int]:
+        E, M, N, K, topk = super().moe_problem_size(a1, w1, w2, topk_ids)
+        if a1.dtype == getattr(torch, "float4_e2m1fn_x2", None):
+            K *= 2
+        return E, M, N, K, topk
 
     def workspace_shapes(
         self,

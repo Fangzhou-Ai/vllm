@@ -239,6 +239,48 @@ def _mxfp8_e4m3_quantize(
     return mxfp8_e4m3_quantize(A, is_sf_swizzled_layout, mx_alignment)
 
 
+def aiter_mx_quantize_input(
+    A: torch.Tensor,
+    quant_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter import QuantType, dtypes, get_hip_quant
+
+    if quant_dtype not in (dtypes.fp8, dtypes.fp4x2):
+        raise ValueError(f"unsupported AITER MX activation dtype: {quant_dtype}")
+
+    num_tokens, hidden_dim = A.shape
+    if hidden_dim % 32 != 0:
+        raise ValueError("AITER MX quantization requires hidden_dim divisible by 32")
+
+    payload_width = hidden_dim // 2 if quant_dtype == dtypes.fp4x2 else hidden_dim
+    if num_tokens == 0:
+        return (
+            A.new_empty((0, payload_width), dtype=quant_dtype),
+            A.new_empty((0, hidden_dim // 32), dtype=dtypes.fp8_e8m0),
+        )
+
+    quantize = get_hip_quant(QuantType.per_1x32)
+    quantized, scale = quantize(
+        A,
+        quant_dtype=quant_dtype,
+        scale_type=dtypes.fp8_e8m0,
+    )
+    if not quantized.is_contiguous() or not scale.is_contiguous():
+        raise ValueError("AITER MX quantization tensors must be contiguous")
+
+    if quantized.dtype != quant_dtype or quantized.shape != (
+        num_tokens,
+        payload_width,
+    ):
+        raise ValueError("AITER MX quantization produced an invalid payload layout")
+    if scale.dtype != dtypes.fp8_e8m0 or scale.shape != (
+        num_tokens,
+        hidden_dim // 32,
+    ):
+        raise ValueError("AITER MX quantization produced an invalid scale layout")
+    return quantized, scale
+
+
 def _mxfp6_e3m2_quantize(
     A: torch.Tensor,
     A_scale: torch.Tensor | None,

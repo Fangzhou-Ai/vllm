@@ -20,6 +20,7 @@ This file only keeps the MoE-shaped integration angle for those helpers.
 
 import importlib
 import math
+import types
 import warnings
 from typing import Any, NamedTuple
 
@@ -497,6 +498,30 @@ def test_aiter_fused_moe_fake_tensor_support():
     )
 
 
+def test_aiter_fused_moe_fake_preserves_packed_fp4_logical_width():
+    """The public custom op should infer its output width from w2, not from
+    the packed FP4 activation width."""
+    from aiter import dtypes
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    _assert_aiter_supported()
+    if getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2:
+        pytest.skip("native torch FP4 dtype is required")
+
+    with FakeTensorMode():
+        output = torch.ops.vllm.rocm_aiter_fused_moe(
+            torch.empty(0, 32, dtype=dtypes.fp4x2, device="cuda"),
+            torch.empty(4, 64, 32, dtype=dtypes.fp4x2, device="cuda"),
+            torch.empty(4, 64, 16, dtype=dtypes.fp4x2, device="cuda"),
+            torch.empty(0, 2, device="cuda"),
+            torch.empty(0, 2, dtype=torch.int32, device="cuda"),
+            output_dtype=torch.bfloat16,
+        )
+
+    assert output.shape == (0, 64)
+    assert output.dtype == torch.bfloat16
+
+
 # Env gating tests --------------------------------------------------------
 
 
@@ -605,6 +630,348 @@ def test_activation_method_enum_values():
 # MXFP4 kernel tests ------------------------------------------------------
 
 
+def _make_distributed_mxfp4_config(
+    backend: str, all2all_backend: str = "mori_low_latency"
+):
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        RoutingMethodType,
+    )
+
+    return FusedMoEConfig(
+        num_experts=8,
+        experts_per_token=2,
+        hidden_dim=64,
+        intermediate_size=64,
+        num_local_experts=4,
+        num_logical_experts=8,
+        moe_parallel_config=FusedMoEParallelConfig(
+            tp_size=1,
+            pcp_size=1,
+            dp_size=2,
+            ep_size=2,
+            tp_rank=0,
+            pcp_rank=0,
+            dp_rank=0,
+            ep_rank=0,
+            sp_size=1,
+            use_ep=True,
+            all2all_backend=all2all_backend,
+            enable_eplb=False,
+        ),
+        activation=MoEActivation.SILU,
+        in_dtype=torch.bfloat16,
+        device="cuda",
+        routing_method=RoutingMethodType.Renormalize,
+        moe_backend=backend,
+        max_num_tokens=16,
+    )
+
+
+@pytest.mark.parametrize(
+    ("quant_kind", "prequantized", "payload_width", "expected_gate_mode"),
+    [
+        pytest.param("mxfp8", True, 64, "interleave", id="mxfp8-prequant"),
+        pytest.param("mxfp8", False, 64, "interleave", id="mxfp8-dynamic"),
+        pytest.param("mxfp4", True, 32, "separated", id="mxfp4-prequant"),
+    ],
+)
+def test_aiter_forwards_mx_quantization_metadata(
+    monkeypatch, quant_kind, prequantized, payload_width, expected_gate_mode
+):
+    from aiter import dtypes
+    from aiter.ops.flydsl.moe_common import GateMode
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import (
+        mxfp4_moe_quant_config,
+        mxfp4_w4a8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+        QuantMethod,
+        rocm_aiter_fused_experts,
+    )
+
+    _assert_aiter_supported()
+    activation_dtype = (
+        dtypes.fp8
+        if quant_kind == "mxfp8" and prequantized
+        else dtypes.fp4x2
+        if quant_kind == "mxfp4"
+        else torch.bfloat16
+    )
+    if quant_kind == "mxfp4" and (
+        getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2
+    ):
+        pytest.skip("native torch FP4 dtype is required")
+
+    captured: dict[str, Any] = {}
+
+    def fused_moe(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return torch.empty(args[0].shape[0], 64, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(rocm_aiter_ops, "fused_moe", fused_moe)
+    hidden_states = torch.empty(3, payload_width, dtype=activation_dtype)
+    a1_scale = torch.empty(3, 2, dtype=dtypes.fp8_e8m0) if prequantized else None
+    scale = torch.empty(1, dtype=torch.uint8)
+    quant_config = (
+        mxfp4_w4a8_moe_quant_config(scale, scale)
+        if quant_kind == "mxfp8"
+        else mxfp4_moe_quant_config(scale, scale)
+    )
+    moe_config = make_dummy_moe_config(
+        num_experts=4,
+        experts_per_token=2,
+        hidden_dim=64,
+        intermediate_size=32,
+        activation=MoEActivation.SILU,
+    )
+
+    output = rocm_aiter_fused_experts(
+        hidden_states,
+        torch.empty(4, 64, 32, dtype=dtypes.fp4x2),
+        torch.empty(4, 64, 16, dtype=dtypes.fp4x2),
+        torch.rand(3, 2, dtype=torch.bfloat16),
+        torch.zeros(3, 2, dtype=torch.int64),
+        moe_config,
+        activation=MoEActivation.SILU,
+        quant_config=quant_config,
+        a1q_scale=a1_scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    assert output.shape == (3, 64)
+    assert captured["args"][0] is hidden_states
+    assert captured["args"][3].dtype == torch.float32
+    assert captured["args"][4].dtype == torch.int32
+    assert captured["kwargs"]["quant_method"] == QuantMethod.BLOCK_1X32.value
+    assert captured["kwargs"]["a1_scale"] is a1_scale
+    assert (
+        captured["kwargs"]["gate_mode"]
+        == getattr(GateMode, expected_gate_mode.upper()).value
+    )
+    assert captured["kwargs"]["hidden_pad"] == 0
+
+
+@pytest.mark.parametrize(
+    ("quant_kind", "payload_width"),
+    [
+        pytest.param("mxfp8", 64, id="mxfp8"),
+        pytest.param("mxfp4", 32, id="mxfp4"),
+    ],
+)
+@pytest.mark.parametrize("num_tokens", [0, 3])
+def test_ag_rs_transports_prequantized_mx_as_bytes(
+    monkeypatch, quant_kind, payload_width, num_tokens
+):
+    from aiter import dtypes
+
+    import vllm.model_executor.layers.fused_moe.all2all_utils as all2all_utils
+    import vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep as ag_rs
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.fused_moe.config import (
+        mxfp4_moe_quant_config,
+        mxfp4_w4a8_moe_quant_config,
+    )
+
+    _assert_aiter_supported()
+    activation_dtype = dtypes.fp8 if quant_kind == "mxfp8" else dtypes.fp4x2
+    if quant_kind == "mxfp4" and (
+        getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2
+    ):
+        pytest.skip("native torch FP4 dtype is required")
+
+    quantized = torch.empty(num_tokens, payload_width, dtype=activation_dtype)
+    scale = torch.empty(num_tokens, 2, dtype=dtypes.fp8_e8m0)
+    captured: dict[str, Any] = {}
+
+    def quantize(a1, quant_dtype):
+        assert a1.shape == (num_tokens, 64)
+        assert quant_dtype == activation_dtype
+        return quantized, scale
+
+    class FakeGroup:
+        world_size = 2
+
+        def dispatch(
+            self,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            *,
+            is_sequence_parallel,
+            extra_tensors,
+        ):
+            captured["hidden_states"] = hidden_states
+            captured["scales"] = extra_tensors
+            assert not is_sequence_parallel
+            return hidden_states, topk_weights, topk_ids, extra_tensors
+
+    fake_group = FakeGroup()
+    monkeypatch.setattr(ag_rs, "aiter_mx_quantize_input", quantize)
+    monkeypatch.setattr(ag_rs, "get_ep_group", lambda: fake_group)
+    monkeypatch.setattr(all2all_utils, "get_ep_all2all_manager", lambda _: fake_group)
+    monkeypatch.setattr(rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+    monkeypatch.setattr("vllm.platforms.rocm.on_gfx950", lambda: True)
+
+    weight_scale = torch.empty(1, dtype=torch.uint8)
+    quant_config = (
+        mxfp4_w4a8_moe_quant_config(weight_scale, weight_scale)
+        if quant_kind == "mxfp8"
+        else mxfp4_moe_quant_config(weight_scale, weight_scale)
+    )
+    quant_config.dispatch_quant_dtype = activation_dtype
+    prepare_finalize = all2all_utils.maybe_make_prepare_finalize(
+        _make_distributed_mxfp4_config(
+            "aiter_mxfp4_fp8" if quant_kind == "mxfp8" else "aiter_mxfp4_mxfp4",
+            all2all_backend="allgather_reducescatter",
+        ),
+        quant_config,
+        allow_new_interface=True,
+        use_monolithic=False,
+    )
+    assert isinstance(prepare_finalize, ag_rs.MoEPrepareAndFinalizeNaiveDPEPModular)
+    assert prepare_finalize.supports_mx_prequantized_inputs
+    lora_mapping = torch.arange(num_tokens, dtype=torch.int32)
+    lora_context = types.SimpleNamespace(
+        punica_wrapper=types.SimpleNamespace(
+            token_mapping_meta=types.SimpleNamespace(token_lora_mapping=lora_mapping)
+        ),
+        local_token_lora_mapping=None,
+    )
+    prepare_finalize.set_lora_context(lora_context)
+    result = prepare_finalize.prepare(
+        torch.empty(num_tokens, 64, dtype=torch.bfloat16),
+        torch.rand(num_tokens, 2),
+        torch.zeros(num_tokens, 2, dtype=torch.int32),
+        num_experts=8,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        quant_config=quant_config,
+    )
+
+    assert captured["hidden_states"].dtype == torch.uint8
+    assert captured["scales"][0].dtype == torch.uint8
+    torch.testing.assert_close(captured["scales"][1], lora_mapping)
+    assert result[0].shape == (num_tokens, payload_width)
+    assert result[0].dtype == activation_dtype
+    assert result[0].data_ptr() == quantized.data_ptr()
+    assert result[1].shape == (num_tokens, 2)
+    assert result[1].dtype == dtypes.fp8_e8m0
+    assert result[1].data_ptr() == scale.data_ptr()
+    torch.testing.assert_close(lora_context.local_token_lora_mapping, lora_mapping)
+
+
+def test_no_dp_keeps_aiter_mx_quantization_fused():
+    from aiter import dtypes
+
+    import vllm.model_executor.layers.fused_moe.modular_kernel as mk
+    from vllm.model_executor.layers.fused_moe.config import (
+        mxfp4_w4a8_moe_quant_config,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+        AiterExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.prepare_finalize.no_dp_ep import (
+        MoEPrepareAndFinalizeNoDPEPModular,
+    )
+
+    _assert_aiter_supported()
+    moe_config = _make_distributed_mxfp4_config(
+        "aiter_mxfp4_fp8", all2all_backend="deepep_high_throughput"
+    )
+    moe_config.moe_parallel_config.dp_size = 1
+    moe_config.moe_parallel_config.ep_size = 1
+    moe_config.moe_parallel_config.use_ep = False
+    weight_scale = torch.empty(1, dtype=torch.uint8)
+    quant_config = mxfp4_w4a8_moe_quant_config(weight_scale, weight_scale)
+    quant_config.dispatch_quant_dtype = dtypes.fp8
+    prepare_finalize = MoEPrepareAndFinalizeNoDPEPModular()
+    kernel = mk.FusedMoEKernel(
+        prepare_finalize,
+        AiterExperts(moe_config, quant_config),
+    )
+
+    assert not prepare_finalize.supports_mx_prequantized_inputs
+    assert kernel.impl.defer_input_quant
+    hidden_states = torch.empty(3, 64, dtype=torch.bfloat16)
+    result = prepare_finalize.prepare(
+        hidden_states,
+        torch.rand(3, 2),
+        torch.zeros(3, 2, dtype=torch.int32),
+        num_experts=8,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        quant_config=quant_config,
+        defer_input_quant=kernel.impl.defer_input_quant,
+    )
+    assert result[0] is hidden_states
+    assert result[1] is None
+
+
+def test_aiter_packed_fp4_problem_size_and_zero_token_output(monkeypatch):
+    from aiter import dtypes
+
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.model_executor.layers.fused_moe.config import mxfp4_moe_quant_config
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+        AiterExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEKernelModularImpl,
+    )
+
+    _assert_aiter_supported()
+    if getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2:
+        pytest.skip("native torch FP4 dtype is required")
+    monkeypatch.setattr(rocm_aiter_ops, "is_fused_moe_enabled", lambda: True)
+
+    scale = torch.empty(1, dtype=torch.uint8)
+    experts = AiterExperts(
+        _make_distributed_mxfp4_config("aiter_mxfp4_mxfp4"),
+        mxfp4_moe_quant_config(scale, scale),
+    )
+    hidden_states = torch.empty(0, 32, dtype=dtypes.fp4x2)
+    w1 = torch.empty(4, 64, 32, dtype=dtypes.fp4x2)
+    w2 = torch.empty(4, 64, 16, dtype=dtypes.fp4x2)
+    topk_weights = torch.empty(0, 2)
+    topk_ids = torch.empty(0, 2, dtype=torch.int32)
+
+    assert experts.moe_problem_size(hidden_states, w1, w2, topk_ids) == (
+        4,
+        0,
+        64,
+        64,
+        2,
+    )
+
+    kernel = FusedMoEKernelModularImpl(None, experts)  # type: ignore[arg-type]
+    output = kernel._fused_experts(
+        in_dtype=torch.bfloat16,
+        a1q=hidden_states,
+        a1q_scale=torch.empty(0, 2, dtype=dtypes.fp8_e8m0),
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=experts.moe_config.activation,
+        global_num_experts=8,
+        local_num_experts=4,
+        expert_map=None,
+        apply_router_weight_on_input=False,
+        expert_tokens_meta=None,
+    )
+
+    assert output.shape == (0, 64)
+    assert output.dtype == torch.bfloat16
+
+
 def test_aiter_mxfp4_quant_scheme_support_matches_gfx950():
     """AITER MXFP4 MoE support should stay gfx950-only."""
     from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
@@ -615,6 +982,102 @@ def test_aiter_mxfp4_quant_scheme_support_matches_gfx950():
     )
 
     assert AiterExperts._supports_quant_scheme(kMxfp4Static, None) is on_gfx950()
+
+
+@pytest.mark.skipif(not on_gfx950(), reason="gfx950 ROCm only")
+@pytest.mark.parametrize(
+    "quant_limit,model_limit,expected_limit",
+    [
+        pytest.param(10.0, 20.0, 10.0, id="quant-limit"),
+        pytest.param(None, 10.0, 10.0, id="model-limit"),
+        pytest.param(0.0, 10.0, None, id="explicit-zero"),
+        pytest.param(None, None, None, id="unclamped"),
+    ],
+)
+def test_aiter_mxfp4_prequantized_moe_applies_clamp(
+    quant_limit, model_limit, expected_limit
+):
+    """Clamp routed gate/up values before the A4W4 intermediate quantization."""
+    from aiter import QuantType, dtypes, get_torch_quant
+    from aiter.utility.fp4_utils import e8m0_shuffle, e8m0_to_f32, mxfp4_to_f32
+
+    from tests.kernels.moe.utils import make_dummy_moe_config
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.config import ocp_mx_moe_quant_config
+    from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+        rocm_aiter_fused_experts,
+    )
+    from vllm.model_executor.layers.fused_moe.utils import aiter_mx_quantize_input
+
+    _assert_aiter_supported()
+    num_tokens, dim, num_experts, topk = 4, 256, 8, 6
+    hidden = torch.zeros(num_tokens, dim, device="cuda", dtype=torch.bfloat16)
+    hidden[:, 0] = hidden.new_tensor([1.0, 0.25, -1.0, 0.0])
+    signs = torch.ones(dim, device="cuda", dtype=torch.bfloat16)
+    signs[dim // 2 :] = -1
+    # Powers of two survive input/weight MXFP4 quantization exactly.
+    w1 = hidden.new_zeros(num_experts, 2 * dim, dim)
+    w1[:, :dim, 0] = 32
+    w1[:, dim:, 0] = 32 * signs
+    w2 = torch.eye(dim, device="cuda", dtype=torch.bfloat16)
+    w2 = w2.expand(num_experts, -1, -1).contiguous()
+    quantize = get_torch_quant(QuantType.per_1x32)
+    w1_q, w1_scale = quantize(w1, quant_dtype=dtypes.fp4x2)
+    w2_q, w2_scale = quantize(w2, quant_dtype=dtypes.fp4x2)
+    w1_q, w2_q = _shuffle_moe_weights(
+        w1_q.view(num_experts, 2 * dim, dim // 2),
+        w2_q.view(num_experts, dim, dim // 2),
+    )
+    quant_config = ocp_mx_moe_quant_config(
+        "mxfp4",
+        e8m0_shuffle(w1_scale),
+        e8m0_shuffle(w2_scale),
+        gemm1_clamp_limit=quant_limit,
+    )
+    moe_config = make_dummy_moe_config(
+        num_experts=num_experts,
+        experts_per_token=topk,
+        hidden_dim=dim,
+        intermediate_size=dim,
+        activation=MoEActivation.SILU,
+    )
+    moe_config.swiglu_limit = model_limit
+    topk_ids = torch.arange(topk, device="cuda", dtype=torch.int32)
+    topk_ids = topk_ids.expand(num_tokens, -1).contiguous()
+    topk_weights = torch.full((num_tokens, topk), 0.125, device="cuda")
+    hidden_q, hidden_scale = aiter_mx_quantize_input(hidden, dtypes.fp4x2)
+
+    gate = (hidden[:, :1].float() * 32).expand(-1, dim)
+    up = gate * signs
+    if expected_limit is not None:
+        gate = gate.clamp(max=expected_limit)
+        up = up.clamp(min=-expected_limit, max=expected_limit)
+    intermediate = (F.silu(gate) * up).to(torch.bfloat16)
+    intermediate_q, intermediate_scale = quantize(
+        intermediate, quant_dtype=dtypes.fp4x2
+    )
+    expected = mxfp4_to_f32(intermediate_q).view(num_tokens, dim)
+    expected *= (
+        e8m0_to_f32(intermediate_scale)
+        .view(num_tokens, -1)
+        .repeat_interleave(32, dim=-1)
+    )
+    expected *= topk * 0.125
+
+    output = rocm_aiter_fused_experts(
+        hidden_q,
+        w1_q,
+        w2_q,
+        topk_weights,
+        topk_ids,
+        moe_config,
+        activation=MoEActivation.SILU,
+        quant_config=quant_config,
+        a1q_scale=hidden_scale,
+        output_dtype=torch.bfloat16,
+    )
+
+    torch.testing.assert_close(output.float(), expected, atol=1e-4, rtol=0.01)
 
 
 @pytest.mark.skipif(not on_gfx950(), reason="gfx950 ROCm only")

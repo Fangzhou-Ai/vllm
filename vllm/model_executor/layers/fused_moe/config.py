@@ -260,6 +260,8 @@ class FusedMoEQuantConfig:
     gemm1_clamp_limit: float | None = None
 
     mx_alignment: int = 0
+    # Optional MX activation dtype a capable prepare/finalize may dispatch.
+    dispatch_quant_dtype: torch.dtype | None = None
 
     def __post_init__(self):
         assert not self.per_act_token_quant or self.block_shape is None, (

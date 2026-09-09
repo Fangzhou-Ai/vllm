@@ -938,7 +938,10 @@ class MoriAll2AllManager(All2AllManagerBase):
 
         if not self.internode:
             # single node
-            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
+            if self._all2all_backend == "mori_low_latency":
+                kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNodeLL
+            else:
+                kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
             rdma_block_num = 0
             warp_num_per_block = 16
             block_num = 80

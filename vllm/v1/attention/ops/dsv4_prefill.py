@@ -104,14 +104,14 @@ def _load_aiter_ops() -> tuple[
     # than left to whichever clang the image carries. The JIT-compiled build of
     # the same kernels lives in aiter.ops.pa_sparse_prefill_opus and exports the
     # attention op under its older name.
-    from aiter.ops.dsv4_mla_prefill import (
+    from aiter.ops.dsv4_mla_sparse import (
         PA_FP8_GLOBAL64,
         PA_FP8_MIN_H,
-        dsv4_mla_prefill,
+        dsv4_mla_sparse,
     )
 
     return (
-        dsv4_mla_prefill,
+        dsv4_mla_sparse,
         int(PA_FP8_MIN_H),
         bool(PA_FP8_GLOBAL64),
     )

@@ -16,6 +16,9 @@ from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.mxfp8_emulation_moe import (
     Mxfp8TritonExpertsBase,
 )
+from vllm.model_executor.layers.fused_moe.experts.rocm_aiter_moe import (
+    _has_fake_expert_slot,
+)
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -153,6 +156,10 @@ class AiterMxfp8Experts(Mxfp8TritonExpertsBase):
         # RoutedExperts.expert_map hands AITER experts the precomputed 0/1
         # expert_mask (with trailing sentinel) instead of the vLLM expert_map.
         expert_mask = expert_map
+        moe_config = getattr(self, "moe_config", None)
+        experts_per_token = getattr(
+            moe_config, "experts_per_token", topk_ids.shape[-1]
+        )
 
         # Route through the graph-safe ``rocm_aiter_fused_moe`` custom op so the
         # call is captured under HIP graphs / torch.compile (a direct
@@ -175,5 +182,11 @@ class AiterMxfp8Experts(Mxfp8TritonExpertsBase):
             gate_mode=GateMode.INTERLEAVE.value,
             swiglu_limit=swiglu_limit,
             output_dtype=output.dtype,
+            has_fake_expert_slot=_has_fake_expert_slot(
+                topk_ids,
+                expert_mask,
+                global_num_experts=global_num_experts,
+                experts_per_token=experts_per_token,
+            ),
         )
         output.copy_(out.to(output.dtype))

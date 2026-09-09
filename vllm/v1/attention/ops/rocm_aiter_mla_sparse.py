@@ -1167,12 +1167,12 @@ def rocm_inv_rope_einsum(
     wo_a weight so the per-step dequant disappears.
     """
     if envs.VLLM_DSV4_FP8_BMM:
-        from aiter.ops.opus.bmm_op import bmm_a8w8_mxscale_opus
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
 
         fused_q, fused_s = _fused_inverse_rope_gptj(
             o, positions, rotary_emb.cos_sin_cache, rope_head_dim, quant=True
         )
-        return bmm_a8w8_mxscale_opus(
+        return batched_gemm_a8w8_mxscale(
             fused_q.view(o.shape[0], n_local_groups, -1),
             wo_a.weight_bmm,
             fused_s.view(o.shape[0], n_local_groups, -1),

@@ -9,6 +9,7 @@ import torch
 
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
+    DFlashSpeculator,
     prepare_dflash_inputs,
 )
 
@@ -174,3 +175,19 @@ def test_prepare_dflash_inputs_never_writes_the_null_block():
         PAD_SLOT_ID,
         PAD_SLOT_ID,
     ]
+
+
+def test_concat_aux_hidden_states_reuses_buffer():
+    speculator = DFlashSpeculator.__new__(DFlashSpeculator)
+    speculator.max_num_tokens = 8
+    first = torch.arange(12, dtype=torch.float32, device="cuda").view(3, 4)
+    second = first + 100
+
+    out = speculator._concat_aux_hidden_states([first, second])
+    expected = torch.cat([first, second], dim=-1)
+    assert torch.equal(out, expected)
+    data_ptr = out.data_ptr()
+
+    out = speculator._concat_aux_hidden_states([first[:2], second[:2]])
+    assert torch.equal(out, expected[:2])
+    assert out.data_ptr() == data_ptr

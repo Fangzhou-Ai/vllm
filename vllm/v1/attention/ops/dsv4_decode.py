@@ -4,7 +4,7 @@ Sibling of :mod:`dsv4_prefill`, and deliberately the same kernel: decode's
 sparse attention is the same operation as prefill's -- N query rows, each
 gathering its own list of compressed rows plus its own sliding window out of
 the same ``fp8_ds_mla`` pool -- only with a much smaller N.  So this module
-does not introduce a second kernel; it feeds ``dsv4_mla_prefill`` the tensors
+does not introduce a second kernel; it feeds ``dsv4_mla_sparse`` the tensors
 the decode path already has, through the same two-segment contract the prefill
 adapter uses for prefix and extend.
 
@@ -76,6 +76,7 @@ _ENABLED: bool | None = None
 _OP: Callable[..., torch.Tensor] | None = None
 _AITER_MIN_HEADS = 0
 _GLOBAL64 = False
+_HAS_ROW_MAP = False
 _SERVED = 0
 _DECLINED: dict[str, int] = {}
 # Keyed by (device, length) and never resized: a captured graph holds the
@@ -83,6 +84,16 @@ _DECLINED: dict[str, int] = {}
 # shaped call could reallocate would leave the earlier graph pointing at freed
 # memory.  vLLM captures one graph per batch size, so this holds one small
 # tensor per captured size.
+# Grid-position -> query-row permutation, keyed by (device, tokens) and never
+# resized, for the same reason _ZERO_INDPTR is: a captured graph holds the
+# address.  It depends only on the token count, so there is one entry per
+# captured batch size and no per-step work.
+_ROW_MAP: dict[tuple[torch.device, int, int], torch.Tensor] = {}
+# XCC count per device, read once from aiter.  1 disables the placement, which
+# is both the right answer for a single-XCD partition and the safe fallback for
+# an aiter that cannot be asked.
+_XCC: dict[torch.device, int] = {}
+
 _ZERO_INDPTR: dict[tuple[torch.device, int], torch.Tensor] = {}
 # The op keeps ``kv_max_e`` for call compatibility and ignores it, but it still
 # dereferences the pointer, so the scalar has to outlive every captured graph.
@@ -93,12 +104,12 @@ _EMPTY_INDICES: dict[torch.device, torch.Tensor] = {}
 
 def enabled() -> bool:
     """Whether the process opted into the direct AITER sparse decode."""
-    global _ENABLED, _OP, _AITER_MIN_HEADS, _GLOBAL64
+    global _ENABLED, _OP, _AITER_MIN_HEADS, _GLOBAL64, _HAS_ROW_MAP
     if _ENABLED is None:
         _ENABLED = os.getenv("VLLM_ROCM_DSV4_MLA_DECODE", "0") == "1"
         if _ENABLED:
             try:
-                _OP, _AITER_MIN_HEADS, _GLOBAL64 = _load_aiter_ops()
+                _OP, _AITER_MIN_HEADS, _GLOBAL64, _HAS_ROW_MAP = _load_aiter_ops()
             except (ImportError, AttributeError) as exc:
                 logger.warning(
                     "dsv4 sparse decode: AITER symbols unavailable (%s); "
@@ -122,17 +133,23 @@ def _is_gfx950(device: torch.device) -> bool:
     return str(arch).split(":", 1)[0] == "gfx950"
 
 
-def _load_aiter_ops() -> tuple[Callable[..., torch.Tensor], int, bool]:
+def _load_aiter_ops() -> tuple[Callable[..., torch.Tensor], int, bool, bool]:
     # Same import the prefill adapter uses, so a build carrying one carries the
     # other; the object is prebuilt, so its schedule does not depend on
     # whichever clang the image happens to ship.
-    from aiter.ops.dsv4_mla_prefill import (
+    from aiter.ops.dsv4_mla_sparse import (
         PA_FP8_GLOBAL64,
         PA_FP8_MIN_H,
-        dsv4_mla_prefill,
+        dsv4_mla_sparse,
     )
 
-    return dsv4_mla_prefill, int(PA_FP8_MIN_H), bool(PA_FP8_GLOBAL64)
+    # getattr on the module, not a from-import: a missing name raises
+    # ImportError, and enabled() handles that by disabling the whole fast path.
+    # Losing the kernel over an absent tuning knob would be a bad trade.
+    from aiter.ops import dsv4_mla_sparse as _module
+
+    has_row_map = bool(getattr(_module, "PA_FP8_HAS_ROW_MAP", False))
+    return dsv4_mla_sparse, int(PA_FP8_MIN_H), bool(PA_FP8_GLOBAL64), has_row_map
 
 
 def _csr(
@@ -168,6 +185,106 @@ def _empty_indices(device: torch.device) -> torch.Tensor:
         tensor = torch.zeros(0, dtype=torch.int32, device=device)
         _EMPTY_INDICES[device] = tensor
     return tensor
+
+
+def _xcc(device: torch.device) -> int:
+    """XCCs in the device's current compute partition, or 1 if unknown.
+
+    Only aiter can answer this: torch does not surface it, and calling
+    libamdhip64 from here would mean hardcoding
+    ``hipDeviceAttributeNumberOfXccs``' numeric value, which moves with the ROCm
+    version -- a worse constant than the one it replaces.  An aiter without the
+    entry point returns 1 and the placement simply does not apply, which is the
+    same behaviour as before this optimisation existed.
+    """
+    cached = _XCC.get(device)
+    if cached is None:
+        try:
+            from aiter.ops.dsv4_mla_sparse import xcc_count
+
+            cached = int(xcc_count(device.index or 0))
+        except Exception:
+            cached = 1
+        _XCC[device] = cached
+    return cached
+
+
+def _row_map(
+    tokens: int, groups: int, device: torch.device
+) -> torch.Tensor | None:
+    """Grid position -> query row, so one request's rows share an XCD.
+
+    Workgroups go round-robin over the XCDs (``XCC_ID = blockIdx.x % n``, n =
+    the device's XCC count) and each XCD has its own L2.  Decode rows are
+    request-major, so a request's rows land on that many *different* XCDs, and
+    every one of those L2s pulls the same KV separately -- the rows of one
+    request read the *same* compressed cache (byte-identical index lists on the
+    ratio-128 layers, ~0.98 tile overlap on ratio-4).
+
+    Cutting the row order into ``n`` contiguous runs and giving run ``c`` to the
+    grid positions with ``b % n == c`` fixes that, because a request's rows are
+    adjacent.  But contiguous runs also hand each XCD a contiguous *slice of the
+    batch*, and when per-row work correlates with position in the batch that is
+    a load imbalance: measured on a synthetic batch whose context length rises
+    with request index, one XCD drew 4x another's tiles and the placement cost
+    2.7% instead of paying.  So the requests are dealt out ``n``-ways first --
+    run ``c`` takes requests c, c+n, c+2n, ... -- which samples the whole batch
+    into every run and leaves the co-location intact.  Measured: -2.67% -> +1.28%
+    on that batch, and +2.74/+3.94% -> +2.60/+3.55% on the real ratio-4 and
+    ratio-128 shapes, a difference well inside the intervals.
+
+    Dealing requests out needs to know how many rows one contributes, which the
+    plain form did not.  When that is unavailable or does not divide the row
+    count, this falls back to the contiguous form: it is what the production
+    batch measures best on anyway, since there every row carries identical work
+    (captured ratio-4 and ratio-128 batches both have zero spread) and the
+    imbalance this guards against cannot arise.
+
+    ``n`` is read from the device rather than written here, because it is a
+    property of the *current compute partition* -- amd-smi can set CPX and make
+    it 1 -- not of the chip.  A literal would silently stop placing anything
+    under a non-default partition: the permutation would still be valid, so
+    nothing would fail, it would just quietly do nothing.
+
+    Returns None when the count is not a multiple of ``n``, or when the device
+    has a single XCD and there is nothing to place, which leaves the kernel on
+    its default order (reverse, so the heaviest rows dispatch first).
+    """
+    n = _xcc(device)
+    if n < 2 or tokens < n or tokens % n:
+        return None
+    key = (device, tokens, groups)
+    row_map = _ROW_MAP.get(key)
+    if row_map is None:
+        rows = torch.arange(tokens, dtype=torch.int32, device=device)
+        m = tokens // groups if groups > 0 else 0
+        if m > 1 and groups * m == tokens and groups >= n:
+            # Requests dealt n-ways: run c takes c, c+n, c+2n, ...  Wrapping
+            # rather than reshaping keeps this valid for any request count --
+            # the production batch is 30 requests, which n does not divide.
+            order = torch.cat(
+                [torch.arange(c, groups, n, device=device) for c in range(n)]
+            )
+            rows = (
+                order.unsqueeze(1) * m
+                + torch.arange(m, device=device)
+            ).reshape(-1).to(torch.int32)
+        row_map = rows[
+            torch.arange(tokens, device=device).view(n, tokens // n).t().reshape(-1)
+        ]
+        _ROW_MAP[key] = row_map
+        # Which form was taken is not visible in the results -- the placement is
+        # bit-identical either way -- so say it once per shape.  A build that
+        # cannot read the speculative config degrades to the contiguous form
+        # silently otherwise.
+        logger.info(
+            "dsv4 sparse decode: XCD row_map for %d rows, %d XCDs, %s",
+            tokens, n,
+            f"{groups} requests dealt {n}-ways, {m} rows each"
+            if m > 1 and groups * m == tokens and groups >= n
+            else f"contiguous runs (requests={groups}, rows={tokens})",
+        )
+    return row_map
 
 
 def _max_e(device: torch.device) -> torch.Tensor:
@@ -206,6 +323,7 @@ def try_dsv4_decode(
     head_dim: int,
     nope_head_dim: int,
     rope_head_dim: int,
+    num_decodes: int = 0,
 ) -> bool:
     """Try the direct AITER sparse decode; return ``False`` if it did not run."""
     global _SERVED
@@ -292,13 +410,16 @@ def try_dsv4_decode(
     if swa_indices.numel() == 0:
         swa_indptr = _zero_indptr(tokens, q.device)
 
+    row_map_kwarg: dict[str, torch.Tensor] = {}
+    if _HAS_ROW_MAP:
+        row_map = _row_map(tokens, num_decodes, q.device)
+        if row_map is not None:
+            row_map_kwarg["row_map"] = row_map
+
     _OP(
         q_nope=q[..., :_D_NOPE],
-        # As in the prefill adapter: q_nope may stay a view because the kernel
-        # takes its row stride, but the RoPE layout has 64 baked in at compile
-        # time, so this slice has to be made contiguous.  At decode's N it is
-        # ~4 MB per layer, against ~130 us of attention.
-        q_rope=q[..., _D_NOPE:].contiguous(),
+        # Both Q views use the explicit per-head stride accepted by the kernel.
+        q_rope=q[..., _D_NOPE:],
         unified_kv_nope=prefix.nope,
         unified_kv_rope=prefix.rope,
         kv_indices_prefix=prefix_indices,
@@ -322,6 +443,10 @@ def try_dsv4_decode(
         kv_lens_extend=None,
         # Kept for call compatibility and ignored, but still dereferenced.
         kv_max_e=_max_e(q.device),
+        # Placement only: which CU computes which row.  The result is
+        # bit-identical -- see _row_map.  Omitted entirely on an AITER that
+        # predates the argument, since an unknown keyword fails at call time.
+        **row_map_kwarg,
     )
 
     _SERVED += 1
@@ -343,13 +468,15 @@ def try_dsv4_decode(
 
 
 def _reset_for_tests() -> None:
-    global _ENABLED, _SERVED, _OP, _AITER_MIN_HEADS, _GLOBAL64
+    global _ENABLED, _SERVED, _OP, _AITER_MIN_HEADS, _GLOBAL64, _HAS_ROW_MAP
     _ENABLED = None
     _OP = None
     _AITER_MIN_HEADS = 0
     _GLOBAL64 = False
+    _HAS_ROW_MAP = False
     _SERVED = 0
     _DECLINED.clear()
+    _ROW_MAP.clear()
     _ZERO_INDPTR.clear()
     _MAX_E.clear()
     _EMPTY_INDICES.clear()

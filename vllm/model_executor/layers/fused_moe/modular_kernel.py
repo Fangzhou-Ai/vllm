@@ -246,6 +246,11 @@ class FusedMoEPrepareAndFinalize(ABC):
         """
         return False
 
+    @property
+    def supports_mx_prequantized_inputs(self) -> bool:
+        """Whether prepare can dispatch MX activations with their scales."""
+        return False
+
     def on_commit(self) -> None:
         """
         Runs after this prepare/finalize has been committed to the active
@@ -520,9 +525,9 @@ class FusedMoEExperts(ABC):
     @property
     def expects_unquantized_inputs(self) -> bool:
         """
-        Whether or not the PrepareFinalize should defer input quantization
-        in the prepare step. If True, then the Experts kernel will
-        execute the input quantization itself.
+        Whether the Experts kernel can accept unquantized inputs and perform
+        input quantization itself. A compatible PrepareFinalize may still
+        prequantize inputs before dispatch.
 
         Sample subclasses that override are AITER and FlashInfer CUTLASS.
         """
@@ -1110,6 +1115,14 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.use_ep
         )
 
+    @property
+    def defer_input_quant(self) -> bool:
+        use_mx_prequant = (
+            self.fused_experts.quant_config.dispatch_quant_dtype is not None
+            and self.prepare_finalize.supports_mx_prequantized_inputs
+        )
+        return self.fused_experts.expects_unquantized_inputs and not use_mx_prequant
+
     def _allocate_buffers(
         self,
         out_dtype: torch.dtype,
@@ -1226,7 +1239,7 @@ class FusedMoEKernelModularImpl:
                 expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                defer_input_quant=self.defer_input_quant,
             )
         else:
             # Overlap shared expert compute with all2all dispatch.
@@ -1239,7 +1252,7 @@ class FusedMoEKernelModularImpl:
                 expert_map,
                 apply_router_weight_on_input,
                 self.fused_experts.quant_config,
-                defer_input_quant=self.fused_experts.expects_unquantized_inputs,
+                defer_input_quant=self.defer_input_quant,
             )
 
             # TODO(lucas): refactor this in the alternative schedules followup
@@ -1303,7 +1316,7 @@ class FusedMoEKernelModularImpl:
         # low-latency kernels are always batched and can never run into
         # the tensor.numel() == 0 case.
         if M_full == 0:
-            return torch.empty_like(a1q, dtype=in_dtype)
+            return a1q.new_empty((M_full, K), dtype=in_dtype)
 
         workspace13, workspace2, fused_out = self._allocate_buffers(
             in_dtype,

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Literal, Union
 
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.config.kernel import MoEBackend
@@ -115,7 +116,7 @@ class Mxfp4MoeBackend(Enum):
     AITER_MXFP4_BF16 = "AITER_MXFP4_BF16"  # W4A16: CK kernel
     # Keep the legacy name as an alias while the ROCm split backend rename settles.
     AITER = "AITER_MXFP4_BF16"
-    AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8: triton kernel
+    AITER_MXFP4_FP8 = "AITER_MXFP4_FP8"  # W4A8
     AITER_MXFP4_MXFP4 = "AITER_MXFP4_MXFP4"  # W4A4: CK kernel
     # Triton
     TRITON = "TRITON"
@@ -140,6 +141,18 @@ TRITON_BACKENDS = (
     Mxfp4MoeBackend.TRITON,
     Mxfp4MoeBackend.TRITON_UNFUSED,
 )
+
+
+def uses_aiter_modular_w4a8(
+    backend: Mxfp4MoeBackend,
+    moe_config: FusedMoEConfig | None,
+) -> bool:
+    return (
+        backend == Mxfp4MoeBackend.AITER_MXFP4_FP8
+        and moe_config is not None
+        and moe_config.routing_method == RoutingMethodType.DeepseekV4
+        and moe_config.activation == MoEActivation.SILU
+    )
 
 
 def backend_to_kernel_cls(
@@ -411,9 +424,12 @@ def _return_or_raise(
     activation_key: QuantKey | None,
     activation_format: mk.FusedMoEActivationFormat,
     scope: Literal["process", "global", "local"] = "local",
+    kernel_classes: list[type[mk.FusedMoEExperts]] | None = None,
 ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts]]:
     reason: str | None = None
-    for k_cls in backend_to_kernel_cls(backend):
+    if kernel_classes is None:
+        kernel_classes = backend_to_kernel_cls(backend)
+    for k_cls in kernel_classes:
         supported, reason = k_cls.is_supported_config(
             k_cls, config, weight_key, activation_key, activation_format
         )
@@ -585,6 +601,13 @@ def select_deepseek_v4_mxfp4_moe_backend(
             ]
         last_error: Exception | None = None
         for requested_backend in requested_backends:
+            kernel_classes: list[type[mk.FusedMoEExperts]] | None = None
+            if uses_aiter_modular_w4a8(requested_backend, config):
+                from vllm.model_executor.layers.fused_moe.experts import (
+                    rocm_aiter_moe,
+                )
+
+                kernel_classes = [rocm_aiter_moe.AiterExperts]
             try:
                 return _return_or_raise(
                     requested_backend,
@@ -592,6 +615,7 @@ def select_deepseek_v4_mxfp4_moe_backend(
                     kMxfp4Static,
                     _backend_activation_key(requested_backend),
                     activation_format,
+                    kernel_classes=kernel_classes,
                 )
             except ValueError as e:
                 last_error = e
@@ -1288,6 +1312,10 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
         is_gfx1250 = on_gfx1250()
 
+    use_aiter_modular_a8w4 = uses_aiter_modular_w4a8(
+        mxfp4_backend, getattr(layer, "moe_config", None)
+    )
+
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
         w13_weight_scale, w2_weight_scale = _pack_deepgemm_mxfp4_scales(
             w13_weight,
@@ -1459,8 +1487,11 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             w2_bias,
         )
 
-    elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 and not is_gfx1250:
-        # Initially introduced for DeepSeekV4
+    elif (
+        mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16 or use_aiter_modular_a8w4
+    ) and not is_gfx1250:
+        # Modular A8W4 uses the same gate/up-interleaved AITER fused-MoE
+        # weight layout as the dynamic A8W4 path.
 
         if w13_bias is not None:
             w13_bias = w13_bias.data.to(torch.float32)
@@ -1830,6 +1861,39 @@ def make_mxfp4_moe_kernel(
 ) -> mk.FusedMoEKernel:
     """Create a FusedMoEKernel for the given MXFP4 backend."""
     is_monolithic = issubclass(experts_cls, mk.FusedMoEExpertsMonolithic)
+    mxfp_dispatch_dtype: torch.dtype | None = None
+    if (
+        not is_monolithic
+        and envs.VLLM_ROCM_ALL2ALL_PREQUANT
+        and mxfp4_backend
+        in (
+            Mxfp4MoeBackend.AITER_MXFP4_FP8,
+            Mxfp4MoeBackend.AITER_MXFP4_MXFP4,
+        )
+    ):
+        from aiter import dtypes
+
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            raise NotImplementedError("AITER MXFP4/MXFP8 dispatch requires gfx950")
+        if moe_config.hidden_dim % 32 != 0:
+            raise ValueError(
+                "AITER MXFP4/MXFP8 dispatch requires hidden_dim divisible by 32"
+            )
+        if mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_FP8:
+            if not moe_quant_config.use_mxfp4_w4a8:
+                raise ValueError("AITER W4A8 requires an MXFP4 W4A8 quant config")
+            mxfp_dispatch_dtype = dtypes.fp8
+        else:
+            if not moe_quant_config.use_mxfp4_w4a4:
+                raise ValueError("AITER W4A4 requires an MXFP4 W4A4 quant config")
+            if getattr(torch, "float4_e2m1fn_x2", None) != dtypes.fp4x2:
+                raise NotImplementedError(
+                    "AITER MXFP4 dispatch requires native torch FP4 dtype support"
+                )
+            mxfp_dispatch_dtype = dtypes.fp4x2
+    moe_quant_config.dispatch_quant_dtype = mxfp_dispatch_dtype
 
     prepare_finalize = maybe_make_prepare_finalize(
         moe=moe_config,

@@ -170,6 +170,45 @@ class DeepseekV4MLP(nn.Module):
             )
         else:
             gate_up, _ = self.gate_up_proj(x)
+
+        flat_m = gate_up.numel() // gate_up.shape[-1]
+        down_uses_ck = self._down_scale is not None or (
+            self._down_mxfp8 is not None
+            and self._down_mxfp8.uses_ck_fallback(flat_m)
+        )
+        if down_uses_ck and isinstance(self.act_fn, SiluAndMulWithClamp):
+            gate_up_2d = gate_up.reshape(-1, gate_up.shape[-1])
+            if gate_up_2d.is_contiguous() and self.act_fn._aiter_applies(gate_up_2d):
+                x_fp8, x_scale = rocm_aiter_ops.clamp_act_mul_and_fp8_group_quant(
+                    gate_up_2d,
+                    self.act_fn.swiglu_limit,
+                    transpose_scale=True,
+                )
+                if self._down_mxfp8 is not None:
+                    out = self._down_mxfp8.apply_prequantized(
+                        x_fp8,
+                        x_scale,
+                        gate_up.dtype,
+                        reduce_tp=self._down_reduce,
+                    )
+                else:
+                    assert self._down_scale is not None
+                    out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+                        x_fp8,
+                        self.down_proj.weight,
+                        x_scale,
+                        self._down_scale,
+                        output_dtype=gate_up.dtype,
+                    )
+                    if (
+                        self._down_reduce
+                        and get_tensor_model_parallel_world_size() > 1
+                    ):
+                        out = tensor_model_parallel_all_reduce(out)
+                if gate_up.dim() != 2:
+                    out = out.view(*gate_up.shape[:-1], out.shape[-1])
+                return out
+
         x = self.act_fn(gate_up)
         if self._down_mxfp8 is not None:
             return self._down_mxfp8(x, reduce_tp=self._down_reduce)
@@ -471,6 +510,21 @@ class DeepseekV4DecoderLayer(nn.Module):
     ):
         return self.mhc_post(x, residual, post, comb)
 
+    def _attn_norm_with_quant(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        num_tokens = x.numel() // x.shape[-1]
+        if not self.attn.can_reuse_wqa_wkv_quantization(num_tokens):
+            return self.attn_norm(x), None, None
+
+        x_fp8, x_scale, x_normed = rocm_aiter_ops.rmsnorm_group_fused_quant_with_bf16(
+            x,
+            self.attn_norm.weight.data,
+            self.rms_norm_eps,
+            transpose_scale=True,
+        )
+        return x_normed, x_fp8, x_scale
+
     def _forward_fused_post_pre(
         self,
         x: torch.Tensor,
@@ -502,8 +556,14 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_sinkhorn_iters,
             )
 
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        x, x_fp8, x_scale = self._attn_norm_with_quant(x)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            hidden_states_fp8=x_fp8,
+            hidden_states_scale=x_scale,
+        )
 
         residual, post_mix, res_mix, x = self.mhc_fused_post_pre(
             x,
@@ -538,8 +598,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         x, post, comb = self.hc_pre(
             x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
         )
-        x = self.attn_norm(x)
-        x = self.attn(positions, x, None)
+        x, x_fp8, x_scale = self._attn_norm_with_quant(x)
+        x = self.attn(
+            positions,
+            x,
+            None,
+            hidden_states_fp8=x_fp8,
+            hidden_states_scale=x_scale,
+        )
         x = self.hc_post(x, residual, post, comb)
 
         residual = x

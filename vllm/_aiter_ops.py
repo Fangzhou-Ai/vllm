@@ -232,6 +232,7 @@ def _rocm_aiter_fused_moe_impl(
     swiglu_limit: float = 0.0,
     beta: float | None = None,
     linear_beta: float | None = None,
+    has_fake_expert_slot: bool = False,
 ) -> torch.Tensor:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -242,6 +243,8 @@ def _rocm_aiter_fused_moe_impl(
     extra_kwargs: dict = {}
     if gate_mode and rocm_aiter_ops.fused_moe_supports_gate_mode():
         extra_kwargs["gate_mode"] = gate_mode
+    if rocm_aiter_ops.fused_moe_supports_has_fake_expert_slot():
+        extra_kwargs["has_fake_expert_slot"] = has_fake_expert_slot
     if (
         getattr(ActivationType, "Situv2", None) is not None
         and activation == ActivationType.Situv2
@@ -300,10 +303,12 @@ def _rocm_aiter_fused_moe_fake(
     swiglu_limit: float = 0.0,
     beta: float | None = None,
     linear_beta: float | None = None,
+    has_fake_expert_slot: bool = False,
 ) -> torch.Tensor:
+    output_shape = (*hidden_states.shape[:-1], w2.shape[1])
     if output_dtype is not None:
-        return torch.empty_like(hidden_states, dtype=output_dtype)
-    return torch.empty_like(hidden_states)
+        return hidden_states.new_empty(output_shape, dtype=output_dtype)
+    return hidden_states.new_empty(output_shape)
 
 
 def _rocm_aiter_asm_moe_tkw1_impl(
@@ -1221,6 +1226,59 @@ def _rocm_aiter_rmsnorm_fp8_group_quant_fake(
     )
 
 
+def _rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    group_size: int,
+    transpose_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    from aiter.ops.fused_qk_rmsnorm_group_quant import (
+        fused_qk_rmsnorm_group_quant,
+    )
+
+    assert x.dim() >= 2
+    n = x.shape[-1]
+    assert n % group_size == 0
+    x_2d = x.reshape(-1, n)
+    m = x_2d.shape[0]
+    x_quant = torch.empty((m, n), dtype=FP8_DTYPE, device=x.device)
+    x_quant_scales = torch.empty(
+        (m, n // group_size), dtype=torch.float32, device=x.device
+    )
+    x_normed_2d = torch.empty((m, n), dtype=x.dtype, device=x.device)
+    if m == 0:
+        return x_quant, x_quant_scales, x_normed_2d.view(x.shape)
+    fused_qk_rmsnorm_group_quant(
+        q_out_quantized=x_quant,
+        q_out_scale=x_quant_scales,
+        q=x_2d,
+        q_weight=weight,
+        q_epsilon=variance_epsilon,
+        q_out_unquantized=x_normed_2d,
+        group_size=group_size,
+        transpose_scale=transpose_scale,
+    )
+    return x_quant, x_quant_scales, x_normed_2d.view(x.shape)
+
+
+def _rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    group_size: int,
+    transpose_scale: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    assert x.dim() >= 2
+    n = x.shape[-1]
+    m = x.reshape(-1, n).shape[0]
+    return (
+        torch.empty((m, n), dtype=FP8_DTYPE, device=x.device),
+        torch.empty((m, n // group_size), dtype=torch.float32, device=x.device),
+        torch.empty(x.shape, dtype=x.dtype, device=x.device),
+    )
+
+
 def _rocm_aiter_fused_rms_gated_fp8_group_quant_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1315,9 +1373,42 @@ def _rocm_aiter_clamp_act_mul_fake(
     x: torch.Tensor,
     swiglu_limit: float,
 ) -> torch.Tensor:
-    return torch.empty(
-        (x.shape[0], x.shape[-1] // 2), dtype=x.dtype, device=x.device
+    return torch.empty((x.shape[0], x.shape[-1] // 2), dtype=x.dtype, device=x.device)
+
+
+def _rocm_aiter_clamp_act_mul_and_fp8_group_quant_impl(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+
+    return fused_clamp_act_mul(
+        x,
+        swiglu_limit=swiglu_limit,
+        activation="silu",
+        dtype_quant=FP8_DTYPE,
+        transpose_scale=transpose_scale,
+        quant_block_size=group_size,
     )
+
+
+def _rocm_aiter_clamp_act_mul_and_fp8_group_quant_fake(
+    x: torch.Tensor,
+    swiglu_limit: float,
+    group_size: int,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    M, N = x.shape
+    N_half = N // 2
+    x_fp8 = torch.empty((M, N_half), dtype=FP8_DTYPE, device=x.device)
+    out_bs = torch.empty(
+        (M, (N_half + group_size - 1) // group_size),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    return x_fp8, out_bs
 
 
 def _rocm_aiter_act_mul_and_fp8_group_quant_impl(
@@ -1474,6 +1565,57 @@ def _fused_mla_dual_rms_norm_per_token_quant_fake(
     mq, nq = q.shape
     q_out = torch.empty((mq, nq), dtype=FP8_DTYPE, device=q.device)
     q_scale = torch.empty((mq, 1), dtype=torch.float32, device=q.device)
+    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
+    return q_out, q_scale, kv_normed
+
+
+def _fused_mla_dual_rms_norm_group_quant_impl(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    q_epsilon: float,
+    kv_epsilon: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse MLA q/kv RMSNorm with group-128 FP8 quantization of q."""
+    from aiter.ops.fused_qk_rmsnorm_group_quant import (
+        fused_qk_rmsnorm_group_quant,
+    )
+
+    m, n = q.shape
+    assert n % group_size == 0
+    q_out = torch.empty((m, n), dtype=FP8_DTYPE, device=q.device)
+    q_scale = torch.empty((m, n // group_size), dtype=torch.float32, device=q.device)
+    kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
+    fused_qk_rmsnorm_group_quant(
+        q_out_quantized=q_out,
+        q_out_scale=q_scale,
+        q=q,
+        q_weight=q_weight,
+        q_epsilon=q_epsilon,
+        k_out=kv_normed,
+        k=kv,
+        k_weight=kv_weight,
+        k_epsilon=kv_epsilon,
+        group_size=group_size,
+        transpose_scale=True,
+    )
+    return q_out, q_scale, kv_normed
+
+
+def _fused_mla_dual_rms_norm_group_quant_fake(
+    q: torch.Tensor,
+    q_weight: torch.Tensor,
+    kv: torch.Tensor,
+    kv_weight: torch.Tensor,
+    q_epsilon: float,
+    kv_epsilon: float,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    m, n = q.shape
+    q_out = torch.empty((m, n), dtype=FP8_DTYPE, device=q.device)
+    q_scale = torch.empty((m, n // group_size), dtype=torch.float32, device=q.device)
     kv_normed = torch.empty(kv.shape, dtype=kv.dtype, device=kv.device)
     return q_out, q_scale, kv_normed
 
@@ -2046,6 +2188,21 @@ class rocm_aiter_ops:
 
         return "gate_mode" in inspect.signature(fused_moe).parameters
 
+    @classmethod
+    @if_aiter_supported
+    @functools.cache
+    def fused_moe_supports_has_fake_expert_slot(cls) -> bool:
+        """Probe whether AITER accepts ``has_fake_expert_slot``.
+
+        Keep the vLLM custom-op schema stable while remaining compatible with
+        AITER builds that predate the explicit fake-expert-slot argument.
+        """
+        import inspect
+
+        from aiter.fused_moe import fused_moe
+
+        return "has_fake_expert_slot" in inspect.signature(fused_moe).parameters
+
     @staticmethod
     def register_ops_once() -> None:
         global _OPS_REGISTERED
@@ -2191,6 +2348,12 @@ class rocm_aiter_ops:
             )
 
             direct_register_custom_op(
+                op_name="rocm_aiter_rmsnorm_fp8_group_quant_with_bf16",
+                op_func=_rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_impl,
+                fake_impl=_rocm_aiter_rmsnorm_fp8_group_quant_with_bf16_fake,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_fused_rms_gated_fp8_group_quant",
                 op_func=_rocm_aiter_fused_rms_gated_fp8_group_quant_impl,
                 fake_impl=_rocm_aiter_fused_rms_gated_fp8_group_quant_fake,
@@ -2206,6 +2369,12 @@ class rocm_aiter_ops:
                 op_name="rocm_aiter_clamp_act_mul",
                 op_func=_rocm_aiter_clamp_act_mul_impl,
                 fake_impl=_rocm_aiter_clamp_act_mul_fake,
+            )
+
+            direct_register_custom_op(
+                op_name="rocm_aiter_clamp_act_mul_and_fp8_group_quant",
+                op_func=_rocm_aiter_clamp_act_mul_and_fp8_group_quant_impl,
+                fake_impl=_rocm_aiter_clamp_act_mul_and_fp8_group_quant_fake,
             )
 
             direct_register_custom_op(
@@ -2306,6 +2475,13 @@ class rocm_aiter_ops:
                 fake_impl=_fused_mla_dual_rms_norm_per_token_quant_fake,
             )
 
+            direct_register_custom_op(
+                op_name="fused_mla_dual_rms_norm_group_quant",
+                op_func=_fused_mla_dual_rms_norm_group_quant_impl,
+                mutates_args=[],
+                fake_impl=_fused_mla_dual_rms_norm_group_quant_fake,
+            )
+
             _OPS_REGISTERED = True
 
     @staticmethod
@@ -2319,6 +2495,26 @@ class rocm_aiter_ops:
     @staticmethod
     def get_rmsnorm_group_fused_quant_op() -> OpOverload:
         return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant.default
+
+    @staticmethod
+    def get_rmsnorm_group_fused_quant_with_bf16_op() -> OpOverload:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant_with_bf16.default
+
+    @staticmethod
+    def rmsnorm_group_fused_quant_with_bf16(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        variance_epsilon: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_rmsnorm_fp8_group_quant_with_bf16(
+            x,
+            weight,
+            variance_epsilon,
+            group_size,
+            transpose_scale,
+        )
 
     @staticmethod
     def get_fused_rms_gated_fp8_group_quant_op() -> OpOverload:
@@ -2368,6 +2564,26 @@ class rocm_aiter_ops:
     @staticmethod
     def get_fused_mla_dual_rms_norm_per_token_quant_op() -> OpOverload:
         return torch.ops.vllm.fused_mla_dual_rms_norm_per_token_quant.default
+
+    @staticmethod
+    def fused_mla_dual_rms_norm_group_quant(
+        q: torch.Tensor,
+        q_weight: torch.Tensor,
+        kv: torch.Tensor,
+        kv_weight: torch.Tensor,
+        q_epsilon: float,
+        kv_epsilon: float,
+        group_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.fused_mla_dual_rms_norm_group_quant(
+            q,
+            q_weight,
+            kv,
+            kv_weight,
+            q_epsilon,
+            kv_epsilon,
+            group_size,
+        )
 
     @staticmethod
     def rms_norm(
@@ -2497,6 +2713,7 @@ class rocm_aiter_ops:
         swiglu_limit: float = 0.0,
         beta: float | None = None,
         linear_beta: float | None = None,
+        has_fake_expert_slot: bool = False,
     ) -> torch.Tensor:
         return torch.ops.vllm.rocm_aiter_fused_moe(
             hidden_states,
@@ -2523,6 +2740,7 @@ class rocm_aiter_ops:
             swiglu_limit,
             beta,
             linear_beta,
+            has_fake_expert_slot,
         )
 
     @staticmethod
@@ -2967,6 +3185,17 @@ class rocm_aiter_ops:
     ) -> torch.Tensor:
         """Clamped SwiGLU: silu(clamp(gate)) * clamp(up), fused."""
         return torch.ops.vllm.rocm_aiter_clamp_act_mul(x, swiglu_limit)
+
+    @staticmethod
+    def clamp_act_mul_and_fp8_group_quant(
+        x: torch.Tensor,
+        swiglu_limit: float,
+        group_size: int = 128,
+        transpose_scale: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.vllm.rocm_aiter_clamp_act_mul_and_fp8_group_quant(
+            x, swiglu_limit, group_size, transpose_scale
+        )
 
     @staticmethod
     def group_fp8_quant(

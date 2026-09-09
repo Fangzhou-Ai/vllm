@@ -170,6 +170,9 @@ def maybe_make_prepare_finalize(
     use_monolithic: bool = False,
     eep_stage: bool = False,
 ) -> FusedMoEPrepareAndFinalize | None:
+    mxfp_dispatch_dtype = (
+        quant_config.dispatch_quant_dtype if quant_config is not None else None
+    )
     if not moe.moe_parallel_config.use_all2all_kernels:
         if not allow_new_interface:
             return None
@@ -202,7 +205,6 @@ def maybe_make_prepare_finalize(
     all2all_manager = get_ep_all2all_manager(eep_stage)
 
     prepare_finalize: FusedMoEPrepareAndFinalize | None = None
-
     if moe.use_deepep_ht_kernels:
         assert moe.dp_size == all2all_manager.dp_world_size
 
@@ -281,29 +283,36 @@ def maybe_make_prepare_finalize(
 
     elif moe.use_mori_kernels:
         assert quant_config is not None
-
         # Note: We may want to use FP8 dispatch just to reduce
         # data movement.
         use_fp8_dispatch = (
             quant_config.is_per_act_token or quant_config.is_block_quantized
         )
-        if use_fp8_dispatch:
+        if mxfp_dispatch_dtype is not None:
+            quant_dtype = mxfp_dispatch_dtype
+            scale_dim = moe.hidden_dim // 32
+            scale_type_size = 1
+        elif use_fp8_dispatch:
             # For PTPC (per token per channel) quant, scale dim is 1
             # For 1x128 quant, scale dim is hidden_dim // 128
             quant_dtype = quant_config.quant_dtype
             scale_dim = 1 if quant_config.is_per_act_token else moe.hidden_dim // 128
+            scale_type_size = torch.float32.itemsize
         else:
             # Unquantized dispatch (e.g. AITER with defer_input_quant):
             # dispatch raw BF16/FP16 data, no scales needed.
             quant_dtype = moe.in_dtype
             scale_dim = 0
+            scale_type_size = 0
+        # Keep the logical width here. Mori reads the packed FP4 width from the
+        # runtime dispatch tensor while sizing this handle for BF16 combine output.
         all_to_all_args = dict(
             rank=all2all_manager.rank,
             num_ep_ranks=all2all_manager.world_size,
             quant_dtype=quant_dtype,
             token_hidden_size=moe.hidden_dim,
             scale_dim=scale_dim,
-            scale_type_size=0 if scale_dim == 0 else torch.float32.itemsize,
+            scale_type_size=scale_type_size,
             max_num_tokens_per_dp_rank=moe.max_num_tokens,
             input_dtype=moe.in_dtype,
             num_local_experts=moe.num_experts // all2all_manager.world_size,
@@ -316,6 +325,8 @@ def maybe_make_prepare_finalize(
             max_tokens_per_rank=moe.max_num_tokens,
             num_dispatchers=all2all_manager.world_size,
             use_fp8_dispatch=use_fp8_dispatch,
+            mxfp_dispatch_dtype=mxfp_dispatch_dtype,
+            compact_recv_layout=not all2all_manager.internode,
         )
 
     elif moe.use_fi_nvl_two_sided_kernels:

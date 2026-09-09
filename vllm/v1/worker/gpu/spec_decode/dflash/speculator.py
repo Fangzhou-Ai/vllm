@@ -18,7 +18,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
@@ -314,6 +314,29 @@ class DFlashSpeculator(DraftModelSpeculator):
         )
 
     @torch.inference_mode()
+    def _concat_aux_hidden_states(
+        self, aux_hidden_states: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Concatenate target aux states into a persistent staging buffer."""
+        num_tokens = aux_hidden_states[0].shape[0]
+        width = sum(x.shape[1] for x in aux_hidden_states)
+        buffer = getattr(self, "_aux_hidden_states_buffer", None)
+        if (
+            buffer is None
+            or buffer.shape[0] < num_tokens
+            or buffer.shape[1] != width
+            or buffer.dtype != aux_hidden_states[0].dtype
+            or buffer.device != aux_hidden_states[0].device
+        ):
+            buffer = torch.empty(
+                (max(self.max_num_tokens, num_tokens), width),
+                dtype=aux_hidden_states[0].dtype,
+                device=aux_hidden_states[0].device,
+            )
+            self._aux_hidden_states_buffer = buffer
+        return torch.cat(aux_hidden_states, dim=-1, out=buffer[:num_tokens])
+
+    @torch.inference_mode()
     def propose(
         self,
         input_batch: InputBatch,
@@ -335,7 +358,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        num_tokens_across_dp: torch.Tensor | None = None,
+        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
@@ -355,7 +378,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         # request's query length to include any rejected positions.
         if aux_hidden_states:
             hidden_states = self.model.combine_hidden_states(
-                torch.cat(aux_hidden_states, dim=-1)
+                self._concat_aux_hidden_states(aux_hidden_states)
             )
         else:
             hidden_states = last_hidden_states
@@ -377,7 +400,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
-                num_tokens_across_dp=num_tokens_across_dp,
+                num_tokens_across_dp=None,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             return self.draft_tokens[:num_reqs]
@@ -437,19 +460,27 @@ class DFlashSpeculator(DraftModelSpeculator):
             context_slots,
         )
 
+        batch_sync, num_batch_tokens = (
+            self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+            if dp_sync is not None
+            else (None, num_query_tokens)
+        )
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
-            num_query_tokens,
+            num_batch_tokens,
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            dp_sync=batch_sync,
         )
-
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
+        num_tokens_across_dp = (
+            batch_sync.num_tokens_across_dp if batch_sync is not None else None
+        )
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.

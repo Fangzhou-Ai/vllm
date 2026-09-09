@@ -9,7 +9,10 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceContiguous,
     TopKWeightAndReduceDelegate,
 )
-from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+from vllm.model_executor.layers.fused_moe.utils import (
+    aiter_mx_quantize_input,
+    moe_kernel_quantize_input,
+)
 from vllm.utils.flashinfer import nvfp4_block_scale_interleave
 
 
@@ -18,8 +21,15 @@ def _quantize_and_setup_dispatch(
     quant_config: FusedMoEQuantConfig,
     defer_input_quant: bool = False,
 ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor | None]:
-    # Defer input quantization to the MoE kernel.
-    if defer_input_quant:
+    mxfp_dispatch_dtype = quant_config.dispatch_quant_dtype
+    if mxfp_dispatch_dtype is not None:
+        if defer_input_quant:
+            raise ValueError(
+                "MXFP4/MXFP8 dispatch requires the prepare step to quantize activations"
+            )
+        a1q, a1q_scale = aiter_mx_quantize_input(a1, mxfp_dispatch_dtype)
+    elif defer_input_quant:
+        # Defer input quantization to the MoE kernel.
         a1q = a1
         a1q_scale = None
     else:
@@ -109,6 +119,10 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
     def output_is_reduced(self) -> bool:
         return False
 
+    @property
+    def supports_mx_prequantized_inputs(self) -> bool:
+        return True
+
     def prepare(
         self,
         a1: torch.Tensor,
@@ -130,8 +144,16 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
             a1 = a1 * topk_weights.to(a1.dtype)
 
         a1q, scales, a1q_scale_orig = _quantize_and_setup_dispatch(
-            a1, quant_config, defer_input_quant
+            a1,
+            quant_config,
+            defer_input_quant,
         )
+
+        mxfp_dispatch_dtype = quant_config.dispatch_quant_dtype
+        if mxfp_dispatch_dtype is not None:
+            assert scales is not None and len(scales) == 1
+            a1q = a1q.view(torch.uint8)
+            scales = [scales[0].view(torch.uint8)]
 
         # When LoRA is active, dispatch the per-token LoRA id along with
         # hidden_states so every rank receives the correct mapping for the
@@ -181,6 +203,13 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
                 )
             else:
                 a1q_scale = a1q_scale_orig
+
+        if mxfp_dispatch_dtype is not None:
+            from aiter import dtypes
+
+            a1q = a1q.view(mxfp_dispatch_dtype)
+            assert a1q_scale is not None
+            a1q_scale = a1q_scale.view(dtypes.fp8_e8m0)
 
         return a1q, a1q_scale, None, topk_ids, topk_weights
 

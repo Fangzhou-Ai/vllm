@@ -96,6 +96,36 @@ class Mxfp8Gemm:
                 out = tensor_model_parallel_all_reduce(out)
         return out if x.dim() == 2 else out.view(*x.shape[:-1], n)
 
+    def uses_ck_fallback(self, m: int) -> bool:
+        return m % _ROW_GROUP != 0
+
+    def apply_prequantized(
+        self,
+        x_fp8: torch.Tensor,
+        x_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        reduce_tp: bool = False,
+    ) -> torch.Tensor:
+        """Run the CK fallback with a shared group-128 quantized activation."""
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        out = rocm_aiter_ops.gemm_a8w8_blockscale_bpreshuffle(
+            x_fp8,
+            self.linear.weight,
+            x_scale,
+            self.scale,
+            output_dtype=output_dtype,
+        )
+        if reduce_tp:
+            from vllm.distributed import (
+                get_tensor_model_parallel_world_size,
+                tensor_model_parallel_all_reduce,
+            )
+
+            if get_tensor_model_parallel_world_size() > 1:
+                out = tensor_model_parallel_all_reduce(out)
+        return out
+
     def _ck(self, x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """Fallback for an M the scaled-MFMA kernel cannot take. The preshuffled
         layout is the same, so the CK bpreshuffle GEMM reads the weight as is."""
