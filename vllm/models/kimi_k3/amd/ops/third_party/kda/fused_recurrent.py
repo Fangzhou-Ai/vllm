@@ -344,8 +344,13 @@ def fused_recurrent_kda_fwd(
     if scale is None:
         scale = K**-0.5
 
-    BV = 32 if use_gate_in_kernel else 8
-    num_warps = 4 if use_gate_in_kernel else 1
+    # gfx950: one warp keeps the K reduction inside the wave. At num_warps=4
+    # Triton splits the 128-wide K axis across two warps (warpsPerCTA=[2,2]),
+    # which turns both tl.sum(axis=1) into cross-warp reductions -- 14
+    # s_barrier and 77 LDS ops per token, plus 50 SGPR spills. BV=8 keeps the
+    # wave count identical, since (128/8)*N*H*1 == (128/32)*N*H*4.
+    BV = 8
+    num_warps = 1
     grid = (cdiv(V, BV) * N * H,)
     fused_recurrent_kda_fwd_kernel[grid](
         q=q,
