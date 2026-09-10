@@ -196,6 +196,29 @@ class TritonMLABackend(MLACommonBackend):
         return True
 
 
+_SCALE_CACHE: dict[int, tuple[torch.Tensor, float]] = {}
+
+
+def _scalar(t) -> float:
+    """float(t) without a per-call device->host sync.
+
+    The entry holds the tensor, not just the value: keying on the address alone
+    is a silent-wrong-answer bug, because freeing a scale tensor lets the
+    allocator hand its address to the next one, which would inherit the cached
+    value. Keeping a reference makes that impossible.
+    """
+    if t is None:
+        return 1.0
+    if not isinstance(t, torch.Tensor):
+        return float(t)
+    hit = _SCALE_CACHE.get(t.data_ptr())
+    if hit is not None and hit[0] is t:
+        return hit[1]
+    value = float(t.reshape(()).item())
+    _SCALE_CACHE[t.data_ptr()] = (t, value)
+    return value
+
+
 class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
     can_return_lse_for_decode: bool = True
 
@@ -309,6 +332,27 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         folded_rows = 0
         if not attn_metadata.causal and query_len > 1:
             folded_rows = attn_metadata.num_decodes * query_len
+            # gfx950 can serve the folded block with a single KV pass instead of
+            # one per head tile. Falls through when the shape or dtype is
+            # unsupported.
+            from vllm.models.kimi_k3.amd.ops.h40_draft_mla import (
+                h40_draft_mla_decode,
+            )
+
+            if h40_draft_mla_decode(
+                q,
+                kv_c_and_k_pe_cache,
+                o,
+                attn_metadata.decode.block_table[: attn_metadata.num_decodes],
+                attn_metadata.decode.seq_lens[: attn_metadata.num_decodes],
+                query_len,
+                self.scale,
+                _scalar(layer._q_scale),
+                _scalar(layer._k_scale),
+            ):
+                # The folded kernel produces no LSE; the DSpark draft path does
+                # not consume one.
+                return o, None
 
         # For batch invariance, use only 1 split to ensure deterministic reduction
         if envs.VLLM_BATCH_INVARIANT:

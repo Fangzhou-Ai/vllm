@@ -254,3 +254,6 @@ vllm/grpc/vllm_engine_pb2.pyi
 
 # Ignore generated cpu headers 
 csrc/cpu/cpu_attn_dispatch_generated.h
+
+# HIP-native sources that hipify must not rewrite are checked in as .hip
+!csrc/libtorch_stable/kimi_k3/*.hip
