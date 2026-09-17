@@ -270,6 +270,7 @@ class MoERunner(MoERunnerInterface):
         self.shared_expert_gate = shared_expert_gate
         self.routed_experts = routed_experts
         self.enable_dbo = enable_dbo
+        self.defer_shared_experts_launch = False
 
         # When both gates are present and FSE is enabled, fuse their
         # weight matrices into [num_experts + num_shared, hidden] so one
@@ -598,6 +599,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
+        shared_experts_launch_deferred: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -605,9 +607,9 @@ class MoERunner(MoERunnerInterface):
         via the router, and the actual fused MoE computation. Returns
         (shared_expert_output, fused_expert_output).
 
-        `shared_experts_overlapping` should be True only if using multi-stream
-        overlap. Then the shared expert was already launched in a separate
-        stream, so the results only have to be awaited here.
+        `shared_experts_overlapping` means the shared input is ready for the
+        auxiliary stream. With `shared_experts_launch_deferred`, enqueue the
+        shared branch after routed work and then join both streams.
         """
         self._maybe_apply_shared_experts(
             shared_experts_input, SharedExpertsOrder.NO_OVERLAP
@@ -636,6 +638,11 @@ class MoERunner(MoERunnerInterface):
                 shared_experts=self._shared_experts,
                 shared_experts_input=shared_experts_input,
             )
+
+        if shared_experts_launch_deferred:
+            assert self._shared_experts is not None
+            assert shared_experts_input is not None
+            self._shared_experts.forward_prepared_async(shared_experts_input)
 
         if shared_experts_overlapping:
             assert self._shared_experts is not None
@@ -884,13 +891,34 @@ class MoERunner(MoERunnerInterface):
         # TODO(bnell): this can be removed after MK migration is complete.
         self.routed_experts._ensure_moe_quant_config_init()
 
-        # If using multi-stream overlap for shared experts, we must launch it
-        # before routed expert dispatch.
+        # Both branches depend on the input event recorded before routing.
         shared_experts_overlapping = False
+        shared_experts_launch_deferred = False
         if self._shared_experts is not None:
-            shared_experts_overlapping = self._shared_experts.maybe_forward_async(
-                shared_experts_input
+            parallel = self.moe_config.moe_parallel_config
+            defer_launch = (
+                self.defer_shared_experts_launch
+                and 0 < hidden_states.shape[0] <= 192
+                and not self.enable_dbo
+                and not self.moe_config.is_lora_enabled
+                and not self.moe_config.defer_moe_finalize
+                and parallel.tp_size == 4
+                and parallel.dp_size == parallel.pcp_size == parallel.sp_size == 1
+                and parallel.ep_size == 1
+                and not parallel.use_ep
+                and not parallel.enable_eplb
+                and self.routed_input_transform is None
+                and self.routed_output_transform is None
             )
+            if defer_launch:
+                shared_experts_overlapping = self._shared_experts.prepare_async(
+                    shared_experts_input
+                )
+                shared_experts_launch_deferred = shared_experts_overlapping
+            else:
+                shared_experts_overlapping = self._shared_experts.maybe_forward_async(
+                    shared_experts_input
+                )
 
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
@@ -917,6 +945,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
                 shared_experts_overlapping=shared_experts_overlapping,
+                shared_experts_launch_deferred=shared_experts_launch_deferred,
             )
 
             return self._maybe_combine(

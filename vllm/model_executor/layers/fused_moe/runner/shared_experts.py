@@ -52,6 +52,7 @@ class SharedExperts(torch.nn.Module):
         # index is always 0 and the second output list element is ignored.
         self.enable_dbo = enable_dbo
         self._output: list[torch.Tensor | None] = [None, None]
+        self._async_prepared = [False, False]
         self._layer = layer
         self._moe_config = moe_config
 
@@ -119,12 +120,8 @@ class SharedExperts(torch.nn.Module):
         else:
             return SharedExpertsOrder.NO_OVERLAP
 
-    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
-        """Enqueue shared experts on the aux stream without waiting for them.
-
-        Returns true if the shared experts were enqueued, false otherwise. Call
-        `wait` to wait for the shared experts to finish if this returns true.
-        """
+    def prepare_async(self, shared_experts_input: torch.Tensor) -> bool:
+        """Record input readiness before independent routed work is enqueued."""
         if (
             self._determine_shared_experts_order(shared_experts_input)
             != SharedExpertsOrder.MULTI_STREAM_OVERLAPPED
@@ -133,11 +130,28 @@ class SharedExperts(torch.nn.Module):
         assert self._stream is not None
         idx = self._output_idx
         assert self._output[idx] is None
+        assert not self._async_prepared[idx]
         self._input_ready_event[idx].record(current_stream())
+        self._input_ready_event[idx].wait(self._stream)
+        self._async_prepared[idx] = True
+        return True
+
+    def forward_prepared_async(self, shared_experts_input: torch.Tensor) -> None:
+        """Enqueue shared work after a successful `prepare_async` call."""
+        assert self._stream is not None
+        idx = self._output_idx
+        assert self._async_prepared[idx]
+        assert self._output[idx] is None
         with torch.cuda.stream(self._stream):
-            self._input_ready_event[idx].wait(self._stream)
             self._output[idx] = self._layer(shared_experts_input)
             self._output_ready_event[idx].record(self._stream)
+        self._async_prepared[idx] = False
+
+    def maybe_forward_async(self, shared_experts_input: torch.Tensor) -> bool:
+        """Enqueue shared experts, returning whether the caller must `wait`."""
+        if not self.prepare_async(shared_experts_input):
+            return False
+        self.forward_prepared_async(shared_experts_input)
         return True
 
     def wait(self) -> None:

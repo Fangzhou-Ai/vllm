@@ -20,6 +20,8 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
+from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mhc import MHCPostOp, MHCPreDelayedOp
@@ -56,6 +58,7 @@ from vllm.models.deepseek_v4.amd.model import (
 )
 from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
+from vllm.platforms.rocm import on_gfx950
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -123,6 +126,18 @@ class DeepseekV4MoE(DeepseekV4MoEBase):
             self.experts.router.bias_vl = self.gate.bias_vl
             self.experts.router.image_sentinel_lo = self.image_sentinel_lo
         self.use_mega_moe = False
+        if isinstance(self.experts, MoERunner):
+            self.experts.defer_shared_experts_launch = (
+                envs.VLLM_ROCM_DEEPSEEK_V41_ROUTED_FIRST
+                and on_gfx950()
+                and self.hidden_size == 5120
+                and self.n_routed_experts == 384
+                and self.n_activated_experts == 6
+                and self.n_shared_experts == 1
+                and vllm_config.parallel_config.pipeline_parallel_size == 1
+                and getattr(self.experts._quant_method, "mxfp4_backend", None)
+                == Mxfp4MoeBackend.AITER_MXFP4_BF16
+            )
         # Expose the MixtureOfExperts protocol fields expected by the V4.1
         # outer model.  The current ROCm runner has no redundant EPLB copies,
         # so logical and physical expert counts are identical.

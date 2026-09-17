@@ -4,7 +4,9 @@
 import importlib
 import inspect
 import sys
+from contextlib import nullcontext
 from copy import deepcopy
+from functools import partial
 from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
@@ -37,6 +39,158 @@ pytestmark = pytest.mark.skipif(
     current_platform.is_xpu(),
     reason="ROCm-specific aiter ops are not supported on XPU",
 )
+
+
+@pytest.mark.parametrize(
+    "fallback",
+    [None, "disabled", "large_batch", "tp", "dp", "ep", "lora", "dbo", "transform"],
+)
+def test_routed_first_shared_experts_preserves_input_dependency(monkeypatch, fallback):
+    """Deferred launch keeps the early fork and falls back outside its scope."""
+    from vllm.model_executor.layers.fused_moe.runner import shared_experts as module
+    from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
+
+    operations = []
+
+    class Event:
+        def record(self, stream):
+            operations.append(("record", stream))
+
+        def wait(self, stream):
+            operations.append(("wait", stream))
+
+    class SharedLayer(nn.Module):
+        def forward(self, x):
+            operations.append(("shared", "aux"))
+            return x + 1
+
+    monkeypatch.setattr(module, "aux_stream", lambda: "aux")
+    monkeypatch.setattr(module, "current_stream", lambda: "main")
+    monkeypatch.setattr(module, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(module.current_platform, "is_cuda_alike", lambda: True)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    monkeypatch.setenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0")
+    monkeypatch.setenv("VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD", "256")
+    parallel = SimpleNamespace(
+        tp_size=4,
+        dp_size=1,
+        pcp_size=1,
+        sp_size=1,
+        ep_size=1,
+        use_ep=False,
+        enable_eplb=False,
+        use_fi_nvl_two_sided_kernels=False,
+        all2all_backend="allgather_reducescatter",
+    )
+    if fallback in ("tp", "dp", "ep"):
+        setattr(parallel, f"{fallback}_size", 2)
+    config = SimpleNamespace(
+        moe_parallel_config=parallel,
+        is_lora_enabled=fallback == "lora",
+        defer_moe_finalize=False,
+    )
+    shared = module.SharedExperts(
+        SharedLayer(), config, fallback == "dbo", lambda: False
+    )
+    quant_method = SimpleNamespace(is_monolithic=False, topk_indices_dtype=torch.int32)
+
+    def routed_forward(**kwargs):
+        operations.append(("routed", "main"))
+        return kwargs["x"] * 2
+
+    runner = SimpleNamespace(
+        _shared_experts=shared,
+        moe_config=config,
+        defer_shared_experts_launch=fallback != "disabled",
+        enable_dbo=fallback == "dbo",
+        routed_input_transform=nn.Identity() if fallback == "transform" else None,
+        routed_output_transform=None,
+        gate=None,
+        routed_experts=SimpleNamespace(
+            quant_method=quant_method,
+            _ensure_moe_quant_config_init=lambda: None,
+            forward_modular=routed_forward,
+        ),
+        _quant_method=quant_method,
+        router=SimpleNamespace(select_experts=lambda **_: (None, None)),
+        _sequence_parallel_context=nullcontext,
+        _maybe_dispatch=lambda x, logits: (x, logits),
+        _maybe_combine=lambda shared_output, routed_output: (
+            shared_output,
+            routed_output,
+        ),
+    )
+    runner._maybe_apply_shared_experts = partial(
+        MoERunner._maybe_apply_shared_experts, runner
+    )
+    runner._apply_quant_method = partial(MoERunner._apply_quant_method, runner)
+    x = torch.ones((193 if fallback == "large_batch" else 6, 4))
+    for _ in range(2):
+        operations.clear()
+        shared_output, routed_output = MoERunner._forward_impl(runner, x, x, x)
+        torch.testing.assert_close(shared_output, x + 1)
+        torch.testing.assert_close(routed_output, x * 2)
+        assert operations[:2] == [("record", "main"), ("wait", "aux")]
+        assert operations[-1] == ("wait", "main")
+        shared_index = operations.index(("shared", "aux"))
+        routed_index = operations.index(("routed", "main"))
+        assert (routed_index < shared_index) == (fallback is None)
+
+
+@pytest.mark.parametrize("fallback", [None, "default", "hardware", "backend", "draft"])
+def test_deepseek_v41_routed_first_requires_explicit_supported_opt_in(
+    monkeypatch, fallback
+):
+    """Model construction must leave the default and unvalidated backends alone."""
+    from vllm.models.deepseek_v41.amd import model
+
+    config = SimpleNamespace(
+        hidden_size=5120,
+        n_routed_experts=384,
+        num_experts_per_tok=6,
+        n_shared_experts=1,
+        num_hidden_layers=40,
+        dspark_n_routed_experts=64,
+        dspark_num_experts_per_tok=6,
+    )
+
+    def init_backbone(self, vllm_config, prefix):
+        nn.Module.__init__(self)
+        self.hidden_size = config.hidden_size
+        self.n_routed_experts = config.n_routed_experts
+        self.n_activated_experts = config.num_experts_per_tok
+        self.n_shared_experts = config.n_shared_experts
+        self.n_local_experts = self.n_routed_experts // 4
+        self.gate = SimpleNamespace()
+        self.experts = model.MoERunner.__new__(model.MoERunner)
+        nn.Module.__init__(self.experts)
+        self.experts.routed_experts = SimpleNamespace(
+            quant_method=SimpleNamespace(
+                mxfp4_backend=(
+                    None
+                    if fallback == "backend"
+                    else model.Mxfp4MoeBackend.AITER_MXFP4_BF16
+                )
+            )
+        )
+
+    monkeypatch.setattr(model.DeepseekV4MoEBase, "__init__", init_backbone)
+    monkeypatch.setattr(model, "on_gfx950", lambda: fallback != "hardware")
+    flag = "VLLM_ROCM_DEEPSEEK_V41_ROUTED_FIRST"
+    if fallback == "default":
+        monkeypatch.delenv(flag, raising=False)
+    else:
+        monkeypatch.setenv(flag, "1")
+    layer = model.DeepseekV4MoE(
+        SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=config),
+            parallel_config=SimpleNamespace(pipeline_parallel_size=1),
+        ),
+        prefix=f"model.layers.{40 if fallback == 'draft' else 0}.mlp",
+    )
+    assert layer.experts.defer_shared_experts_launch == (fallback is None)
+
 
 _QUARK_FSE_CONFIG: dict[str, Any] = {
     "global_quant_config": {

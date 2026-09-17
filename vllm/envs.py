@@ -293,6 +293,7 @@ if TYPE_CHECKING:
     VLLM_GC_DEBUG: str = ""
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
+    VLLM_ROCM_DEEPSEEK_V41_ROUTED_FIRST: bool = False
     VLLM_DISABLE_DSV4_MEGAMOE_SHARED_EXPERT_FUSION: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
@@ -2004,6 +2005,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disables parallel execution of shared_experts via separate cuda stream
     "VLLM_DISABLE_SHARED_EXPERTS_STREAM": lambda: bool(
         int(os.getenv("VLLM_DISABLE_SHARED_EXPERTS_STREAM", "0"))
+    ),
+    # Experimental routed-first shared-expert scheduling for gfx950 DSV4.1-Flash
+    # TP4. Benefits depend on the workload; some batch sizes can regress.
+    # Disabled by default.
+    "VLLM_ROCM_DEEPSEEK_V41_ROUTED_FIRST": lambda: bool(
+        int(os.getenv("VLLM_ROCM_DEEPSEEK_V41_ROUTED_FIRST", "0"))
     ),
     # Emergency rollback for the DeepSeek-V4 NVIDIA MegaMoE path. By default,
     # DeepGEMM computes replicated FP8 shared experts in the same persistent
