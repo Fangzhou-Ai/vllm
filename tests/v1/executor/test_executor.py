@@ -45,6 +45,48 @@ def test_supports_async_scheduling_multiproc_executor():
     assert MultiprocExecutor.supports_async_scheduling() is True
 
 
+@pytest.mark.parametrize(
+    ("user_threads", "expected_threads", "expected_marker", "expected_calls"),
+    [
+        pytest.param(None, "1", "1", [1], id="default"),
+        pytest.param("4", "4", None, [], id="user-override"),
+    ],
+)
+def test_multiproc_worker_envs_thread_count(
+    monkeypatch,
+    user_threads,
+    expected_threads,
+    expected_marker,
+    expected_calls,
+):
+    if user_threads is None:
+        monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("OMP_NUM_THREADS", user_threads)
+    monkeypatch.delenv(
+        multiproc_executor_module.OMP_NUM_THREADS_SET_BY_VLLM, raising=False
+    )
+    monkeypatch.setattr(multiproc_executor_module, "_maybe_force_spawn", lambda: None)
+    monkeypatch.setattr(
+        multiproc_executor_module.current_platform, "is_cpu", lambda: False
+    )
+    set_num_threads_calls: list[int] = []
+    monkeypatch.setattr(
+        multiproc_executor_module.torch,
+        "set_num_threads",
+        set_num_threads_calls.append,
+    )
+
+    multiproc_executor_module.set_multiprocessing_worker_envs(local_world_size=8)
+
+    assert os.environ["OMP_NUM_THREADS"] == expected_threads
+    assert (
+        os.environ.get(multiproc_executor_module.OMP_NUM_THREADS_SET_BY_VLLM)
+        == expected_marker
+    )
+    assert set_num_threads_calls == expected_calls
+
+
 class _FakeClock:
     def __init__(self) -> None:
         self.now = 0.0
