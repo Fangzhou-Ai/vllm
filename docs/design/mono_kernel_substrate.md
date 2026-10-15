@@ -17,8 +17,8 @@ MonoKernels), [#61311](https://github.com/vllm-project/vllm/pull/61311) (runtime
   helpers and an in-kernel rank-ordered all-reduce. The five codebases we compared hold 0.5-1.3k
   lines of it each.
 - The wire format is identical everywhere (8-byte `(value, tag)` pairs, polls batched by 12,
-  system scope for peers). What diverges is the *contract around it*: the epoch/tag scheme (three
-  different ones), the wait policy (unbounded, 10 s timeout, retry-bounded), the peer allocator,
+  system scope for peers). What diverges is the *contract around it*: the epoch/tag scheme (four, counting
+  ATOM's), the wait policy (unbounded, 10 s timeout, retry-bounded), the peer allocator,
   the `Mailbox` constructor, and the build key. The copies already behave differently where a
   rank fails, where a tag wraps and where a pair is double-buffered.
 - The RFC's runtime shell (refusals, routing, fail-stop) does not touch any of this, and the stage
@@ -50,6 +50,13 @@ model-independent, three layers `device/`, `plan/`, `runtime/`, MIT, used by ATO
 and MiniMax-M3); ROCm/FlyDSL `kernels/monokernel` (the GLM-5 / Kimi-K3 line, Apache-2.0, not
 installed in the wheel and outside FlyDSL's stable-API policy); the aiter FlyDSL directory, which
 vLLM already imports `buffer_ops`, `dpp_utils`, `kernel_signature` and `UncachedIpcHeap` from.
+
+ATOM's own contract is `Mailbox(layer, diag=None, region_ids=None)` with tag `layer + 1`; its
+runner zeroes every mailbox at the start of each step in a dedicated launch
+(`runtime/step_begin.py`, which also fences the ranks through step-epoch slots at the buffer
+tail), and its bounded wait (`_spin_bounded`) exists only in debug builds. The Kimi copy is the
+closest to it (50 changed lines in `ops.py`, 139 in `sync.py` against ATOM); the DeepSeek copy is
+a redesign (264 changed lines in `ops.py`): no per-step zeroing launch, a device epoch word.
 
 The ATOM commits cited by the vLLM files (`97359d6`, `a526f0d`) are snapshots of ATOM `main`
 that do not touch `atom/mono`; the framework itself landed in ATOM `0873517` (2026-10-06). The
@@ -98,7 +105,9 @@ This is the cheapest place to start, because it needs no agreement from anyone e
 
 ### Divergences that matter
 
-1. **Three epoch protocols.** DeepSeek's kernel advances its own epoch after every CTA has written a
+1. **Four epoch protocols.** ATOM zeroes all mailboxes at each step's start in a separate launch
+   and fences the ranks with step-epoch slots; the vLLM DeepSeek design exists to avoid that
+   launch. DeepSeek's kernel advances its own epoch after every CTA has written a
    mark (graph-safe, no host op). Kimi, Qwen, GLM and MiniMax advance a device counter with a host
    `add_` captured in the graph. Tags are `2e+1/2e+2`, `(e mod 2^22)*256+slot+1`,
    `step*lps+layer+1` and `step*128+layer+1`. Wrap behavior differs: DeepSeek's tag is a 32-bit
@@ -174,7 +183,8 @@ location (in scratch vs an external tensor) becomes a field of the policy, not a
 
 **D2. Epoch strategies behind one interface; do not unify the protocols in v0.** The substrate
 exposes `tag(epoch, slot)` and `parity(...)` for both the in-kernel epoch (DeepSeek) and the
-host-advanced counter (everyone else), with the tag layout a documented parameter. Merging them
+host-advanced counter (everyone else); ATOM's zero-at-step-start protocol stays ATOM's, because
+it needs a host launch per step that the vLLM copies avoid, with the tag layout a documented parameter. Merging them
 needs a hazard review of the peer-buffer arguments (Open questions) and is a v1 decision.
 
 **D3. Typed addresses, not scope strings.** Adopt `Addr(region, space)` with the one-space-per-poll
