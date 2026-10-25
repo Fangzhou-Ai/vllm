@@ -33,6 +33,12 @@ from vllm.v1.kv_cache_interface import KVQuantMode
 logger = init_logger(__name__)
 is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 float8_info = torch.finfo(current_platform.fp8_dtype())
+if current_platform.is_rocm():
+    from vllm.platforms.rocm import on_gfx950
+
+    _ON_GFX950 = on_gfx950()
+else:
+    _ON_GFX950 = False
 # Longest per-request query (e.g. 1 + num_speculative_tokens) run by split-K.
 MAX_3D_QUERY_LEN = 8
 # Cap on the lower bound of tiles per split-K segment for non-causal
@@ -578,18 +584,23 @@ def kernel_unified_attention(
 
         if SLIDING_WINDOW:
             qpos_lo = q_block_local_idx * BLOCK_Q
+            qpos_hi = tl.minimum(
+                qpos_lo + (BLOCK_M - 1) // num_queries_per_kv,
+                cur_batch_query_len - 1,
+            )
             dist = context_len + qpos_lo - seq_offset[:, None]
+            right_dist = context_len + qpos_hi - seq_offset[:, None]
             if USE_PER_SEQ_CAUSAL:
                 is_causal_seq = tl.load(per_seq_causal_ptr + seq_idx)
                 sw_mask_v = tl.where(
                     is_causal_seq,
                     dist < SLIDING_WINDOW,
-                    (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW),
+                    (dist < SLIDING_WINDOW) & (right_dist > -SLIDING_WINDOW),
                 )
             elif USE_CAUSAL:
                 sw_mask_v = dist < SLIDING_WINDOW
             else:
-                sw_mask_v = (dist < SLIDING_WINDOW) & (dist > -SLIDING_WINDOW)
+                sw_mask_v = (dist < SLIDING_WINDOW) & (right_dist > -SLIDING_WINDOW)
             V = tl.where(sw_mask_v, V, 0.0)
         if USE_PER_TOKEN_HEAD_SCALES:
             # Per-token-head quant: apply v_scale to P instead of V.
@@ -966,9 +977,27 @@ def unified_attention(
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
 
+    short_window_query = (
+        _ON_GFX950
+        and num_seqs >= 8
+        and window_size[0] >= 0
+        and not use_mm_prefix
+        and not use_rswa
+        and not use_per_seq_causal
+        and chunk_lookback < 0
+        and kv_quant_mode == KVQuantMode.NONE
+        and not is_batch_invariant
+        and not use_causal
+        and 1 < max_seqlen_q <= MAX_3D_QUERY_LEN
+        and head_size == 128
+        and num_queries_per_kv == 16
+        and q.dtype == torch.bfloat16
+    )
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
+    if short_window_query:
+        BLOCK_M = 64
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # Tuned launch parameters; ``None`` lets Triton pick its defaults.

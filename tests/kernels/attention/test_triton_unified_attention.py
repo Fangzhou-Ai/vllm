@@ -544,6 +544,88 @@ def ref_paged_attn(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize(
+    "query_len,context_len,window,causal",
+    [
+        (1, 2576, 2048, True),
+        (3, 5152, 4096, False),
+        (7, 8192, 4096, False),
+        (8, 4107, 4096, True),
+        (9, 129, 64, False),
+        (7, 17, 1, False),
+    ],
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("heads,dim", [(8, 128), (16, 128), (16, 256)])
+@torch.inference_mode()
+def test_short_sliding_window_matches_reference_and_preserves_padding(
+    query_len: int,
+    context_len: int,
+    window: int,
+    causal: bool,
+    dtype: torch.dtype,
+    heads: int,
+    dim: int,
+) -> None:
+    """Partition only active keys without dropping tails or writing graph padding."""
+    torch.set_default_device(DEVICE_TYPE)
+    set_random_seed(7140531)
+    query_lens = [query_len, max(1, query_len - 2)] * 4
+    kv_lens = [context_len, context_len + 13] * 4
+    tokens, block_size = sum(query_lens), 128
+    query = torch.randn(tokens + 2, heads, dim, dtype=dtype)
+    key = torch.randn(128, block_size, 1, dim, dtype=dtype)
+    value = torch.randn_like(key)
+    table = torch.randint(
+        0, 128, (len(kv_lens), triton.cdiv(max(kv_lens), block_size)), dtype=torch.int32
+    )
+    starts = torch.tensor([0, *query_lens], dtype=torch.int32).cumsum(
+        dim=0, dtype=torch.int32
+    )
+    lengths = torch.tensor(kv_lens, dtype=torch.int32)
+    output = torch.full_like(query, 123)
+    scratch = torch.empty(tokens + 2, heads, 16, dim, dtype=torch.float32)
+    maxima = torch.empty(tokens + 2, heads, 16, dtype=torch.float32)
+    sums = torch.empty_like(maxima)
+    unified_attention(
+        query,
+        key,
+        value,
+        output,
+        starts,
+        max(query_lens),
+        lengths,
+        max(kv_lens),
+        dim**-0.5,
+        causal,
+        (window - 1, window - 1),
+        table,
+        0.0,
+        None,
+        None,
+        None,
+        seq_threshold_3D=128,
+        num_par_softmax_segments=16,
+        softmax_segm_output=scratch,
+        softmax_segm_max=maxima,
+        softmax_segm_expsum=sums,
+    )
+    expected = ref_paged_attn(
+        query[:tokens].clone(),
+        key,
+        value,
+        query_lens,
+        kv_lens,
+        table,
+        dim**-0.5,
+        sliding_window=window,
+        causal=causal,
+    )
+    torch.testing.assert_close(output[:tokens], expected, atol=1.5e-2, rtol=1e-2)
+    assert torch.equal(output[tokens:], torch.full_like(output[tokens:], 123))
+
+
+@torch.inference_mode()
 def test_fp8_softmax_preserves_small_probabilities() -> None:
     """Keep exp(-8) contributions that underflow when cast directly to E4M3."""
     device = torch.device(DEVICE_TYPE)

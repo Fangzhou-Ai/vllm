@@ -349,6 +349,22 @@ steps:
       commands:
       - pytest -v -s kernels/attention --ignore=kernels/attention/test_triton_unified_attention_diffkv.py --ignore=kernels/attention/test_rocm_aiter_mla_decode.py --ignore=kernels/attention/test_rocm_aiter_mla_decode_metadata.py --ignore=kernels/attention/test_rocm_aiter_mla_fp8_support.py --ignore=kernels/attention/test_rocm_aiter_mla_op_registration.py --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
 
+- label: ":amd: (MI355) Sliding Window Split-K Attention"
+  key: kernels-attention-sliding-window-mi355
+  device: mi355_dpx
+  num_devices: 1
+  dind: false
+  timeout_in_minutes: 10
+  working_dir: /vllm-workspace/tests
+  depends_on:
+  - image-build-amd
+  source_file_dependencies:
+  - vllm/v1/attention/ops/triton_unified_attention.py
+  - vllm/v1/attention/ops/triton_attention_helpers.py
+  - tests/kernels/attention/test_triton_unified_attention.py
+  commands:
+  - pytest -v -s kernels/attention/test_triton_unified_attention.py -k "short_sliding_window or splitk_admission or reduce_segments or splitk_softmax"
+
 - label: ":nvidia: (H100) Attention DiffKV Kernels"
   key: kernels-attention-diffkv-test-h100
   timeout_in_minutes: 20
