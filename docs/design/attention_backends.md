@@ -105,6 +105,17 @@ vllm serve google/gemma-4-31B-it \
     --attention-backend TRITON_FLASHINFER
 ```
 
+### Triton Sliding-Window Draft Attention on ROCm
+
+`TRITON_ATTN` automatically packs short BF16 non-causal sliding-window query
+blocks on `gfx950` GPUs, including AMD Instinct MI355X. Select `TRITON_ATTN`
+for draft attention and use an unquantized draft KV cache. Packing is enabled
+by default for eligible shapes; no additional environment variable is needed.
+
+The optimized shape uses 128-dimensional heads, 16 query heads per KV head,
+2–8 query tokens per request, and at least eight requests. Other shapes use
+the existing Triton attention paths.
+
 ### Manual Selection
 
 When you explicitly set a backend via `--attention-backend` or `AttentionConfig`:

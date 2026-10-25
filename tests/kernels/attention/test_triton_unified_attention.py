@@ -557,7 +557,6 @@ def ref_paged_attn(
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("heads,dim", [(8, 128), (16, 128), (16, 256)])
-@torch.inference_mode()
 def test_short_sliding_window_matches_reference_and_preserves_padding(
     query_len: int,
     context_len: int,
