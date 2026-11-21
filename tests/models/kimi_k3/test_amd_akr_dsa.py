@@ -229,7 +229,7 @@ def test_prologue_matches_stock_ops(default_vllm_config, tokens):
     torch.testing.assert_close(idx_w, ref_w, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("rows", [1, 12, 43, 100, 192])
+@pytest.mark.parametrize("rows", [1, 12, 43, 100, 192, 240, 256])
 def test_sparse_mla_decode_matches_triton(rows):
     """The DCP sparse MLA decode kernel against Triton sparse_mla_fwd (out and lse)."""
     from vllm._aiter_ops import rocm_aiter_ops

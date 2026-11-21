@@ -49,9 +49,10 @@ SWITCHES: dict[str, str] = {
 
 # rows of the shared gathered-query buffer (``ensure_q_buffer``)
 Q_BUFFER_ROWS = 256
-# the sparse MLA kernel's partials feed the combine kernel; past its rows (c48: 48 x 5)
-# the stock Triton decode + v_up-first combine run as a pair
-MAX_ROWS_SPARSE = 192
+# the sparse MLA kernel's partials feed the combine kernel, whose communicator takes
+# 256 rows (c48 with 4 speculative tokens: 48 x 5 = 240); past them the stock decode
+# + v_up-first combine run as a pair
+MAX_ROWS_SPARSE = 256
 
 
 def on(name: str) -> bool:
@@ -497,7 +498,7 @@ def build_weights(w) -> LayerWeights:
             _fallback("COMBINE", str(e))
             return lw
         if old is not None:
-            # the stock v_up-first combine stays for M > 192 (c48: 48 x 5 rows) on a
+            # the stock v_up-first combine stays for M > 256 on a
             # view of the kernel's copy ([96, 512, 128] = w_uv_t^T: no second copy;
             # dcp_vup_bmm takes any strides and reads its transpose = w_uv_t)
             layer.W_UV_dcp = torch.nn.Parameter(
