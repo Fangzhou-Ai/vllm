@@ -459,7 +459,7 @@ def test_dense_mlp_module_both_drafts(dist_init, draft):
     assert layer.mlp.down_proj.reduce_results == reduces
     xs = {
         rows: torch.randn(rows, 7168, device="cuda").to(torch.bfloat16)
-        for rows in (5, 32, 80, 144)
+        for rows in (1, 5, 16, 17, 32, 80, 129, 144)
     }
     stock = {rows: layer.mlp(x).float() for rows, x in xs.items()}
     model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))

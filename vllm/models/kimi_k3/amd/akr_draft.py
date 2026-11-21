@@ -21,8 +21,8 @@ sliding-window draft (`Qwen3DSparkForCausalLM`, a compiled `DFlashQwen3Model`).
   (gate_up + SwiGLU, down) through the op `vllm.kimi_akr_draft_dense_mlp` (opaque to
   torch.compile); the weights are replaced in place by their packed layout (no extra
   memory). An MLP whose down projection all-reduces (the release's `Qwen2MLP`) keeps
-  that all-reduce after the op. Needs `max_num_seqs * k <= 144` (checked at set-up;
-  the stock weights are gone).
+  that all-reduce after the op. Needs `max_num_seqs` x the query rows a request (k)
+  <= 144 (checked at set-up; the stock weights are gone).
 * `DAR`      AITER's fused all-reduce + RMSNorm: the preview's
   `fused_allreduce_rms_norm`. The release's compiled backbone leaves it to vLLM's
   `RocmAiterAllReduceFusionPass` (`pass_config.fuse_allreduce_rms`); set-up logs
@@ -343,7 +343,7 @@ def _dense_mlp_op(x: torch.Tensor, key: int) -> torch.Tensor:
 
 
 def _dense_mlp_fake(x: torch.Tensor, key: int) -> torch.Tensor:
-    return torch.empty_like(x)
+    return x.new_empty(x.shape)  # contiguous, as the kernel's output
 
 
 direct_register_custom_op(
@@ -375,7 +375,9 @@ class AkrDenseMlp(nn.Module):
 
 
 def _mlp_reason(spec, model) -> str | None:
-    rows = spec.max_num_reqs * spec.num_speculative_steps
+    # query rows a step (k, or 1 + k for a fill-in block without sample_from_anchor)
+    q = getattr(spec, "num_query_per_req", spec.num_speculative_steps)
+    rows = spec.max_num_reqs * q
     if rows > MLP_MAX_ROWS:
         return f"up to {rows} draft rows (max {MLP_MAX_ROWS})"
     lib = _dense()

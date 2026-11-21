@@ -298,3 +298,6 @@ def test_release_mlp_reason_takes_a_reducing_mlp(_env, monkeypatch):
     assert akr_draft._mlp_reason(spec, model) is None
     spec.max_num_reqs = 48  # 192 draft rows at c48
     assert "192" in akr_draft._mlp_reason(spec, model)
+    # the rows are the query rows: 1 + k a request for a fill-in block
+    spec.max_num_reqs, spec.num_query_per_req = 32, 5
+    assert "160" in akr_draft._mlp_reason(spec, model)

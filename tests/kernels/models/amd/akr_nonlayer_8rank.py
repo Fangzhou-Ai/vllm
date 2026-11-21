@@ -365,7 +365,24 @@ def test_ctx_release(rank):
 
     torch.manual_seed(10)
     cases = []
-    for num_tokens, num_graph in ((50, 40), (40, 40), (30, 40), (300, 45), (60, 0)):
+    for num_tokens, num_graph in (
+        (50, 40),
+        (40, 40),
+        (30, 40),
+        (300, 45),
+        (60, 0),
+        # the kernel's row cap (192) on the eager and the graph path: 193 eager rows
+        # take the stock combine + norm
+        (1, 0),
+        (192, 0),
+        (193, 0),
+        (257, 0),
+        (99, 100),
+        (292, 100),
+        (293, 100),
+        (190, 190),
+        (383, 190),
+    ):
         aux = [
             torch.randn(num_tokens, HIDDEN, device="cuda").to(torch.bfloat16)
             for _ in range(5)
