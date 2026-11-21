@@ -626,8 +626,12 @@ def stage_sparse_combine(ha, hs, rank, M, reqs_empty=1):
     ).to(torch.int32)
     rows, stride_rows = flat_kv_row_view(ha.mla_cache, PAGE)
     scale = ha.layer.impl.scale
-    with akr_env(True):
-        res = A.sparse_mla_decode(q, rows, indptr, packed, scale, torch.bfloat16)
+    bands, A.FLYDSL_SPARSE_ROWS = A.FLYDSL_SPARSE_ROWS, ()  # the kernel at every M
+    try:
+        with akr_env(True):
+            res = A.sparse_mla_decode(q, rows, indptr, packed, scale, torch.bfloat16)
+    finally:
+        A.FLYDSL_SPARSE_ROWS = bands
     assert res is not None
     out, lse = res
     out_t = torch.empty((M, 96, 512), dtype=torch.bfloat16, device=dev)
@@ -796,6 +800,11 @@ def e2e(ha, hs, rank, name, lens, pad=0, switches=True, expect=None):
         f"e2e {name}: akr vs stock relL2 {r[1]} (noise {r[0]})",
     )
     if expect is not None:
+        from vllm.models.kimi_k3.amd import akr_dsa as A
+
+        if A._flydsl_sparse_wins(torch.empty((T, 96, 576), device="meta")):
+            # rows the hook leaves to the faster stock FlyDSL kernel
+            expect = [k for k in expect if k != "sparse_mla_decode"]
         for k in expect:
             check(rank, calls.get(k, 0) >= 1, f"e2e {name}: {k} did not run ({calls})")
     log(
@@ -1211,8 +1220,8 @@ def main():
                     ("single row", [(5000, 1)], 0, True, None),
                     ("T200 (50x4)", draw(50), 0, True, every),
                     (
-                        # the prologue (and so the fused score + top-k) takes one indexer
-                        # decode tile: decode_tile_size at a 1M context = 233 rows
+                        # the prologue (and so the fused score + top-k) takes one
+                        # indexer decode tile: decode_tile_size at 1M context = 233 rows
                         "T240 (48x5)",
                         [(int(c), 5) for c in rng.integers(1000, 9000, 48)],
                         0,
