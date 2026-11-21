@@ -10,14 +10,14 @@ default below) that applies on top of its route (`akr_config.on(route)`, which
 | NAME      | route       | default | piece                                            |
 |-----------|-------------|---------|--------------------------------------------------|
 | EMBED     | collectives | on      | `vocab_gather_comm` (target + drafter block ids) |
-| LMHEAD    | gemm        | on      | lm_head GEMM + all-gather (`compute_logits`)     |
+| LMHEAD    | gemm        | on      | lm_head GEMM + all-gather (target, drafter)      |
 | SHARDED   | sampling    | off     | `--enable-batch-sharded-sampling` owner exchange |
 | TOPP      | sampling    | on      | `top_p_mask` in `split_top_p_override`           |
 | MARKOV    | sampling    | on      | fused persistent Markov draft chain              |
-| CTXPROJ   | draft       | on      | sharded drafter `context_proj` + gather + norm   |
+| CTXPROJ   | draft       | on      | sharded drafter context projection + norm        |
 | DMLP      | draft       | on      | drafter dense MLP                                |
-| DMLA      | draft       | on      | drafter dense MLA decode                         |
-| DAR       | draft       | on      | AITER fused all-reduce + RMSNorm in the drafter  |
+| DMLA      | draft       | on      | drafter dense MLA decode (MLA drafts)            |
+| DAR       | draft       | on      | AITER fused all-reduce + RMSNorm (MLA drafter)   |
 | FINALNORM | norm        | off     | final attn_res + norm in `allreduce_attnres`     |
 """
 

@@ -3,8 +3,10 @@
 """Single-GPU checks of the Kimi-K3.1 non-layer amd_kernels routes against the stock
 paths (vllm/models/kimi_k3/amd/akr_*.py): the fused Markov chain behind
 `DSparkSpeculator._sample_sequential` (synthetic and block rejection interfaces: the
-draft tokens and the draft logits cache, with and without a row-mapped cache), the
-`split_top_p_override`, the drafter's dense MLP and the tile packer.
+draft tokens and the draft logits cache, with and without a row-mapped cache; the
+preview's and the release's draft class), the `split_top_p_override`, the drafter's
+dense MLP (both drafts' MLP modules, eager, torch.compile and graph replay) and the
+tile packer.
 
 Run: HIP_VISIBLE_DEVICES=0 pytest tests/kernels/models/amd/test_akr_nonlayer_1gpu.py
 """
@@ -48,10 +50,18 @@ class _MarkovW2(torch.nn.Module):
         self.quant_method = UnquantizedEmbeddingMethod()
 
 
-def _model(w1, w2, base):
+def _draft_cls(draft: str):
+    if draft == "release":
+        from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
+
+        return Qwen3DSparkForCausalLM
     from vllm.models.kimi_k3.nvidia.dspark_mla import K3DSparkForCausalLM
 
-    class _Model(K3DSparkForCausalLM):
+    return K3DSparkForCausalLM
+
+
+def _model(w1, w2, base, draft: str = "preview"):
+    class _Model(_draft_cls(draft)):
         def __init__(self):
             torch.nn.Module.__init__(self)
             head = torch.nn.Module()
@@ -81,7 +91,9 @@ def _model(w1, w2, base):
     return _Model()
 
 
-def _speculator(temp: float, seed: int, row_mapped: bool, n_spec: int):
+def _speculator(
+    temp: float, seed: int, row_mapped: bool, n_spec: int, draft: str = "preview"
+):
     from vllm.v1.worker.gpu.spec_decode.draft_logits import DraftLogitsCache
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
@@ -94,7 +106,7 @@ def _speculator(temp: float, seed: int, row_mapped: bool, n_spec: int):
     s = DSparkSpeculator.__new__(DSparkSpeculator)
     s.device = dev
     s.vocab_size = VOCAB
-    s.model = _model(w1, w2, base.to(bf16))
+    s.model = _model(w1, w2, base.to(bf16), draft)
     s.num_speculative_steps = n_spec
     s.max_num_reqs = MAX_REQS
     s._draft_topk = None
@@ -150,17 +162,34 @@ def _run(s, num_reqs):
     return s.draft_tokens.clone(), s.draft_logits.values.clone()
 
 
-@pytest.mark.parametrize("n_spec", [3, 7])
-@pytest.mark.parametrize("row_mapped", [False, True])
-@pytest.mark.parametrize("temp", [0.0, 0.6, 1.0])
-@pytest.mark.parametrize("num_reqs", [1, 5, 8])
-def test_markov_chain_matches_vllm_loop(num_reqs, temp, row_mapped, n_spec):
+@pytest.mark.parametrize(
+    "draft,n_spec,row_mapped,temp,num_reqs",
+    [
+        ("preview", n, rm, t, r)
+        for n in (3, 7)
+        for rm in (False, True)
+        for t in (0.0, 0.6, 1.0)
+        for r in (1, 5, 8)
+    ]
+    # the release (nst 4 at c16..c48, 7 at c1, 5 at c4): the same head and loop
+    + [
+        ("release", n, rm, 1.0, r)
+        for n in (4, 7)
+        for rm in (False, True)
+        for r in (1, 8)
+    ],
+)
+def test_markov_chain_matches_vllm_loop(draft, num_reqs, temp, row_mapped, n_spec):
     _need_akr()
     from vllm.models.kimi_k3.amd import akr_sampling
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
     s = _speculator(
-        temp, seed=int(temp * 10) + num_reqs, row_mapped=row_mapped, n_spec=n_spec
+        temp,
+        seed=int(temp * 10) + num_reqs,
+        row_mapped=row_mapped,
+        n_spec=n_spec,
+        draft=draft,
     )
     ref_tok, ref_cache = _run(s, num_reqs)
     akr_sampling.setup_speculator(s)
@@ -394,6 +423,66 @@ def test_dense_mlp_vs_stock(rows):
     )  # stock rounds gate / up too
     # the stock weights were replaced in place by the packed layout (same shape)
     assert mlp.gate_up_proj.weight.data.shape == gu.shape
+
+
+def _draft_mlp(draft: str):
+    """One layer's MLP of the draft class at the TP8 shard (7168, 1792): the preview's
+    `KimiMLP` (its all-reduce is the next norm's), the release's `Qwen2MLP` (its down
+    projection all-reduces; a no-op at TP 1)."""
+    if draft == "preview":
+        from vllm.models.kimi_k3.nvidia.model import KimiMLP
+
+        mlp = KimiMLP(7168, 1792, "silu", reduce_results=False)
+    else:
+        from vllm.model_executor.models.qwen2 import Qwen2MLP
+
+        mlp = Qwen2MLP(7168, 1792, "silu")
+    mlp = mlp.to(device="cuda", dtype=torch.bfloat16)
+    g = torch.Generator(device="cuda").manual_seed(11)
+    for p in mlp.parameters():
+        p.data.copy_(torch.randn(p.shape, generator=g, device="cuda") * 0.02)
+    return mlp
+
+
+@pytest.mark.parametrize("draft", ["preview", "release"])
+def test_dense_mlp_module_both_drafts(dist_init, draft):
+    """`_install_mlp` on the draft's own layers: the layer's `mlp` becomes the op
+    `vllm.kimi_akr_draft_dense_mlp` (+ the stock all-reduce when the MLP had one), the
+    same in eager, under torch.compile (fullgraph: the release's backbone is compiled)
+    and in a graph replay."""
+    _need_akr()
+    from vllm.models.kimi_k3.amd import akr_draft
+
+    layer = torch.nn.Module()
+    layer.mlp = _draft_mlp(draft)
+    reduces = draft == "release"
+    assert layer.mlp.down_proj.reduce_results == reduces
+    xs = {
+        rows: torch.randn(rows, 7168, device="cuda").to(torch.bfloat16)
+        for rows in (5, 32, 80, 144)
+    }
+    stock = {rows: layer.mlp(x).float() for rows, x in xs.items()}
+    model = SimpleNamespace(model=SimpleNamespace(layers=[layer]))
+    spec = SimpleNamespace(device=torch.device("cuda"), max_num_reqs=36)
+    assert akr_draft._install_mlp(spec, model) == 1
+    assert isinstance(layer.mlp, akr_draft.AkrDenseMlp)
+    assert layer.mlp.all_reduce is False  # TP 1
+    compiled = torch.compile(
+        lambda x: layer.mlp(x), fullgraph=True, dynamic=True, backend="aot_eager"
+    )
+    for rows, x in xs.items():
+        for out in (layer.mlp(x), compiled(x)):
+            rel = float((out.float() - stock[rows]).norm() / stock[rows].norm())
+            assert out.shape == x.shape and rel < 8e-3, (draft, rows, rel)
+    x = xs[32].clone()
+    layer.mlp(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = layer.mlp(x)
+    x.copy_(torch.randn_like(x))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out, layer.mlp(x))
 
 
 # ---------------------------------------------------------------- final attn_res + norm

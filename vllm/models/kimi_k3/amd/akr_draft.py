@@ -1,32 +1,49 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""The DSpark drafter's amd_kernels routes (draft route):
+"""The DSpark drafter's amd_kernels routes (draft route) for a Kimi-K3 target. Each
+piece reads its modules and shapes from the draft, so both Kimi-K3.1 drafts take
+them: the preview's MLA draft (`K3DSparkForCausalLM`) and the release's GQA
+sliding-window draft (`Qwen3DSparkForCausalLM`, a compiled `DFlashQwen3Model`).
 
-* `CTXPROJ`  `gemm/bf16_common.bf16_linear_gather`: `context_proj` (35840 -> 7168,
-  514 MB replicated GEMM) + `context_norm` as a sharded GEMM (this rank's columns,
+* `CTXPROJ`  `gemm/bf16_common.bf16_linear_gather`: the context projection (35840 ->
+  7168, 514 MB replicated GEMM) + its RMSNorm as a sharded GEMM (this rank's columns,
   64 MB at TP8) + gather over the TP ranks + RMSNorm in two launches. The target aux
   hidden states are packed into the kernel's tile layout (`linear_gather_pack_aux`)
-  instead of `torch.cat`. Rows <= 192 (the whole decode graph's context); the original
-  weight stays for larger prefill chunks. Extra memory: the packed shard 64 MB + slabs
-  22 MB per rank.
-* `DMLP`     `decoder/bf16_dense_mlp_common.bf16_dense_mlp`: the dense MLP's gate_up +
-  SwiGLU and down GEMMs; the weights are replaced in place by their packed layout (no
-  extra memory). Needs `max_num_seqs * k <= 144` (checked at set-up; the stock weights
-  are gone).
-* `DAR`      AITER's fused all-reduce + RMSNorm in `fused_allreduce_rms_norm`.
-* the lm_head all-gather exchange (`akr_lmhead`, switch `LMHEAD`) and the fused Markov
-  chain (`akr_sampling`, switch `MARKOV`).
+  instead of `torch.cat`. Rows <= 192 (the whole decode graph's context); the
+  original weight stays for larger prefill chunks. Extra memory: the packed shard
+  64 MB + slabs 22 MB per rank. The preview's `context_proj` + `context_norm` (its
+  `combine_hidden_states` norms); the release's `fc` + `hidden_norm`, whose stock
+  norm runs in `precompute_and_store_context_kv` (`_normalize_context_states`): the
+  stored rows are normed here instead (by the kernel, or by that stock norm for rows
+  it does not take) and the precompute's norm becomes the identity. Off when
+  `VLLM_K31_BEAT_DRAFTFC` already split `fc` over TP.
+* `DMLP`     `decoder/bf16_dense_mlp_common.bf16_dense_mlp`: every layer's dense MLP
+  (gate_up + SwiGLU, down) through the op `vllm.kimi_akr_draft_dense_mlp` (opaque to
+  torch.compile); the weights are replaced in place by their packed layout (no extra
+  memory). An MLP whose down projection all-reduces (the release's `Qwen2MLP`) keeps
+  that all-reduce after the op. Needs `max_num_seqs * k <= 144` (checked at set-up;
+  the stock weights are gone).
+* `DAR`      AITER's fused all-reduce + RMSNorm: the preview's
+  `fused_allreduce_rms_norm`. The release's compiled backbone leaves it to vLLM's
+  `RocmAiterAllReduceFusionPass` (`pass_config.fuse_allreduce_rms`); set-up logs
+  whether that pass is on.
+* `DMLA`     the dense MLA decode (`akr_draft_mla`): MLA drafts only.
+* the lm_head all-gather exchange on `compute_draft_logits` (`akr_lmhead`, switch
+  `LMHEAD`) and the fused Markov chain (`akr_sampling`, switch `MARKOV`).
 
 Each piece is checked at set-up with its entry's `*_unsupported_reason` (communicator,
 weights, the largest call it takes) and stays on the stock path otherwise.
 """
 
+from collections.abc import Callable
 from typing import Any
 
 import torch
+from torch import nn
 
 from vllm.logger import init_logger
 from vllm.models.kimi_k3.amd import akr_lmhead, akr_nonlayer, akr_sampling
+from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
@@ -46,6 +63,26 @@ def compute_logits(model, hidden_states: torch.Tensor) -> torch.Tensor | None:
     return akr_lmhead.logits("draft", model.lm_head, hidden_states)
 
 
+def _setup_lmhead(model, vllm_config) -> bool:
+    """Collective: the draft's exchange. The preview's `compute_logits` reads its
+    `_akr_lmhead` flag; another draft gets its `compute_draft_logits` wrapped."""
+    lm_head = getattr(model, "lm_head", None)
+    if lm_head is None or not hasattr(model, "compute_draft_logits"):
+        return False
+    ok = akr_lmhead.setup("draft", lm_head, model.logits_processor, vllm_config)
+    if hasattr(model, "_akr_lmhead"):
+        model._akr_lmhead = ok
+    elif ok:
+        stock = model.compute_draft_logits
+
+        def compute_draft_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+            out = akr_lmhead.logits("draft", model.lm_head, hidden_states)
+            return stock(hidden_states) if out is None else out
+
+        model.compute_draft_logits = compute_draft_logits
+    return ok
+
+
 def _gemm():
     from amd_kernels.gemm import bf16_common
 
@@ -53,10 +90,24 @@ def _gemm():
 
 
 # ------------------------------------------------------------------ context_proj
+def _ctx_layout(model) -> tuple[Any, Any, bool] | str:
+    """(projection, norm, the norm runs in the precompute) of the draft's context path,
+    or why the route does not know it."""
+    m = model.model
+    if hasattr(m, "context_proj") and hasattr(m, "context_norm"):
+        return m.context_proj, m.context_norm, False
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    if isinstance(m, DFlashQwen3Model) and getattr(m, "use_aux_hidden_state", False):
+        return m.fc, m.hidden_norm, True
+    return f"no context projection layout known for {type(m).__name__}"
+
+
 def _ctx_dims(model) -> tuple[int, int, int]:
     """(rank, N shard, K) of this rank's rows of the context projection."""
     g = akr_nonlayer.tp_group()
-    n, k = model.model.context_proj.weight.data.shape
+    proj, _, _ = _ctx_layout(model)
+    n, k = proj.weight.data.shape
     return g.rank_in_group, n // g.world_size, k
 
 
@@ -66,7 +117,8 @@ class ContextProj:
         lib = _gemm()
         self.lib = lib
         r, n_shard, k = _ctx_dims(model)
-        w = model.model.context_proj.weight.data
+        proj, norm, self.norm_in_precompute = _ctx_layout(model)
+        w = proj.weight.data
         self.w_packed = lib.linear_gather_pack_weight(
             w[n_shard * r : n_shard * (r + 1)].contiguous()
         )
@@ -74,8 +126,16 @@ class ContextProj:
         self.comm = lib.linear_gather_comm(r, g.cpu_group, device, n_shard=n_shard, k=k)
         self.hidden, self.k = w.shape
         self.num_aux = self.k // self.hidden
-        self.norm_weight = model.model.context_norm.weight
-        self.eps = float(model.model.context_norm.variance_epsilon)
+        self.norm_weight = norm.weight
+        self.eps = float(norm.variance_epsilon)
+        # rows the kernel does not take: normed as the kernel's (the precompute's
+        # stock norm for the release; the preview's combine already norms)
+        self.post_norm: Callable[[torch.Tensor], torch.Tensor] = (
+            model.model._normalize_context_states
+            if self.norm_in_precompute
+            else _identity
+        )
+        self._model = model.model
         n = self._numel(CTX_MAX_ROWS)
         # zero once: rows past a call's rows keep their (finite) previous content,
         # as the stock staging does
@@ -143,6 +203,12 @@ class ContextProj:
             out=out,
         )
 
+    def install(self) -> None:
+        """The release: the precompute's context norm becomes the identity (every stored
+        row is normed by `store_hidden_states` / `prepare_graph_forward`)."""
+        if self.norm_in_precompute:
+            self._model._normalize_context_states = _identity
+
     def warm_up(self, device: torch.device) -> None:
         """Collective: compile every tier of pack_aux and the projection."""
         aux = [
@@ -157,18 +223,38 @@ class ContextProj:
         torch.accelerator.synchronize(device)
 
 
+def _identity(x: torch.Tensor) -> torch.Tensor:
+    return x
+
+
 def _ctx_reason(spec, model) -> str | None:
-    m = model.model
-    proj = getattr(m, "context_proj", None)
-    if proj is None or proj.weight.dtype != torch.bfloat16:
-        return "context_proj is not a bf16 weight"
+    from vllm.model_executor.layers.linear import ReplicatedLinear
+
+    layout = _ctx_layout(model)
+    if isinstance(layout, str):
+        return layout
+    proj, norm, norm_in_precompute = layout
+    if not isinstance(proj, ReplicatedLinear):
+        # e.g. VLLM_K31_BEAT_DRAFTFC's TP-split fc (latency_specialized), which wins
+        return f"the context projection is a {type(proj).__name__}"
+    if proj.weight.dtype != torch.bfloat16 or proj.bias is not None:
+        return "the context projection is not a bf16 weight without bias"
+    n, k = proj.weight.shape
+    if k % n:
+        return f"context projection {n} x {k} is not a concat of {n}-wide aux states"
     if spec._aux_staging is None:
         return "no FULL-graph aux staging (decode cudagraph mode is not FULL)"
-    if (
-        m.context_norm.weight.dtype != torch.bfloat16
-        or abs(m.context_norm.variance_epsilon - 1e-5) > 1e-12
-    ):
-        return "context_norm is not bf16 / eps 1e-5"
+    if norm.weight.dtype != torch.bfloat16 or abs(norm.variance_epsilon - 1e-5) > 1e-12:
+        return "the context norm is not bf16 / eps 1e-5"
+    if norm_in_precompute:
+        m = model.model
+        if not hasattr(m, "_hidden_norm_weight"):
+            return "the context K/V buffers are not built"
+        if (
+            m._rms_norm_eps != norm.variance_epsilon
+            or m._hidden_norm_weight.data_ptr() != norm.weight.data_ptr()
+        ):
+            return "the precompute's context norm is not hidden_norm"
     rows = spec._num_graph_context_tokens(spec.max_num_reqs)
     if rows > CTX_MAX_ROWS:
         return f"{rows} graph context rows (max {CTX_MAX_ROWS})"
@@ -247,15 +333,58 @@ def _x_view(stage: torch.Tensor, down: torch.Tensor, rows: int) -> torch.Tensor:
     return stage[: _x_numel(down, rows)].view(-1, down.shape[0] // 32, 64, 8)
 
 
+# One entry per installed layer MLP, called by the op below (inside the draft's
+# compiled / captured forward, so the kernel launch is opaque to torch.compile).
+_MLPS: dict[int, _Mlp] = {}
+
+
+def _dense_mlp_op(x: torch.Tensor, key: int) -> torch.Tensor:
+    return _MLPS[key](x if x.is_contiguous() else x.contiguous())
+
+
+def _dense_mlp_fake(x: torch.Tensor, key: int) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="kimi_akr_draft_dense_mlp",
+    op_func=_dense_mlp_op,
+    fake_impl=_dense_mlp_fake,
+)
+
+
+class AkrDenseMlp(nn.Module):
+    """A draft layer's dense MLP on `bf16_dense_mlp` (this rank's partial sum), then the
+    stock MLP's own all-reduce when it had one (`down_proj.reduce_results`), which keeps
+    it visible to vLLM's all-reduce + RMSNorm fusion pass in a compiled backbone."""
+
+    def __init__(self, stock: nn.Module, key: int) -> None:
+        super().__init__()
+        self.stock = stock  # keeps the (packed) weights registered
+        self.key = key
+        down = stock.down_proj
+        self.all_reduce = bool(down.reduce_results) and down.tp_size > 1
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = torch.ops.vllm.kimi_akr_draft_dense_mlp(x, self.key)
+        if self.all_reduce:
+            from vllm.distributed import tensor_model_parallel_all_reduce
+
+            out = tensor_model_parallel_all_reduce(out)
+        return out
+
+
 def _mlp_reason(spec, model) -> str | None:
-    if spec.max_num_reqs * spec.num_speculative_steps > MLP_MAX_ROWS:
-        rows = spec.max_num_reqs * spec.num_speculative_steps
+    rows = spec.max_num_reqs * spec.num_speculative_steps
+    if rows > MLP_MAX_ROWS:
         return f"up to {rows} draft rows (max {MLP_MAX_ROWS})"
     lib = _dense()
     if not lib.available():
         return "needs gfx950 with FlyDSL"
     for layer in model.model.layers:
         mlp = layer.mlp
+        if not all(hasattr(mlp, a) for a in ("gate_up_proj", "down_proj", "act_fn")):
+            return f"{type(mlp).__name__} is not a gate_up / act / down MLP"
         if type(mlp.act_fn).__name__ != "SiluAndMul":
             return f"activation {type(mlp.act_fn).__name__}"
         gu, dn = mlp.gate_up_proj.weight, mlp.down_proj.weight
@@ -269,10 +398,12 @@ def _mlp_reason(spec, model) -> str | None:
         if gu.dtype != torch.bfloat16 or dn.dtype != torch.bfloat16:
             return "quantized MLP weights"
         if (
-            getattr(mlp, "shard_sequence_parallel", False)
-            or mlp.down_proj.reduce_results
+            getattr(mlp.gate_up_proj, "bias", None) is not None
+            or getattr(mlp.down_proj, "bias", None) is not None
         ):
-            return "MLP all-reduces itself or shards the sequence"
+            return "MLP projections with a bias"
+        if getattr(mlp, "shard_sequence_parallel", False):
+            return "MLP shards the sequence"
     return None
 
 
@@ -300,9 +431,9 @@ def _install_mlp(spec, model) -> int:
             return 0
     n = 0
     for layer in model.model.layers:
-        mlp = layer.mlp
-        m = _Mlp(mlp, ws, device)
-        mlp.forward = m
+        key = len(_MLPS)
+        _MLPS[key] = m = _Mlp(layer.mlp, ws, device)
+        layer.mlp = AkrDenseMlp(layer.mlp, key)
         n += 1
     # compile every tier (first call of the mode warms them all)
     probe = torch.zeros(16, hidden, dtype=torch.bfloat16, device=device)
@@ -311,27 +442,63 @@ def _install_mlp(spec, model) -> int:
     return n
 
 
+# ------------------------------------------------------------------ all-reduce + norm
+def _ar_note(spec, model) -> None:
+    """A draft built without the preview's `aiter_ar` flag (the release's compiled
+    backbone): its all-reduce + RMSNorm pairs are vLLM's fusion pass's; log whether it
+    is on (nothing is installed)."""
+    layers = getattr(model.model, "layers", ())
+    if not layers or hasattr(layers[0], "aiter_ar") or not akr_nonlayer.switch("DAR"):
+        return
+    from vllm._aiter_ops import rocm_aiter_ops
+    from vllm.config import CompilationMode
+
+    cc = spec.vllm_config.compilation_config
+    reason = None
+    if akr_nonlayer.tp_group().world_size == 1:
+        return
+    if cc.mode != CompilationMode.VLLM_COMPILE:
+        reason = "the draft backbone is not compiled (no all-reduce + RMSNorm fusion)"
+    elif not cc.pass_config.fuse_allreduce_rms:
+        reason = "pass_config.fuse_allreduce_rms is off"
+    elif rocm_aiter_ops.get_aiter_allreduce() is None:
+        reason = "no AITER custom all-reduce for the fusion pass"
+    if not akr_nonlayer.blocked("DAR", reason):
+        logger.info(
+            "amd_kernels drafter: all-reduce + RMSNorm left to vLLM's "
+            "RocmAiterAllReduceFusionPass (compiled draft backbone)"
+        )
+
+
 # ------------------------------------------------------------------ set-up
+def _target_reason(target_model) -> str | None:
+    if target_model is None:
+        return None
+    if not type(target_model).__module__.startswith("vllm.models.kimi_k3."):
+        return f"target {type(target_model).__name__} is not a Kimi-K3 model"
+    return None
+
+
 def setup(spec, target_model) -> None:
     """From `DSparkSpeculator.load_model` (collective on the TP group: same order on
     every rank, after the weights load, before any capture)."""
     model = spec.model
     spec._akr_ctx = None
-    if type(model).__name__ != "K3DSparkForCausalLM":
+    spec._akr_markov = None
+    if akr_nonlayer.blocked("draft", _target_reason(target_model)):
         return
     from vllm.config import set_current_vllm_config
 
     with set_current_vllm_config(spec.vllm_config):
-        model._akr_lmhead = akr_lmhead.setup(
-            "draft", model.lm_head, model.logits_processor, spec.vllm_config
-        )
+        _setup_lmhead(model, spec.vllm_config)
         if akr_nonlayer.switch("CTXPROJ"):
             ctx = _context_proj(spec, model)
             if ctx is not None:
                 ctx.warm_up(spec.device)
+                ctx.install()
                 spec._akr_ctx = ctx
                 logger.info(
-                    "amd_kernels drafter: sharded context_proj (+%.0f MB per rank)",
+                    "amd_kernels drafter: sharded context projection (+%.0f MB a rank)",
                     ctx.w_packed.numel() * 2 / 2**20,
                 )
         if akr_nonlayer.switch("DMLP") and not akr_nonlayer.blocked(
@@ -340,36 +507,41 @@ def setup(spec, target_model) -> None:
             n = _install_mlp(spec, model)
             if n:
                 logger.info("amd_kernels drafter: dense MLP kernels on %d layers", n)
+        _ar_note(spec, model)
         akr_sampling.setup_speculator(spec)
-        from vllm.models.kimi_k3.amd import akr_draft_mla
+        if getattr(spec.draft_model_config, "use_mla", False):
+            from vllm.models.kimi_k3.amd import akr_draft_mla
 
-        akr_draft_mla.setup(spec, model)
+            akr_draft_mla.setup(spec, model)
 
 
 def store_hidden_states(
     spec, num_tokens, last_hidden_states, aux_hidden_states, num_graph_tokens
 ) -> bool:
-    """`DFlashSpeculator._store_hidden_states` with the packed context projection.
-    False (nothing done) when the context projection is not on."""
+    """`DFlashSpeculator._store_hidden_states` with the packed context projection; every
+    stored row is the normed projection. False (nothing done) when it is not on."""
     ctx: ContextProj | None = getattr(spec, "_akr_ctx", None)
-    if ctx is None or not aux_hidden_states or len(aux_hidden_states) != ctx.num_aux:
+    if ctx is None:
         return False
+    aux = aux_hidden_states
+    packed = bool(aux) and len(aux) == ctx.num_aux
     start = 0
     if num_graph_tokens and spec._aux_staging is not None:
+        assert packed, "the FULL graph's context rows need the aux hidden states"
         start = min(num_tokens, num_graph_tokens)
-        ctx.pack_graph(aux_hidden_states, start)
+        ctx.pack_graph(aux, start)
     if start == num_tokens:
         return True
-    rows = num_tokens - start
-    if rows <= CTX_MAX_ROWS:
-        ctx.combine_eager(
-            aux_hidden_states, start, num_tokens, spec.hidden_states[start:num_tokens]
-        )
-    else:
+    out = spec.hidden_states[start:num_tokens]
+    if packed and num_tokens - start <= CTX_MAX_ROWS:
+        ctx.combine_eager(aux, start, num_tokens, out)
+    elif aux:
         hidden = spec.model.combine_hidden_states(
-            torch.cat([h[start:num_tokens] for h in aux_hidden_states], dim=-1)
+            torch.cat([h[start:num_tokens] for h in aux], dim=-1)
         )
-        spec.hidden_states[start:num_tokens].copy_(hidden)
+        out.copy_(ctx.post_norm(hidden))
+    else:
+        out.copy_(ctx.post_norm(last_hidden_states[start:num_tokens]))
     return True
 
 
