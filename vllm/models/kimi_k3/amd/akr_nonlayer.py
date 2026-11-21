@@ -18,6 +18,8 @@ default below) that applies on top of its route (`akr_config.on(route)`, which
 | DMLP      | draft       | on      | drafter dense MLP                                |
 | DMLA      | draft       | on      | drafter dense MLA decode (MLA drafts)            |
 | DAR       | draft       | on      | AITER fused all-reduce + RMSNorm (MLA drafter)   |
+| DQKV      | draft       | on      | drafter q / k norm + RoPE + KV insert (GQA)      |
+| DCTXKV    | draft       | on      | drafter context K norm + RoPE + KV inserts (GQA) |
 | FINALNORM | norm        | off     | final attn_res + norm in `allreduce_attnres`     |
 """
 
@@ -39,6 +41,8 @@ SWITCHES: dict[str, tuple[str, bool]] = {
     "DMLP": ("draft", True),
     "DMLA": ("draft", True),
     "DAR": ("draft", True),
+    "DQKV": ("draft", True),
+    "DCTXKV": ("draft", True),
     "FINALNORM": ("norm", False),
 }
 

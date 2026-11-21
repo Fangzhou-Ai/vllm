@@ -115,6 +115,7 @@ _KimiTarget.__module__ = "vllm.models.kimi_k3.amd.model"
 def _record(monkeypatch):
     from vllm.models.kimi_k3.amd import (
         akr_draft,
+        akr_draft_gqa,
         akr_draft_mla,
         akr_lmhead,
         akr_sampling,
@@ -135,6 +136,7 @@ def _record(monkeypatch):
     monkeypatch.setattr(akr_draft, "_install_mlp", rec("dmlp", 1))
     monkeypatch.setattr(akr_sampling, "setup_speculator", rec("markov"))
     monkeypatch.setattr(akr_draft_mla, "setup", rec("dmla"))
+    monkeypatch.setattr(akr_draft_gqa, "setup", rec("gqa"))
     return calls
 
 
@@ -150,8 +152,9 @@ def test_setup_routes_per_draft(monkeypatch, _env, draft):
     assert calls["ctxproj"][0] == (spec, model)
     assert calls["dmlp"][0] == (spec, model)
     assert calls["markov"][0] == (spec,)
-    # the dense MLA decode is the MLA draft's only
+    # the dense MLA decode is the MLA draft's only, the GQA attention inputs the GQA's
     assert ("dmla" in calls) == (draft == "preview")
+    assert calls.get("gqa") == (None if draft == "preview" else [(spec, model)])
     h = torch.zeros(2, H, dtype=torch.bfloat16)
     if draft == "preview":
         assert model._akr_lmhead is True  # read by K3DSparkForCausalLM.compute_logits

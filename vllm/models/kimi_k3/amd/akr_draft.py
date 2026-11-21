@@ -28,6 +28,8 @@ sliding-window draft (`Qwen3DSparkForCausalLM`, a compiled `DFlashQwen3Model`).
   `RocmAiterAllReduceFusionPass` (`pass_config.fuse_allreduce_rms`); set-up logs
   whether that pass is on.
 * `DMLA`     the dense MLA decode (`akr_draft_mla`): MLA drafts only.
+* `DQKV`, `DCTXKV` the GQA draft's q / k norm + RoPE + KV insert of the query block
+  and of the context rows (`akr_draft_gqa`): the release only.
 * the lm_head all-gather exchange on `compute_draft_logits` (`akr_lmhead`, switch
   `LMHEAD`) and the fused Markov chain (`akr_sampling`, switch `MARKOV`).
 
@@ -515,6 +517,10 @@ def setup(spec, target_model) -> None:
             from vllm.models.kimi_k3.amd import akr_draft_mla
 
             akr_draft_mla.setup(spec, model)
+        else:
+            from vllm.models.kimi_k3.amd import akr_draft_gqa
+
+            akr_draft_gqa.setup(spec, model)
 
 
 def store_hidden_states(

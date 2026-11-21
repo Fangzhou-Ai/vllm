@@ -5,8 +5,9 @@ paths (vllm/models/kimi_k3/amd/akr_*.py): the fused Markov chain behind
 `DSparkSpeculator._sample_sequential` (synthetic and block rejection interfaces: the
 draft tokens and the draft logits cache, with and without a row-mapped cache; the
 preview's and the release's draft class), the `split_top_p_override`, the drafter's
-dense MLP (both drafts' MLP modules, eager, torch.compile and graph replay) and the
-tile packer.
+dense MLP (both drafts' MLP modules, eager, torch.compile and graph replay), the tile
+packer, and the release draft's fused q / k norm + RoPE + KV insert and context K/V
+store (`akr_draft_gqa`).
 
 Run: HIP_VISIBLE_DEVICES=0 pytest tests/kernels/models/amd/test_akr_nonlayer_1gpu.py
 """
@@ -714,3 +715,212 @@ def test_dense_mla_wrapper_vs_aiter(reqs, qlen, cache_dtype):
         )
         is None
     )
+
+
+# ------------------------------------------------------------ release draft q / K / V
+NQ, NKV, HD, PAGE, PAGES = 12, 2, 64, 64, 96
+
+
+def _triton_attn(kind: str, idx: int = 0):
+    """A TRITON_ATTN draft attention layer: impl (cache update), cache, scales."""
+    from vllm.v1.attention.backend import AttentionType
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
+
+    impl = TritonAttentionImpl.__new__(TritonAttentionImpl)
+    impl.attn_type = AttentionType.DECODER
+    impl.kv_cache_dtype = "fp8" if kind == "fp8" else "auto"
+    impl._is_per_token_head_quant = False
+    impl.head_size = HD
+    impl.fp8_dtype = current_platform.fp8_dtype()
+    impl._set_kv_ptr_range = False
+    g = torch.Generator(device="cuda").manual_seed(100 + idx)
+    shape = (PAGES, NKV, PAGE, 2 * HD)
+    if kind == "fp8":
+        cache = torch.randint(0, 120, shape, generator=g, device="cuda").to(torch.uint8)
+    else:
+        cache = torch.randn(shape, generator=g, device="cuda").to(torch.bfloat16)
+    return SimpleNamespace(
+        impl=impl,
+        kv_cache=cache,
+        _k_scale=torch.tensor(0.0625 * (1 + idx), device="cuda"),
+        _v_scale=torch.tensor(0.03 * (1 + idx), device="cuda"),
+        kv_sharing_target_layer_name=None,
+        attn_backend=SimpleNamespace(
+            forward_includes_kv_cache_update=False, get_name=lambda: "TRITON_ATTN"
+        ),
+        layer_name=f"model.layers.{idx}.self_attn.attn",
+    )
+
+
+def _rope():
+    from vllm.model_executor.layers.rotary_embedding import get_rope
+
+    return get_rope(
+        HD,
+        max_position=1 << 16,
+        is_neox_style=True,
+        rope_parameters={"rope_theta": 10000.0, "rope_type": "default"},
+        dtype=torch.bfloat16,
+    )
+
+
+def _gqa_layer(kind: str):
+    """The release draft's `DFlashQwen3Attention` pieces the routes read (TP8 shard)."""
+    from vllm.model_executor.layers.layernorm import RMSNorm
+
+    a = torch.nn.Module()
+    a.num_heads, a.num_kv_heads, a.head_dim = NQ, NKV, HD
+    a.q_size, a.kv_size, a.v_scale = NQ * HD, NKV * HD, None
+    g = torch.Generator(device="cuda").manual_seed(7)
+    for name in ("q_norm", "k_norm"):
+        norm = RMSNorm(HD, eps=1e-5).to(device="cuda", dtype=torch.bfloat16)
+        norm.weight.data.copy_(torch.rand(HD, generator=g, device="cuda") + 0.5)
+        setattr(a, name, norm)
+    a.rotary_emb = _rope().cuda()
+    a.attn = _triton_attn(kind)
+    return a
+
+
+def _slots(n: int, seed: int) -> torch.Tensor:
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    s = torch.randperm(PAGES * PAGE, generator=g, device="cuda")[:n].clone()
+    s[::5] = -1  # padded rows write nothing
+    return s
+
+
+def _kv_close(got: torch.Tensor, ref: torch.Tensor, kind: str, exact: bool) -> None:
+    """Cache: V bit-equal; K bit-equal (`exact`) or within one bf16 ulp / e4m3 step of
+    the stock ops or 2^-6 of its head's maximum (RoPE cancels; the eager stock ops round
+    the normed K before RoPE, the kernel and the compiled layer do not)."""
+    assert torch.equal(got[..., HD:], ref[..., HD:])
+    a, b = got[..., :HD], ref[..., :HD]
+    if exact:
+        assert torch.equal(a, b)
+        return
+    if kind == "fp8":
+        a, b = (t.view(torch.float8_e4m3fn).float() for t in (a, b))
+        step = 2.0**-3
+    else:
+        a, b = a.float(), b.float()
+        step = 2.0**-7
+    tol = (
+        torch.maximum(b.abs() * step, b.abs().amax(dim=-1, keepdim=True) * 2.0**-6)
+        + 2.0**-9
+    )
+    assert bool(((a - b).abs() <= tol).all()), float(((a - b).abs() - tol).max())
+
+
+@pytest.mark.parametrize("kind", ["fp8", "bf16"])
+@pytest.mark.parametrize("rows", [1, 7, 32, 80, 192, 240, 2048])
+def test_draft_qkv_norm_rope_insert_vs_stock(monkeypatch, kind, rows):
+    """The op behind `DQKV` (`akr_draft_gqa._qkv_op`) against the stock ops it replaces
+    (q / k RMSNorm, NeoX RoPE, TRITON_ATTN's cache update): q within one bf16 ulp of
+    the row maximum, the cache within one step; no slot (profile run): q only."""
+    _need_akr()
+    from vllm.model_executor.layers.attention import attention as A
+    from vllm.models.kimi_k3.amd import akr_draft_gqa as G
+
+    a = _gqa_layer(kind)
+    assert G._layer_reason(a) is None
+    key = len(G._LAYERS)
+    G._LAYERS[key] = a
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    qkv = torch.randn(rows, (NQ + 2 * NKV) * HD, generator=g, device="cuda")
+    qkv = qkv.to(torch.bfloat16)
+    pos = torch.randint(0, 1 << 16, (rows,), generator=g, device="cuda")
+    slots = _slots(rows, rows)
+    ref_cache = a.attn.kv_cache.clone()
+    ref_q = G._qkv_stock(
+        a,
+        SimpleNamespace(**{**vars(a.attn), "kv_cache": ref_cache}),
+        qkv,
+        pos,
+        ref_cache,
+        slots,
+    )
+    ctx = {"slots": slots}
+    monkeypatch.setattr(
+        A,
+        "get_attention_context",
+        lambda name: (None, a.attn, a.attn.kv_cache, ctx["slots"]),
+    )
+    q = G._qkv_op(qkv, pos, key, a.attn.layer_name)
+    tol = ref_q.float().abs().amax(dim=-1, keepdim=True) * 2**-6
+    assert bool(((q.float() - ref_q.float()).abs() <= tol).all())
+    _kv_close(a.attn.kv_cache, ref_cache, kind, exact=False)
+    ctx["slots"] = None
+    before = a.attn.kv_cache.clone()
+    q2 = G._qkv_op(qkv, pos, key, a.attn.layer_name)
+    assert torch.equal(q2, q) and torch.equal(a.attn.kv_cache, before)
+
+
+def _ctx_model(kind: str, hidden: int = 512):
+    """A `DFlashQwen3Model` shell with the release draft's context K/V buffers at TP8
+    (5 layers, 2 KV heads of 64) and TRITON_ATTN caches."""
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+
+    nl = 5
+    m = DFlashQwen3Model.__new__(DFlashQwen3Model)
+    torch.nn.Module.__init__(m)
+    g = torch.Generator(device="cuda").manual_seed(3)
+    m._num_attn_layers, m._head_dim, m._num_kv_heads = nl, HD, NKV
+    m._kv_size, m._rms_norm_eps = NKV * HD, 1e-5
+    m._k_norm_weights = (torch.rand(nl, HD, generator=g, device="cuda") + 0.5).to(
+        torch.bfloat16
+    )
+    rope = _rope().cuda()
+    m._rope_cos_sin_cache, m._rope_head_size, m._rope_is_neox = (
+        rope.cos_sin_cache,
+        HD,
+        True,
+    )
+    w = torch.randn(nl * 2 * NKV * HD, hidden, generator=g, device="cuda") * 0.05
+    m._fused_kv_weight, m._fused_kv_bias, m._context_kv_proj = w.bfloat16(), None, None
+    m._hidden_norm_weight = (torch.rand(hidden, generator=g, device="cuda") + 0.5).to(
+        torch.bfloat16
+    )
+    m.__dict__["layers"] = [SimpleNamespace(self_attn=SimpleNamespace(v_scale=None))]
+    m._attn_layers = [_triton_attn(kind, i) for i in range(nl)]
+    return m
+
+
+@pytest.mark.parametrize("kind", ["fp8", "bf16"])
+@pytest.mark.parametrize("rows", [1, 12, 40, 100, 240, 1000])
+@pytest.mark.parametrize("per_layer", [False, True])
+def test_draft_context_kv_store_vs_stock(kind, rows, per_layer):
+    """`DCTXKV` (`akr_draft_gqa.ContextKv`) against the stock
+    `precompute_and_store_context_kv` on the same caches: every layer's cache bytes;
+    a graph replay of the route equals its eager call."""
+    _need_akr()
+    from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
+    from vllm.models.kimi_k3.amd import akr_draft_gqa as G
+
+    m = _ctx_model(kind)
+    model = SimpleNamespace(model=m)
+    assert G._ctx_reason(model) is None
+    g = torch.Generator(device="cuda").manual_seed(rows)
+    states = torch.randn(rows, 512, generator=g, device="cuda").to(torch.bfloat16)
+    pos = torch.randint(0, 1 << 16, (rows,), generator=g, device="cuda")
+    slots = [_slots(rows, rows + (i if per_layer else 0)) for i in range(5)]
+    slot_arg = slots if per_layer else slots[0]
+    start = [a.kv_cache.clone() for a in m._attn_layers]
+    DFlashQwen3Model.precompute_and_store_context_kv(m, states, pos, slot_arg)
+    ref = [a.kv_cache.clone() for a in m._attn_layers]
+    for a, c in zip(m._attn_layers, start):
+        a.kv_cache.copy_(c)
+    route = G.ContextKv(m)
+    route(states, pos, slot_arg)
+    for a, r in zip(m._attn_layers, ref):
+        _kv_close(a.kv_cache, r, kind, exact=True)
+    if rows != 100:
+        return
+    eager = [a.kv_cache.clone() for a in m._attn_layers]
+    for a, c in zip(m._attn_layers, start):
+        a.kv_cache.copy_(c)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        route(states, pos, slot_arg)
+    graph.replay()
+    torch.cuda.synchronize()
+    for a, e in zip(m._attn_layers, eager):
+        assert torch.equal(a.kv_cache, e)
