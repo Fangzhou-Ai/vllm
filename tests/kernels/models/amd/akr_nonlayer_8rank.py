@@ -236,7 +236,7 @@ def test_ctx(rank):
         return y.to(torch.bfloat16)
 
     torch.manual_seed(9)
-    for rows in (12, 40, 60, 65, 144, 192):
+    for rows in (12, 40, 60, 65, 144, 192, 240, 256):
         aux = [
             torch.randn(rows + 5, HIDDEN, device="cuda").to(torch.bfloat16)
             for _ in range(5)
@@ -270,7 +270,7 @@ def test_ctx(rank):
         cos, rel = _cos_rel(out, exact(aux))
         assert cos > 0.99999 and rel < 1e-3, (i, cos, rel)
     # the speculator hooks: graph rows packed eagerly + projected in the graph step,
-    # the remaining rows eagerly (<= 192) or by the stock combine (> 192)
+    # the remaining rows eagerly (<= 256) or by the stock combine (> 256)
     spec = SimpleNamespace(
         _akr_ctx=ctx,
         _aux_staging=object(),
@@ -371,17 +371,20 @@ def test_ctx_release(rank):
         (30, 40),
         (300, 45),
         (60, 0),
-        # the kernel's row cap (192) on the eager and the graph path: 193 eager rows
+        # the kernel's row cap (256) on the eager and the graph path: 257 eager rows
         # take the stock combine + norm
         (1, 0),
         (192, 0),
         (193, 0),
+        (256, 0),
         (257, 0),
         (99, 100),
-        (292, 100),
-        (293, 100),
+        (356, 100),
+        (357, 100),
         (190, 190),
-        (383, 190),
+        (240, 240),
+        (496, 240),
+        (497, 240),
     ):
         aux = [
             torch.randn(num_tokens, HIDDEN, device="cuda").to(torch.bfloat16)

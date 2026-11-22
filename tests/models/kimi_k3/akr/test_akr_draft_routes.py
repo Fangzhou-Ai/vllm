@@ -193,6 +193,10 @@ def test_context_layout_and_reasons(_env):
     for model in (rel, pre):
         assert akr_draft._ctx_reason(_spec(model, _env, False), model) is None
     spec = _spec(rel, _env, False)
+    spec.max_num_reqs = 48  # c48, 4 speculative tokens: 240 graph context rows
+    assert akr_draft._ctx_reason(spec, rel) is None
+    spec.max_num_reqs = 52
+    assert "260 graph context rows" in akr_draft._ctx_reason(spec, rel)
     spec._aux_staging = None
     assert "FULL" in akr_draft._ctx_reason(spec, rel)
     # the precompute norms with the q_norm eps: it must be hidden_norm's
@@ -302,10 +306,14 @@ def test_release_mlp_reason_takes_a_reducing_mlp(_env, monkeypatch):
     spec = _spec(model, _env, False)
     assert akr_draft._mlp_reason(spec, model) is None
     spec.max_num_reqs = 48  # 192 draft rows at c48
-    assert "192" in akr_draft._mlp_reason(spec, model)
+    assert akr_draft._mlp_reason(spec, model) is None
+    spec.max_num_reqs = 65
+    assert "260" in akr_draft._mlp_reason(spec, model)
     # the rows are the query rows: 1 + k a request for a fill-in block
-    spec.max_num_reqs, spec.num_query_per_req = 32, 5
-    assert "160" in akr_draft._mlp_reason(spec, model)
+    spec.max_num_reqs, spec.num_query_per_req = 48, 5
+    assert akr_draft._mlp_reason(spec, model) is None
+    spec.max_num_reqs = 52
+    assert "260" in akr_draft._mlp_reason(spec, model)
 
 
 def test_release_ar_reason(_env):

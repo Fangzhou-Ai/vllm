@@ -372,7 +372,7 @@ def test_tile_packer_matches_library():
     from vllm.models.kimi_k3.amd.akr_draft_ops import pack_tiles
 
     down = torch.empty(7168, 1792, dtype=torch.bfloat16, device="cuda")
-    for rows in (1, 12, 16, 17, 60, 144, 192):
+    for rows in (1, 12, 16, 17, 60, 144, 192, 193, 240, 256):
         x = torch.randn(rows, 7168, device="cuda").to(torch.bfloat16)
         tiles = dense_mlp_packed_tiles(rows, down=down)
         out = torch.full(
@@ -389,7 +389,7 @@ def test_tile_packer_matches_library():
         assert torch.equal(out.view(tiles, 224, 64, 8), ref), rows
 
 
-@pytest.mark.parametrize("rows", [12, 32, 60, 144])
+@pytest.mark.parametrize("rows", [12, 32, 60, 144, 145, 192, 240, 256])
 def test_dense_mlp_vs_stock(rows):
     _need_akr()
     from vllm.model_executor.layers.activation import SiluAndMul

@@ -9,9 +9,9 @@ sliding-window draft (`Qwen3DSparkForCausalLM`, a `DFlashQwen3Model` backbone).
   7168, 514 MB replicated GEMM) + its RMSNorm as a sharded GEMM (this rank's columns,
   64 MB at TP8) + gather over the TP ranks + RMSNorm in two launches. The target aux
   hidden states are packed into the kernel's tile layout (`linear_gather_pack_aux`)
-  instead of `torch.cat`. Rows <= 192 (the whole decode graph's context); the
+  instead of `torch.cat`. Rows <= 256 (the whole decode graph's context); the
   original weight stays for larger prefill chunks. Extra memory: the packed shard
-  64 MB + slabs 22 MB per rank; the stock FULL-graph staging `_aux_staging` (the
+  64 MB + slabs 29 MB per rank; the stock FULL-graph staging `_aux_staging` (the
   graph's context rows x 35840 bf16) is emptied, its readers bypassed. The preview's
   `context_proj` + `context_norm` (its
   `combine_hidden_states` norms); the release's `fc` + `hidden_norm`, whose stock
@@ -25,7 +25,7 @@ sliding-window draft (`Qwen3DSparkForCausalLM`, a `DFlashQwen3Model` backbone).
   memory; one workspace and one activation staging for all layers, which run one after
   another on one stream). An MLP whose down projection all-reduces (the release's
   `Qwen2MLP`) keeps that all-reduce after the op. Needs `max_num_seqs` x the query rows
-  a request (k) <= 144 (checked at set-up; the stock weights are gone).
+  a request (k) <= 256 (checked at set-up; the stock weights are gone).
 * `DAR`      the all-reduce + residual add + RMSNorm pairs. The preview: AITER's fused
   op (`fused_allreduce_rms_norm`). The release (uncompiled under breakable CUDA graphs,
   so vLLM's fusion pass never sees it): `norm/attnres_rmsnorm_common`
@@ -60,8 +60,8 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
-CTX_MAX_ROWS = 192  # rows of the staging buffers (the decode graph's context)
-MLP_MAX_ROWS = 144  # the kernel loses to the stock GEMMs at 192 rows (0.95x)
+CTX_MAX_ROWS = 256  # rows of the staging buffers (the decode graph's context)
+MLP_MAX_ROWS = 256
 AR_MAX_ROWS = 152  # all-reduce + norm: a draft step loses 0.5 us at 156 rows, 2 at 160
 
 
