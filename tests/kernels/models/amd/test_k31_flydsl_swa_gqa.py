@@ -196,26 +196,42 @@ def test_tiles_per_workgroup_8_matches_4(dtype, monkeypatch):
     torch.testing.assert_close(outs[8], outs[4], atol=1e-3, rtol=0)
 
 
-def test_cuda_graph_padded_requests():
-    """Captured as the builder captures (seq_lens 1) with an empty request in
-    the middle; replays on real lengths."""
+@pytest.mark.parametrize(
+    "dtype,bs,ctxs,qlens",
+    [
+        (torch.bfloat16, 448, [3000, 50, 9000], [7, 0, 7]),
+        # 8 key tiles a workgroup: new requests, and padded ones (no rows, no
+        # keys, null blocks) mid-batch and at the end.
+        (FP8, 64, [0, 5000, 0, 3, 2045, 60000, 0, 0], [4, 1, 0, 3, 4, 2, 0, 0]),
+    ],
+    ids=["bf16", "fp8"],
+)
+def test_cuda_graph_padded_requests(dtype, bs, ctxs, qlens):
+    """Captured as the builder captures (seq_lens 1) with empty requests;
+    replays on real lengths. Rows past the last request stay untouched."""
     from vllm.models.kimi_k3.amd.ops.flydsl_swa_gqa import flydsl_swa_gqa_fwd
 
-    bs = 448
-    kv = _cache(512, bs, torch.bfloat16)
-    q, bt, sl, _ = _problem([3000, 50, 9000], 7, bs, 512)
-    qsl = torch.tensor([0, 7, 7, 14], dtype=torch.int32, device="cuda")
+    rows = max(qlens)
+    nblk = _num_blocks(ctxs, rows, bs)
+    kv = _cache(nblk, bs, dtype)
+    q, bt, _, _ = _problem(ctxs, rows, bs, nblk)
+    sl = torch.tensor(
+        [c + n for c, n in zip(ctxs, qlens)], dtype=torch.int32, device="cuda"
+    )
+    bt[sl == 0] = 0
+    qsl = torch.tensor([0, *qlens], device="cuda").cumsum(0).to(torch.int32)
+    ks, vs, kf, vf = _scales(dtype, dim0=True)
     run_sl = sl.clone().fill_(1)
     out = torch.zeros_like(q)
-    flydsl_swa_gqa_fwd(q, kv, bt, run_sl, qsl, 7, out, SCALE, W)
+    flydsl_swa_gqa_fwd(q, kv, bt, run_sl, qsl, rows, out, SCALE, W, ks, vs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        flydsl_swa_gqa_fwd(q, kv, bt, run_sl, qsl, 7, out, SCALE, W)
+        flydsl_swa_gqa_fwd(q, kv, bt, run_sl, qsl, rows, out, SCALE, W, ks, vs)
     run_sl.copy_(sl)
     out.zero_()
     graph.replay()
     torch.cuda.synchronize()
-    ref = _reference(q, kv, bt, run_sl, qsl)
+    ref = _reference(q, kv, bt, sl, qsl, kf, vf)
     torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=0)
 
 
