@@ -352,10 +352,13 @@ def test_fused_score_topk_across_ragged_batches(monkeypatch):
     from vllm.config import VllmConfig
     from vllm.forward_context import set_forward_context
     from vllm.models.kimi_k3.amd import dsa  # noqa: F401
-    from vllm.models.kimi_k3.amd.ops.fp4_indexer import store_keys
+    from vllm.models.kimi_k3.amd.ops.fp4_indexer import decode_tile_size, store_keys
 
     torch.manual_seed(0)
     width, scale = 131072, HEADS**-0.5 * 128**-0.5
+    # DCP8: rank-local width of the model length, every batch's rows one tile (the
+    # fused kernel serves single-tile calls only)
+    max_model_len = 8 * width
     knorm = _knorm()
     config = VllmConfig()
     total_pages = 3000
@@ -376,6 +379,7 @@ def test_fused_score_topk_across_ragged_batches(monkeypatch):
     for rows_per_req, keys_per_req, pad in batches:
         meta, used, tokens = _ragged_metadata(rows_per_req, keys_per_req, pad, width)
         assert used <= total_pages
+        assert tokens <= decode_tile_size(max_model_len, width, TOPK, HEADS)
         q = torch.randn((tokens, HEADS, 128), device="cuda", dtype=torch.bfloat16)
         k = torch.randn((tokens, 128), device="cuda", dtype=torch.bfloat16)
         w = torch.rand((tokens, HEADS), device="cuda", dtype=torch.bfloat16)
@@ -386,7 +390,7 @@ def test_fused_score_topk_across_ragged_batches(monkeypatch):
             sc = torch.zeros(out.shape, device="cuda")
             with set_forward_context({"indexer": meta}, config):
                 torch.ops.vllm.kimi_fp4_indexer(
-                    q, knorm(k), w, cache, out, "indexer", width,
+                    q, knorm(k), w, cache, out, "indexer", max_model_len,
                     weight_scale=scale, scores=sc,
                 )  # fmt: skip
             torch.accelerator.synchronize()
