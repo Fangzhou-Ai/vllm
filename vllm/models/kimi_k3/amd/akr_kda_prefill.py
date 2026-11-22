@@ -37,6 +37,7 @@ logger = init_logger(__name__)
 
 _ATTR_W = "_akr_kda_conv_w"
 _STEP = "_akr_kda_table"
+_SIDX = "_akr_kda_sidx"
 
 
 def _env_on() -> bool:
@@ -94,6 +95,18 @@ def _conv_weight(layer) -> torch.Tensor:
     return w
 
 
+def _state_indices(m) -> torch.Tensor | None:
+    """`prefill_state_indices` with unit stride, once per step: the builder's is the
+    column view `block_table[:, 0]` (row stride 1 + speculative blocks)."""
+    s = getattr(m, _SIDX, None)
+    if s is None:
+        s = m.prefill_state_indices
+        if s is not None:
+            s = s.contiguous()
+        setattr(m, _SIDX, s)
+    return s
+
+
 def _table(m, prefill_state_indices, prefill_has_initial_state, cu, state_cache):
     from amd_kernels.attention.kda_common import kda_prefill_chunk_table
 
@@ -138,7 +151,7 @@ def try_prefill(
     nd = m.num_decodes  # decode-first, only when there is no spec split (checked above)
     nd_tok = m.num_decode_tokens
     cu = m.prefill_query_start_loc
-    sidx = m.prefill_state_indices
+    sidx = _state_indices(m)
     has = m.prefill_has_initial_state
     if cu is None or sidx is None or has is None:
         return False
