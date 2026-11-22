@@ -304,7 +304,8 @@ def _ragged_metadata(rows_per_req, keys_per_req, pad_reqs, width):
     )
     keys = torch.tensor(keys_per_req, device=dev, dtype=torch.int64)
     new = torch.tensor(rows_per_req, device=dev, dtype=torch.int64)
-    ends = (keys[req] - new[req] + within + 1).clamp(min=0).to(torch.int32)
+    raw_ends = keys[req] - new[req] + within + 1
+    ends = raw_ends.clamp(min=0).to(torch.int32)
     table = torch.zeros((nreq, pages), device=dev, dtype=torch.int32)
     used = 0
     for r, n in enumerate(keys_per_req):
@@ -313,9 +314,13 @@ def _ragged_metadata(rows_per_req, keys_per_req, pad_reqs, width):
         used += nb
     starts = torch.zeros(nreq + 1, device=dev, dtype=torch.int32)
     starts[1:] = torch.tensor(rows_per_req, device=dev).cumsum(0)
-    slots = (table[req, (ends - 1).clamp(min=0) // 64].to(torch.int64) * 64) + (
-        (ends - 1).clamp(min=0) % 64
-    )
+    last = (ends - 1).clamp(min=0)
+    slots = table[req, last // 64].to(torch.int64) * 64 + last % 64
+    # Rows beyond a short request's keys store nothing: several rows writing one
+    # slot leave whichever key lands last, a different one in each run.
+    slots = torch.where(raw_ends > 0, slots, -1)
+    stored = slots[slots >= 0]
+    assert stored.unique().numel() == stored.numel()
     meta = DeepseekV32IndexerMetadata(
         seq_lens=keys.to(torch.int32),
         max_seq_len=max(keys_per_req),
