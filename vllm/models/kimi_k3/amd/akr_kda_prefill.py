@@ -6,9 +6,7 @@
 One call replaces, for the prefill tokens of a layer: the fused qkv causal conv + SiLU,
 the gate / beta / q-k L2-norm computation, `chunk_kda_prefill` and the gated RMSNorm
 (`self.o_norm`). Route `kda` of `akr_config`, sub-switch `VLLM_KIMI_AKR_KDA_PREFILL`
-(default off: unset keeps the stock path, `=1` enables it). Off by default because of an
-open bug: with it on, served requests can be corrupted across requests (garbage answers
-in GSM8K runs at TP8/DCP8).
+(default off: unset keeps the stock path, `=1` enables it).
 
 Constraints (any failure falls back to the stock path before anything is written):
 - The entry serves the call (`kda_prefill_unsupported_reason`: the (heads, head_dim) of
@@ -41,8 +39,7 @@ _SIDX = "_akr_kda_sidx"
 
 
 def _env_on() -> bool:
-    """VLLM_KIMI_AKR_KDA_PREFILL: off unless set to 1/true/on/yes (open cross-request
-    corruption, see above)."""
+    """VLLM_KIMI_AKR_KDA_PREFILL: off unless set to 1/true/on/yes."""
     v = os.environ.get("VLLM_KIMI_AKR_KDA_PREFILL", "").strip().lower()
     return v in ("1", "true", "on", "yes")
 
