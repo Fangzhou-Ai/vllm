@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """amd_kernels KDA prefill hook (akr_kda_prefill.try_prefill) vs the stock prefill of
 KimiK3DeltaAttention._forward, with the state indices the GDN builder passes: the column
-view block_table[:, 0] of a (requests, 1 + speculative blocks) table. Every sequence must
-read and write its own state slot (single GPU)."""
+view block_table[:, 0] of a (requests, 1 + speculative blocks) table. Every sequence
+must read and write its own state slot (single GPU)."""
 
 import os
 import sys
@@ -28,9 +28,8 @@ CASES = [
 
 @pytest.fixture(scope="module")
 def env():
-    from vllm.config import VllmConfig, set_current_vllm_config
-
     import vllm.models.kimi_k3.amd.kda as kda
+    from vllm.config import VllmConfig, set_current_vllm_config
 
     saved = kda.get_forward_context, os.environ.get("VLLM_KIMI_AKR_KDA_PREFILL")
 
