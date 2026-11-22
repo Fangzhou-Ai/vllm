@@ -62,7 +62,7 @@ logger = init_logger(__name__)
 
 CTX_MAX_ROWS = 192  # rows of the staging buffers (the decode graph's context)
 MLP_MAX_ROWS = 144  # the kernel loses to the stock GEMMs at 192 rows (0.95x)
-AR_MAX_ROWS = 160  # all-reduce + norm: 0.99x the stock pair at 192 rows, 0.92x at 256
+AR_MAX_ROWS = 152  # all-reduce + norm: a draft step loses 0.5 us at 156 rows, 2 at 160
 
 
 def aiter_ar() -> bool:

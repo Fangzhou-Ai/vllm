@@ -9,7 +9,9 @@ the stock `Qwen2MLP` and with the amd_kernels MLP (`AkrDenseMlp`).
 
 8 ranks: every pair takes the kernel up to `AR_MAX_ROWS` rows (eager and in a CUDA
 graph captured under `graph_capture`), more rows fall back. Numerics: one pair within
-one bf16 ulp of the stock all-reduce + RMSNorm (the residual bit for bit); the backbone
+one bf16 ulp of the stock all-reduce + RMSNorm (the residual bit for bit); every pair
+of the backbone, on its own inputs: the residual the stock pair's, the output within
+one bf16 ulp of the fp64 norm (the stock pair is itself up to one ulp off); the backbone
 no further from the stock one than the stock one is from itself run to run or on vLLM's
 native norms (1.4-2.2% relative on these random weights). A compiled backbone is
 declined. 2 ranks: no kernel for the communicator, the route declines and the backbone
@@ -30,9 +32,9 @@ import torch.multiprocessing as mp
 from torch import nn
 
 HIDDEN, ATTN_SHARD, INTER_SHARD, LAYERS, EPS = 7168, 768, 1792, 5, 1e-5
-ROWS = (1, 7, 20, 64, 128, 160, 192, 300)
+ROWS = (1, 7, 20, 64, 128, 152, 153, 192, 300)
 GRAPH_ROWS = (20, 128)
-BENCH_ROWS = (7, 20, 64, 96, 128, 160, 192)
+BENCH_ROWS = (7, 20, 64, 96, 128, 152, 156, 160, 192)
 
 
 class _OProj(nn.Module):
@@ -142,6 +144,33 @@ def _pair_check(norm) -> str:
     return f"pair: output <= {worst[0]:.2f} bf16 ulp, residual max |d| {worst[1]:.3g}"
 
 
+def _in_situ(akr_draft, worst: list[float]):
+    """`AkrArNorm.forward` checking every kernel call of the backbone on its own inputs:
+    the new residual the stock pair's up to the order of the eight-way sum, the output
+    within one bf16 ulp of the fp64 RMSNorm of that residual. Returns the original
+    forward."""
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    real = akr_draft.AkrArNorm.forward
+
+    def checked(self, x, residual):
+        ref_res = tensor_model_parallel_all_reduce(x.clone()) + residual
+        out, new_res = real(self, x, residual)
+        if x.shape[0] <= akr_draft.AR_MAX_ROWS:
+            u = new_res.double()
+            y = u * torch.rsqrt(u.square().mean(-1, keepdim=True) + self.eps)
+            y = y * self.stock.weight.double()
+            d_out = float(((out.double() - y).abs() / (y.abs() * 2.0**-7 + 1e-5)).max())
+            d_res = float((new_res.float() - ref_res.float()).abs().max())
+            tol = float(ref_res.float().abs().max()) * 2.0**-7  # sum order
+            assert d_out <= 1.0 and d_res <= tol, (x.shape[0], d_out, d_res)
+            worst[0] = max(worst[0], d_out)
+        return out, new_res
+
+    akr_draft.AkrArNorm.forward = checked
+    return real
+
+
 def _check(rank, world, cfg, akr_mlp: bool) -> str:
     from vllm import ir
     from vllm.distributed.parallel_state import graph_capture
@@ -193,6 +222,13 @@ def _check(rank, world, cfg, akr_mlp: bool) -> str:
         assert calls[0] == (2 * LAYERS if m <= akr_draft.AR_MAX_ROWS else 0), m
         assert rel <= 1.25 * floor[m] + 1e-3 and cos > 0.9995, (rank, m, rel, floor[m])
         worst = max(worst, rel)
+    in_situ = [0.0]
+    real = _in_situ(akr_draft, in_situ)
+    try:
+        for m in rows:
+            _fwd(model, m, m + 2000)
+    finally:
+        akr_draft.AkrArNorm.forward = real
     for m in GRAPH_ROWS:
         positions, x = _inputs(m, m)
         with graph_capture(spec.device) as ctx:
@@ -211,7 +247,8 @@ def _check(rank, world, cfg, akr_mlp: bool) -> str:
     return (
         f"8 ranks, akr MLP {akr_mlp}: {pairs} pairs fused, rows {rows} eager + "
         f"{GRAPH_ROWS} graph, worst rel {worst:.2e} vs stock (stock floor "
-        f"{min(floor.values()):.2e}..{max(floor.values()):.2e}) {msg}"
+        f"{min(floor.values()):.2e}..{max(floor.values()):.2e}), every pair <= "
+        f"{in_situ[0]:.2f} ulp of fp64 {msg}"
     )
 
 
