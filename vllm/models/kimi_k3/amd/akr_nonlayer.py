@@ -17,7 +17,7 @@ default below) that applies on top of its route (`akr_config.on(route)`, which
 | CTXPROJ   | draft       | on      | sharded drafter context projection + norm        |
 | DMLP      | draft       | on      | drafter dense MLP                                |
 | DMLA      | draft       | on      | drafter dense MLA decode (MLA drafts)            |
-| DAR       | draft       | on      | AITER fused all-reduce + RMSNorm (MLA drafter)   |
+| DAR       | draft       | on      | drafter fused all-reduce + RMSNorm               |
 | DQKV      | draft       | on      | drafter q / k norm + RoPE + KV insert (GQA)      |
 | DCTXKV    | draft       | on      | drafter context K norm + RoPE + KV inserts (GQA) |
 | FINALNORM | norm        | off     | final attn_res + norm in `allreduce_attnres`     |

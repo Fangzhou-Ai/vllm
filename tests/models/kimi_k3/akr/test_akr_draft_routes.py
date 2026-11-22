@@ -134,6 +134,7 @@ def _record(monkeypatch):
     monkeypatch.setattr(akr_draft, "_context_proj", rec("ctxproj"))
     monkeypatch.setattr(akr_draft, "_mlp_reason", rec("mlp_reason"))
     monkeypatch.setattr(akr_draft, "_install_mlp", rec("dmlp", 1))
+    monkeypatch.setattr(akr_draft, "_dar", rec("dar"))
     monkeypatch.setattr(akr_sampling, "setup_speculator", rec("markov"))
     monkeypatch.setattr(akr_draft_mla, "setup", rec("dmla"))
     monkeypatch.setattr(akr_draft_gqa, "setup", rec("gqa"))
@@ -152,6 +153,7 @@ def test_setup_routes_per_draft(monkeypatch, _env, draft):
     assert calls["ctxproj"][0] == (spec, model)
     assert calls["dmlp"][0] == (spec, model)
     assert calls["markov"][0] == (spec,)
+    assert calls["dar"][0] == (spec, model)  # the preview's layers keep their own
     # the dense MLA decode is the MLA draft's only, the GQA attention inputs the GQA's
     assert ("dmla" in calls) == (draft == "preview")
     assert calls.get("gqa") == (None if draft == "preview" else [(spec, model)])
@@ -304,3 +306,17 @@ def test_release_mlp_reason_takes_a_reducing_mlp(_env, monkeypatch):
     # the rows are the query rows: 1 + k a request for a fill-in block
     spec.max_num_reqs, spec.num_query_per_req = 32, 5
     assert "160" in akr_draft._mlp_reason(spec, model)
+
+
+def test_release_ar_reason(_env):
+    """The release's all-reduce + RMSNorm pairs (`DAR`) engage only on an uncompiled
+    backbone with a TP all-reduce (the 8-rank kernel check: draft_ar_norm_ranks.py)."""
+    from vllm.models.kimi_k3.amd import akr_draft
+
+    model = _release()
+    spec = _spec(model, _env, False)
+    assert akr_draft._ar_reason(spec, model) == "TP 1 (no all-reduce)"
+    model.model.do_not_compile = False
+    assert "compiled" in akr_draft._ar_reason(spec, model)
+    akr_draft._dar(spec, model)
+    assert not any(isinstance(n, akr_draft.AkrArNorm) for n in model.modules())

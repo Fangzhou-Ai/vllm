@@ -3,7 +3,7 @@
 """The DSpark drafter's amd_kernels routes (draft route) for a Kimi-K3 target. Each
 piece reads its modules and shapes from the draft, so both Kimi-K3.1 drafts take
 them: the preview's MLA draft (`K3DSparkForCausalLM`) and the release's GQA
-sliding-window draft (`Qwen3DSparkForCausalLM`, a compiled `DFlashQwen3Model`).
+sliding-window draft (`Qwen3DSparkForCausalLM`, a `DFlashQwen3Model` backbone).
 
 * `CTXPROJ`  `gemm/bf16_common.bf16_linear_gather`: the context projection (35840 ->
   7168, 514 MB replicated GEMM) + its RMSNorm as a sharded GEMM (this rank's columns,
@@ -23,10 +23,13 @@ sliding-window draft (`Qwen3DSparkForCausalLM`, a compiled `DFlashQwen3Model`).
   memory). An MLP whose down projection all-reduces (the release's `Qwen2MLP`) keeps
   that all-reduce after the op. Needs `max_num_seqs` x the query rows a request (k)
   <= 144 (checked at set-up; the stock weights are gone).
-* `DAR`      AITER's fused all-reduce + RMSNorm: the preview's
-  `fused_allreduce_rms_norm`. The release's compiled backbone leaves it to vLLM's
-  `RocmAiterAllReduceFusionPass` (`pass_config.fuse_allreduce_rms`); set-up logs
-  whether that pass is on.
+* `DAR`      the all-reduce + residual add + RMSNorm pairs. The preview: AITER's fused
+  op (`fused_allreduce_rms_norm`). The release (uncompiled under breakable CUDA graphs,
+  so vLLM's fusion pass never sees it): `norm/attnres_rmsnorm_common`
+  `allreduce_attnres_rmsnorm` without bank (`AkrArNorm`) on the o_proj -> post-attention
+  norm and MLP -> next input norm / final norm pairs (2 a layer), on the target's
+  communicator (else one of 14.7 MiB); calls past `AR_MAX_ROWS` all-reduce first.
+  A compiled backbone keeps the stock pairs.
 * `DMLA`     the dense MLA decode (`akr_draft_mla`): MLA drafts only.
 * `DQKV`, `DCTXKV` the GQA draft's q / k norm + RoPE + KV insert of the query block
   and of the context rows (`akr_draft_gqa`): the release only.
@@ -44,13 +47,19 @@ import torch
 from torch import nn
 
 from vllm.logger import init_logger
-from vllm.models.kimi_k3.amd import akr_lmhead, akr_nonlayer, akr_sampling
+from vllm.models.kimi_k3.amd import (
+    akr_config,
+    akr_lmhead,
+    akr_nonlayer,
+    akr_sampling,
+)
 from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
 CTX_MAX_ROWS = 192  # rows of the staging buffers (the decode graph's context)
 MLP_MAX_ROWS = 144  # the kernel loses to the stock GEMMs at 192 rows (0.95x)
+AR_MAX_ROWS = 160  # all-reduce + norm: 0.99x the stock pair at 192 rows, 0.92x at 256
 
 
 def aiter_ar() -> bool:
@@ -447,30 +456,171 @@ def _install_mlp(spec, model) -> int:
 
 
 # ------------------------------------------------------------------ all-reduce + norm
-def _ar_note(spec, model) -> None:
-    """A draft built without the preview's `aiter_ar` flag (the release's compiled
-    backbone): its all-reduce + RMSNorm pairs are vLLM's fusion pass's; log whether it
-    is on (nothing is installed)."""
+def _norm_entry():
+    from amd_kernels.norm import attnres_rmsnorm_common
+
+    return attnres_rmsnorm_common
+
+
+class AkrArNorm(nn.Module):
+    """`norm(all_reduce(x), residual)` for the TP partial `x` of a projection that no
+    longer all-reduces: `allreduce_attnres_rmsnorm` without bank (all-reduce + residual
+    add + RMSNorm in one launch; `residual` is updated in place) for the calls its entry
+    takes up to `AR_MAX_ROWS` rows, else the all-reduce and the stock norm. Host-only
+    per-call check: capture-safe, and the kernel registers nothing per graph."""
+
+    def __init__(self, stock: nn.Module, comm: Any) -> None:
+        super().__init__()
+        self.stock = stock  # keeps the weight registered
+        self.comm = comm
+        self.eps = float(stock.variance_epsilon)
+        self._reason = _norm_entry().allreduce_attnres_rmsnorm_unsupported_reason
+
+    def forward(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        args = (x, residual, None, None, None, 0, -1, self.stock.weight)
+        args += (self.eps, self.eps)
+        if x.shape[0] <= AR_MAX_ROWS and not akr_config.call_unsupported(
+            "draft", self._reason(self.comm, *args)
+        ):
+            return self.comm.allreduce_attnres_rmsnorm(*args)
+        from vllm.distributed import tensor_model_parallel_all_reduce
+
+        return self.stock(tensor_model_parallel_all_reduce(x), residual)
+
+
+def _mlp_reduces(mlp) -> bool:
+    if isinstance(mlp, AkrDenseMlp):
+        return mlp.all_reduce
+    down = getattr(mlp, "down_proj", None)
+    return bool(getattr(down, "reduce_results", False)) and down.tp_size > 1
+
+
+def _defer_mlp(mlp) -> None:
+    """The MLP returns its TP partial (its all-reduce moves into the next norm)."""
+    if isinstance(mlp, AkrDenseMlp):
+        mlp.all_reduce = False
+    else:
+        mlp.down_proj.reduce_results = False
+
+
+def _ar_reason(spec, model) -> str | None:
+    """Why the release draft's all-reduce + RMSNorm pairs stay stock, or None."""
+    from vllm.config import CompilationMode
+    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.layers.linear import RowParallelLinear
+    from vllm.model_executor.models.qwen3_dflash import (
+        DFlashQwen3DecoderLayer,
+        DFlashQwen3Model,
+    )
+
+    m = model.model
+    if not isinstance(m, DFlashQwen3Model) or type(m).forward is not (
+        DFlashQwen3Model.forward
+    ):
+        return f"{type(m).__name__} is not the DFlash Qwen3 backbone"
+    cc = getattr(m, "compilation_config", spec.vllm_config.compilation_config)
+    if (
+        not getattr(m, "do_not_compile", True)
+        or cc.mode == CompilationMode.STOCK_TORCH_COMPILE
+    ):
+        return "the draft backbone is compiled (vLLM's all-reduce + RMSNorm fusion)"
+    if akr_nonlayer.tp_group().world_size == 1:
+        return "TP 1 (no all-reduce)"
+    norms = [m.norm]
+    for layer in m.layers:
+        if type(layer).forward is not DFlashQwen3DecoderLayer.forward:
+            return f"{type(layer).__name__} is not a DFlash Qwen3 decoder layer"
+        o_proj = getattr(layer.self_attn, "o_proj", None)
+        if not isinstance(o_proj, RowParallelLinear) or not o_proj.reduce_results:
+            return "o_proj is not an all-reducing RowParallelLinear"
+        if not _mlp_reduces(layer.mlp):
+            return f"{type(layer.mlp).__name__} does not end in a TP all-reduce"
+        norms += [layer.input_layernorm, layer.post_attention_layernorm]
+    for n in norms:
+        if (
+            type(n) is not RMSNorm
+            or not n.has_weight
+            or n.variance_size_override is not None
+            or n.weight.dtype != torch.bfloat16
+        ):
+            return f"{n} is not a plain bf16 RMSNorm"
+    return None
+
+
+_DRAFT_NORM_COMM: Any = None  # the draft's own, when the target has none
+
+
+def _draft_norm_comm(device: torch.device, hidden: int):
+    """Collective: the target's communicator (the kdamoe `norm` route's, one stream: the
+    draft runs after the target on it), else one for the draft; None (warned once)."""
+    global _DRAFT_NORM_COMM
+    from vllm.models.kimi_k3.amd import akr_runtime
+
+    if akr_runtime.attnres_comm is not None:
+        return akr_runtime.attnres_comm
+    if _DRAFT_NORM_COMM is not None:
+        return _DRAFT_NORM_COMM
+    lib = _norm_entry()
+    if akr_nonlayer.blocked("DAR", None if lib.available() else "needs gfx950"):
+        return None
+    g = akr_nonlayer.tp_group()
+    kw = dict(hidden=hidden)
+    reason = lib.attnres_comm_unsupported_reason(
+        g.rank_in_group, g.cpu_group, device, **kw
+    )
+    if akr_nonlayer.blocked("DAR", reason):
+        return None
+    _DRAFT_NORM_COMM = lib.attnres_comm(g.rank_in_group, g.cpu_group, device, **kw)
+    return _DRAFT_NORM_COMM
+
+
+def _install_ar(spec, model) -> int:
+    """Collective: every all-reduce + RMSNorm pair of the release draft (o_proj ->
+    post-attention norm, MLP -> next input norm / final norm) on `AkrArNorm`; the
+    projections return their partials. Returns the number of pairs (0: stock)."""
+    m = model.model
+    norm = m.norm
+    hidden = norm.weight.shape[0]
+    comm = _draft_norm_comm(spec.device, hidden)
+    if comm is None:
+        return 0
+    z = torch.zeros(16, hidden, dtype=torch.bfloat16, device=spec.device)
+    args = (z, z.clone(), None, None, None, 0, -1, norm.weight)
+    args += (norm.variance_epsilon, norm.variance_epsilon)
+    if akr_nonlayer.blocked(
+        "DAR", _norm_entry().allreduce_attnres_rmsnorm_unsupported_reason(comm, *args)
+    ):
+        return 0
+    comm.allreduce_attnres_rmsnorm(*args)  # compiles the variant before any capture
+    torch.accelerator.synchronize(spec.device)
+    n = 0
+    for i, layer in enumerate(m.layers):
+        layer.self_attn.o_proj.reduce_results = False
+        layer.post_attention_layernorm = AkrArNorm(layer.post_attention_layernorm, comm)
+        _defer_mlp(layer.mlp)
+        if i:
+            layer.input_layernorm = AkrArNorm(layer.input_layernorm, comm)
+        n += 2
+    m.norm = AkrArNorm(norm, comm)
+    return n
+
+
+def _dar(spec, model) -> None:
+    """The release draft's all-reduce + RMSNorm (the preview's layers carry their own
+    `aiter_ar` flag)."""
     layers = getattr(model.model, "layers", ())
     if not layers or hasattr(layers[0], "aiter_ar") or not akr_nonlayer.switch("DAR"):
         return
-    from vllm._aiter_ops import rocm_aiter_ops
-    from vllm.config import CompilationMode
-
-    cc = spec.vllm_config.compilation_config
-    reason = None
-    if akr_nonlayer.tp_group().world_size == 1:
+    if akr_nonlayer.blocked("DAR", _ar_reason(spec, model)):
         return
-    if cc.mode != CompilationMode.VLLM_COMPILE:
-        reason = "the draft backbone is not compiled (no all-reduce + RMSNorm fusion)"
-    elif not cc.pass_config.fuse_allreduce_rms:
-        reason = "pass_config.fuse_allreduce_rms is off"
-    elif rocm_aiter_ops.get_aiter_allreduce() is None:
-        reason = "no AITER custom all-reduce for the fusion pass"
-    if not akr_nonlayer.blocked("DAR", reason):
+    n = _install_ar(spec, model)
+    if n:
         logger.info(
-            "amd_kernels drafter: all-reduce + RMSNorm left to vLLM's "
-            "RocmAiterAllReduceFusionPass (compiled draft backbone)"
+            "amd_kernels drafter: all-reduce + RMSNorm fused on %d pairs "
+            "(allreduce_attnres_rmsnorm)",
+            n,
         )
 
 
@@ -511,7 +661,7 @@ def setup(spec, target_model) -> None:
             n = _install_mlp(spec, model)
             if n:
                 logger.info("amd_kernels drafter: dense MLP kernels on %d layers", n)
-        _ar_note(spec, model)
+        _dar(spec, model)
         akr_sampling.setup_speculator(spec)
         if getattr(spec.draft_model_config, "use_mla", False):
             from vllm.models.kimi_k3.amd import akr_draft_mla
