@@ -319,7 +319,8 @@ def preallocate_score_topk_scratch(w, device, cache, out_indices) -> None:
     it runs (all the captured ones) launches the kernel there, and the set the warm-up's
     host calls made on the load stream is released (an eager serial decode on another
     stream makes its own set later, after the KV cache is sized). No set at all when no
-    decode batch of the server is the kernel's (e.g. 8 query rows a request)."""
+    decode batch of the server is the kernel's (e.g. 8 query rows a request); a shorter
+    batch (fewer drafts) that the kernel takes then makes a set of the decode rows."""
     from amd_kernels.indexer.mxfp4_indexer_common import paged_score_topk_preallocate
 
     from vllm.utils.torch_utils import aux_stream
@@ -328,7 +329,9 @@ def preallocate_score_topk_scratch(w, device, cache, out_indices) -> None:
     shape = _decode_shape()
     kw = dict(cache=cache, out_indices=out_indices)
     if shape is not None and _decode_reason(w, cache, out_indices, shape[1]):
-        paged_score_topk_preallocate(device, [], **kw, release_others=True)
+        paged_score_topk_preallocate(
+            device, [], **kw, rows=shape[0], release_others=True
+        )
         return
     streams = (
         [aux_stream()] if ms else [torch.cuda.current_stream(device), aux_stream()]

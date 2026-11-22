@@ -85,6 +85,18 @@ def test_capture_streams_borrow_the_load_set(monkeypatch, runtime_state):
     assert [sorted(s) for s in seen] == [[(0, B), (1, A)], [(0, C), (1, A)]]
 
 
+def test_register_twice_lends_once(monkeypatch, runtime_state):
+    tp = _install_fake_tp(monkeypatch, [B])
+    work = {(0, A): "set"}
+    swap = _swap_dict(work)
+    akr_runtime.register_stream_workspaces(swap)
+    akr_runtime.register_stream_workspaces(swap)
+    akr_runtime.install_capture_hook()
+    with tp.graph_capture():
+        assert work == {(0, B): "set"}
+    assert work == {(0, A): "set"}
+
+
 def test_capture_returns_the_set_on_error(monkeypatch, runtime_state):
     tp = _install_fake_tp(monkeypatch, [B])
     work = {(0, A): "set"}
@@ -160,7 +172,7 @@ def test_score_topk_scratch(monkeypatch, ms, reason):
     ((args, kw),) = calls
     assert kw["cache"] == "cache" and kw["out_indices"] == "out"
     if reason is not None:  # no decode batch is the kernel's: no set, the warm-up's go
-        assert args == ("cuda:0", []) and kw["release_others"]
+        assert args == ("cuda:0", []) and kw["release_others"] and kw["rows"] == 240
     elif ms:  # only the aux stream's set, for 240 rows
         assert (
             args == ("cuda:0", ["aux"]) and kw["rows"] == 240 and kw["release_others"]

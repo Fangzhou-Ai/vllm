@@ -81,7 +81,8 @@ def register_stream_workspaces(swap) -> None:
     """`swap(device_index, stream_a, stream_b)` exchanges a library's workspaces of two
     streams. Call after the load-time warm-up made them on the CURRENT stream, which
     then lends them to every capture stream."""
-    _swappers.append(swap)
+    if swap not in _swappers:  # twice would swap the keys back
+        _swappers.append(swap)
     dev = torch.accelerator.current_device_index()
     _holder.setdefault(dev, torch.cuda.current_stream().cuda_stream)
 
